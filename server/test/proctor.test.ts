@@ -1,0 +1,6 @@
+import test from 'node:test'; import assert from 'node:assert/strict';
+import { dedupeWindow, fingerprintFor, reviewPriority } from '../src/proctor.js';
+import { roleCanAccess, tenantFilter } from '../src/auth.js';
+test('duplicate signal fingerprint is stable inside its cooldown window', () => { const time = new Date('2030-01-01T00:00:10Z'); const one = fingerprintFor('org-a', 'candidate-a', 'looking_away', dedupeWindow(time, 30)); const two = fingerprintFor('org-a', 'candidate-a', 'looking_away', dedupeWindow(new Date('2030-01-01T00:00:25Z'), 30)); assert.equal(one, two); });
+test('review priority exposes contributing signals and is not a probability', () => { const result = reviewPriority([{ type: 'phone_detected', weight: 30 }, { type: 'fullscreen_exit', weight: 10 }]); assert.deepEqual(result, { score: 40, contributingSignals: [{ type: 'phone_detected', weight: 30 }, { type: 'fullscreen_exit', weight: 10 }] }); });
+test('evidence and socket review are organization/role constrained primitives', () => { assert.deepEqual(tenantFilter('org-a'), { organizationId: 'org-a' }); assert.equal(roleCanAccess('student', ['proctor']), false); assert.equal(roleCanAccess('proctor', ['proctor']), true); });

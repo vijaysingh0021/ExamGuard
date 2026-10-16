@@ -1,0 +1,11 @@
+import http from 'node:http';
+import { Server } from 'socket.io';
+import { app } from './app.js';
+import { connectDatabase } from './db.js';
+import { loadConfig } from './config.js';
+import jwt from 'jsonwebtoken'; import { Membership } from './models.js';
+const config = loadConfig(); const server = http.createServer(app); const io = new Server(server, { cors: { origin: config.CLIENT_URL } });
+io.use((socket, next) => { try { const token = socket.handshake.auth.token; const payload = jwt.verify(token, config.JWT_SECRET) as jwt.JwtPayload; socket.data.userId = String(payload.sub); next(); } catch { next(new Error('Authentication required')); } });
+io.on('connection', socket => socket.on('join-exam', async ({ organizationId, examId }: { organizationId: string; examId: string }) => { const membership = await Membership.findOne({ userId: socket.data.userId, organizationId, active: true }).lean(); if (!membership || !['institute_admin', 'teacher', 'proctor'].includes(membership.role)) return socket.emit('subscription_error', { error: 'Not authorized for live monitoring' }); socket.join(`org:${organizationId}:exam:${examId}`); socket.emit('subscription_ready', { examId }); }));
+app.set('broadcast', (room: string, payload: unknown) => io.to(room).emit('proctoring_incident', payload));
+connectDatabase().then(() => server.listen(config.PORT, () => console.info(`ExamGuard API listening on ${config.PORT}`))).catch(error => { console.error('Database connection failed. Check MONGODB_URI and MONGODB_DB_NAME.', error.message); process.exit(1); });

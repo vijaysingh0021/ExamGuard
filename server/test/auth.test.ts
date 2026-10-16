@@ -1,0 +1,4 @@
+import test from 'node:test'; import assert from 'node:assert/strict'; import { roleCanAccess, signToken, tenantFilter } from '../src/auth.js';
+test('authentication signs a JWT with configured environment', () => { const previous = { ...process.env }; Object.assign(process.env, { MONGODB_URI: 'mongodb+srv://user:pass@cluster/test', MONGODB_DB_NAME: 'test', JWT_SECRET: 'x'.repeat(32) }); assert.match(signToken('user-id'), /\./); process.env = previous; });
+test('role authorization permits only explicitly granted roles', () => { assert.equal(roleCanAccess('teacher', ['teacher', 'institute_admin']), true); assert.equal(roleCanAccess('student', ['teacher', 'institute_admin']), false); });
+test('organization isolation filter always scopes a query to one organization', () => { assert.deepEqual(tenantFilter('org-a'), { organizationId: 'org-a' }); assert.notDeepEqual(tenantFilter('org-a'), tenantFilter('org-b')); });
