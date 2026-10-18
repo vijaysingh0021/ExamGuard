@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" role="img" aria-label="Simulated training frame: exam tab hidden">
+  <rect width="640" height="360" fill="#0f172a"/><rect x="20" y="20" width="600" height="320" rx="14" fill="none" stroke="#60a5fa" stroke-width="3" stroke-dasharray="8 7"/>
+  <rect x="36" y="36" width="238" height="31" rx="8" fill="#60a5fa"/><text x="52" y="57" fill="#0f172a" font-family="Arial,sans-serif" font-size="15" font-weight="700">SIMULATED TRAINING FRAME</text>
+  <rect x="135" y="100" width="370" height="180" rx="14" fill="#1e293b" stroke="#94a3b8" stroke-width="3"/><rect x="135" y="100" width="370" height="34" rx="14" fill="#334155"/><circle cx="158" cy="117" r="6" fill="#f87171"/><circle cx="178" cy="117" r="6" fill="#fbbf24"/><circle cx="198" cy="117" r="6" fill="#34d399"/><path d="M292 174h56v22h-56zM270 209h100v12H270zM287 233h66v12h-66z" fill="#64748b"/>
+  <path d="M455 157l37 37-37 37" fill="none" stroke="#fbbf24" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/><text x="36" y="326" fill="#cbd5e1" font-family="Arial,sans-serif" font-size="15">Demo-only visual • browser visibility changed • no real capture</text>
+</svg>

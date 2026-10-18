@@ -10,7 +10,7 @@ Install the .NET 8 SDK and build on a Windows laptop:
 dotnet run --project device-monitor/ExamGuard.DeviceMonitor.csproj
 ```
 
-Paste an ExamGuard bearer token for the active student session and the organization, exam, candidate, and attempt IDs. Read and accept the consent disclosure before scanning. The companion stores no raw address/BSSID locally: it hashes identifiers with a new in-memory session salt before upload. Stop ends scanning and rotates that salt. A dedicated, scoped short-lived pairing token should be added before production rollout.
+From the active exam, create a short-lived companion pairing token, paste it into the companion, and choose **Verify pairing**. The server supplies the organization, exam, candidate, and attempt context only after it verifies the active attempt. Read and accept the consent disclosure before scanning. The companion stores no raw address/BSSID locally: it hashes identifiers with a new in-memory session salt before upload. Stop ends scanning and rotates that salt.
 
 ## Limitations
 
