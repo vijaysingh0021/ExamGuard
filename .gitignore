@@ -3,6 +3,9 @@ dist
 .env
 .env.local
 coverage
+.cache/
 *.log
 bin/
 obj/
+.venv/
+__pycache__/

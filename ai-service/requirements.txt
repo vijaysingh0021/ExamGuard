@@ -1,6 +1,6 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-opencv-python==4.10.0.84
-mediapipe==0.10.20
-numpy==1.26.4
-ultralytics==8.3.57
+python-multipart==0.0.20
+# Computer-vision analysis is optional. `main.py` accurately reports it as
+# unavailable when these libraries are not installed, so the service can run
+# its health boundary on a standard Python installation.

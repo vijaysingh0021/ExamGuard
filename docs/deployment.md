@@ -4,7 +4,7 @@
 
 - Client: `npm run dev -w client` (port 5173)
 - API: `npm run dev -w server` (port 4000)
-- AI service: `cd ai-service; uvicorn main:app --port 8000`
+- AI service: `cd ai-service; .\.venv\Scripts\python -m pip install -r requirements.txt; .\.venv\Scripts\python -m uvicorn main:app --port 8000` (create the virtual environment first with `python -m venv .venv`)
 
 Use `npm run build` for production artifacts. Provide `MONGODB_URI`, `MONGODB_DB_NAME`, and a unique 32+ character `JWT_SECRET` to the API environment. Do not place any server secret in a Vite `VITE_*` variable.
 
@@ -25,5 +25,5 @@ The AI service is optional and must be separately deployed. Its `/health` endpoi
 - **API exits on startup:** validate Atlas URI, database name, JWT secret, and Atlas network access.
 - **Uploads fail:** configure private storage values and ensure the bucket allows server credentials to write.
 - **Email is unavailable:** leave it unset for in-app-only delivery or configure both email variables.
-- **AI says unavailable:** install `ai-service/requirements.txt` in an isolated Python environment; set `YOLO_MODEL_PATH` only for a tested model.
+- **AI says unavailable:** first install `ai-service/requirements.txt` in an isolated Python environment. The health endpoint intentionally reports computer vision as unavailable until the approved host also installs `ai-service/requirements-ai.txt`; set `YOLO_MODEL_PATH` only for a tested model.
 - **Live-monitoring subscription rejected:** sign in with an active institute-admin, teacher, or proctor membership for the requested organization.

@@ -1,0 +1,7 @@
+-r requirements.txt
+# Optional local computer-vision stack. Install this only on a host intended
+# to perform disclosed frame analysis.
+opencv-python==4.10.0.84
+mediapipe==0.10.20
+numpy==1.26.4
+ultralytics==8.3.57

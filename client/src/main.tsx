@@ -560,6 +560,7 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
   const stopCamera = () => {
     cameraStream.current?.getTracks().forEach((track) => track.stop());
     cameraStream.current = null;
+    delete (window as any).__examguardCameraStream;
     if (videoRef.current) videoRef.current.srcObject = null;
     setCamera("Not checked");
   };
@@ -573,7 +574,7 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
     setLevel(0);
     setMicrophone("Not checked");
   };
-  useEffect(() => () => { stopCamera(); stopMicrophone(); }, []);
+  useEffect(() => () => { stopMicrophone(); }, []);
   useEffect(() => { const update = () => setFullscreen(Boolean(document.fullscreenElement)); document.addEventListener("fullscreenchange", update); return () => document.removeEventListener("fullscreenchange", update); }, []);
   const checkCamera = async () => {
     if (!supported) return setCamera("Camera unavailable: this browser does not support device access.");
@@ -582,6 +583,7 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
       cameraStream.current = stream;
+      (window as any).__examguardCameraStream = stream;
       if (videoRef.current) videoRef.current.srcObject = stream;
       setCamera("Camera ready");
     } catch (e) {
@@ -644,6 +646,27 @@ function StudentExam({ session }: { session: Session }) {
   const [pairingLoading, setPairingLoading] = useState(false);
   const [attentionWarning, setAttentionWarning] = useState("");
   const submitting = useRef(false);
+  useEffect(() => () => {
+    const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
+    stream?.getTracks().forEach((track) => track.stop());
+    delete (window as any).__examguardCameraStream;
+  }, []);
+  const captureEvidence = async () => {
+    const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
+    if (!stream?.active) return undefined;
+    const video = document.createElement("video");
+    video.srcObject = stream; video.muted = true; video.playsInline = true;
+    await video.play();
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth || 640; canvas.height = video.videoHeight || 480;
+    canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
+    video.pause(); video.srcObject = null;
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.8));
+    if (!blob) return undefined;
+    const form = new FormData(); form.append("file", blob, "browser-signal.jpg");
+    const { data } = await api.post(`/api/student/attempts/${payload.attempt.id}/evidence`, form);
+    return data.evidenceKey as string;
+  };
   const start = async () => {
     try {
       const { data } = await api.post(
@@ -655,6 +678,7 @@ function StudentExam({ session }: { session: Session }) {
       setLeft(
         Math.max(0, new Date(data.attempt.deadlineAt).getTime() - Date.now()),
       );
+      void createCompanionPairing(data.attempt.id);
     } catch (e) {
       setError(
         axios.isAxiosError(e)
@@ -681,15 +705,16 @@ function StudentExam({ session }: { session: Session }) {
     if (!payload) return;
     const report = (type: "visibility_hidden" | "fullscreen_exit", message: string) => {
       setAttentionWarning(message);
-      void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+      void (async () => { let evidenceKey: string | undefined; try { evidenceKey = await captureEvidence(); } catch { /* Evidence is optional; the signal is still recorded. */ } return api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
         examId: payload.attempt.examId,
         candidateId: payload.attempt.candidateId,
         attemptId: payload.attempt.id,
         type,
         occurredAt: new Date().toISOString(),
         source: "browser",
+        evidenceKey,
         details: { clientWarning: true },
-      }).catch(() => undefined);
+      }); })().catch(() => undefined);
     };
     const visibility = () => { if (document.visibilityState === "hidden") report("visibility_hidden", "Warning: you left the examination tab. Return immediately and keep this exam in focus."); };
     const fullscreen = () => { if (!document.fullscreenElement) report("fullscreen_exit", "Warning: fullscreen was exited. Return to fullscreen and remain on the examination screen."); };
@@ -730,11 +755,12 @@ function StudentExam({ session }: { session: Session }) {
       submitting.current = false;
     }
   };
-  const createCompanionPairing = async () => {
+  const createCompanionPairing = async (attemptId = payload?.attempt?.id) => {
+    if (!attemptId) return;
     setPairingError("");
     setPairingLoading(true);
     try {
-      const { data } = await api.post(`/api/student/attempts/${payload.attempt.id}/companion-pairing`);
+      const { data } = await api.post(`/api/student/attempts/${attemptId}/companion-pairing`);
       setPairingToken(data.pairingToken);
       setPairingOpen(true);
     } catch (requestError) {
@@ -893,6 +919,41 @@ function Dashboard({ session }: { session: Session }) {
 }
 function CandidateDashboard({ session }: { session: Session }) {
   const navigate = useNavigate();
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ["candidate-dashboard"],
+    queryFn: () => api.get("/api/student/dashboard").then((response) => response.data),
+  });
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  if (isLoading) return <div className="h-40 animate-pulse rounded-2xl bg-slate-200" />;
+  if (isError) return <div className="card text-center"><AlertTriangle className="mx-auto text-red-500" /><h2 className="mt-3 font-semibold">Your assessments could not be loaded</h2><p className="mt-1 text-sm text-slate-500">Contact your examination administrator.</p></div>;
+
+  const assignments = data.assignments ?? [];
+  const verification = data.verification ?? { status: "not_submitted" };
+  const verificationRequired = assignments.some((item: any) => item.exam?.requireVerification);
+  const submitVerification = async () => {
+    setSubmitting(true); setError(""); setNotice("");
+    try {
+      await api.post(`/api/organizations/${session.organization.id}/candidates/${data.candidate.id}/verification`);
+      setNotice("Identity verification submitted. Your institute must approve it before you can start this assessment.");
+      await refetch();
+    } catch (requestError) {
+      setError(axios.isAxiosError(requestError) ? (requestError.response?.data?.error ?? "Could not submit identity verification.") : "Could not submit identity verification.");
+    } finally { setSubmitting(false); }
+  };
+
+  return <div className="mx-auto max-w-5xl space-y-5">
+    <div className="card bg-gradient-to-br from-white to-blue-50"><p className="eyebrow">Candidate workspace</p><h2 className="mt-1 text-2xl font-semibold">Your assessments</h2><p className="mt-2 text-sm text-slate-500">Start only during the published assessment window.</p></div>
+    {verificationRequired && <section className="card border-amber-200 bg-amber-50/60"><h3 className="font-semibold">Identity verification</h3><p className="mt-1 text-sm text-slate-600">Status: <b className="capitalize">{String(verification.status).replaceAll("_", " ")}</b>{verification.rejectionReason ? ` — ${verification.rejectionReason}` : ""}</p>{verification.status === "approved" ? <p className="mt-3 text-sm text-emerald-700">Approved. You can start protected assessments during their availability window.</p> : verification.status === "submitted" ? <p className="mt-3 text-sm text-amber-800">Your request is awaiting review by your institute.</p> : <button type="button" onClick={() => void submitVerification()} disabled={submitting} className="button mt-4 disabled:opacity-60">{submitting ? "Submitting…" : verification.status === "resubmission_required" ? "Resubmit identity verification" : "Submit identity verification"}</button>}{notice && <p role="status" className="mt-3 text-sm text-emerald-700">{notice}</p>}{error && <p role="alert" className="mt-3 text-sm text-red-700">{error}</p>}</section>}
+    <section className="card"><h3 className="font-semibold">Assigned assessments</h3><div className="mt-4 space-y-3">{assignments.length ? assignments.map((item: any) => { const exam = item.exam; const attempt = item.attempt; const now = Date.now(); const startsAt = exam?.startsAt ? new Date(exam.startsAt).getTime() : 0; const endsAt = exam?.endsAt ? new Date(exam.endsAt).getTime() : Number.MAX_SAFE_INTEGER; const available = ["published", "scheduled", "live"].includes(exam?.status) && now >= startsAt && now < endsAt && !["submitted", "expired", "terminated"].includes(attempt?.status); return <article key={item.id} className="flex flex-col gap-3 rounded-xl border border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium">{exam?.title ?? "Assessment unavailable"}</p><p className="mt-1 text-sm text-slate-500">{exam?.durationMinutes ?? "—"} minutes · {attempt?.status?.replaceAll("_", " ") ?? (available ? "Available" : "Scheduled")}</p></div>{available ? <button type="button" onClick={() => navigate(`/app/take/${exam._id}`)} className="button">{attempt ? "Resume assessment" : "Start readiness"}</button> : <span className="text-sm text-slate-500">{attempt?.receiptCode ? `Receipt: ${attempt.receiptCode}` : "Not currently available"}</span>}</article>; }) : <p className="rounded-xl border border-dashed p-8 text-center text-sm text-slate-500">No assessments have been assigned to you yet.</p>}</div></section>
+  </div>;
+}
+/* Legacy dashboard retained temporarily below for reference while the candidate
+   verification workflow is migrated to the implementation above.
+function LegacyCandidateDashboard({ session }: { session: Session }) {
+  const navigate = useNavigate();
   const { data, isLoading, isError } = useQuery({
     queryKey: ["candidate-dashboard"],
     queryFn: () => api.get("/api/student/dashboard").then((response) => response.data),
@@ -903,6 +964,8 @@ function CandidateDashboard({ session }: { session: Session }) {
   const assigned = data.assignments ?? [];
   return <div className="mx-auto max-w-5xl space-y-5"><div className="card bg-gradient-to-br from-white to-blue-50"><p className="eyebrow">Candidate workspace</p><h2 className="mt-1 text-2xl font-semibold">Your assessments</h2><p className="mt-2 text-sm text-slate-500">Start only during the published assessment window. Your saved progress is restored when you return to an open attempt.</p></div><section className="card"><h3 className="font-semibold">Assigned assessments</h3><div className="mt-4 space-y-3">{assigned.length ? assigned.map((item: any) => { const exam = item.exam; const attempt = item.attempt; const startsAt = exam?.startsAt ? new Date(exam.startsAt).getTime() : 0; const endsAt = exam?.endsAt ? new Date(exam.endsAt).getTime() : Number.MAX_SAFE_INTEGER; const available = ["published", "scheduled", "live"].includes(exam?.status) && now >= startsAt && now < endsAt && !["submitted", "expired", "terminated"].includes(attempt?.status); return <article key={item.id} className="flex flex-col gap-3 rounded-xl border border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium">{exam?.title ?? "Assessment unavailable"}</p><p className="mt-1 text-sm text-slate-500">{exam?.durationMinutes ?? "—"} minutes · {attempt?.status?.replaceAll("_", " ") ?? (available ? "Available" : "Scheduled")}</p>{exam?.startsAt && <p className="mt-1 text-xs text-slate-500">Starts {new Date(exam.startsAt).toLocaleString()}</p>}</div>{available ? <button type="button" onClick={() => navigate(`/app/take/${exam._id}`)} className="button">{attempt ? "Resume assessment" : "Start readiness"}</button> : <span className="text-sm text-slate-500">{attempt?.receiptCode ? `Receipt: ${attempt.receiptCode}` : "Not currently available"}</span>}</article>; }) : <p className="rounded-xl border border-dashed p-8 text-center text-sm text-slate-500">No assessments have been assigned to you yet.</p>}</div></section><section className="card"><h3 className="font-semibold">Released results</h3><div className="mt-4 space-y-2">{assigned.filter((item: any) => item.grade).length ? assigned.filter((item: any) => item.grade).map((item: any) => <div key={item.id} className="flex justify-between rounded-lg bg-slate-50 p-3 text-sm"><span>{item.exam?.title}</span><span className="font-semibold">{item.grade.totalMarks}/{item.grade.maxMarks}</span></div>) : <p className="text-sm text-slate-500">Results appear here only after your organization releases them.</p>}</div></section></div>;
 }
+}
+*/
 function Exams({ session }: { session: Session }) {
   const navigate = useNavigate();
   const { data = [], isLoading } = useQuery({

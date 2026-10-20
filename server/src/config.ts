@@ -1,12 +1,14 @@
 import dotenv from 'dotenv';
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { z } from 'zod';
 
-// npm workspaces execute the server with `server/` as cwd, while production
-// processes commonly use the repository root. Load a local file only when
-// present; already-provided environment variables always retain precedence.
-const envFile = [resolve(process.cwd(), '.env'), resolve(process.cwd(), '..', '.env')].find(existsSync);
+// Workspace scripts execute under `server/`; root scripts execute under the
+// repository root. Prefer the repository .env in either case. Values supplied
+// by the OS retain precedence because dotenv never overrides them.
+const cwd = process.cwd();
+const repositoryEnv = basename(cwd) === 'server' ? resolve(cwd, '..', '.env') : resolve(cwd, '.env');
+const envFile = [repositoryEnv, resolve(cwd, '.env')].find(existsSync);
 if (envFile) dotenv.config({ path: envFile, override: false });
 
 const schema = z.object({
@@ -24,3 +26,4 @@ const schema = z.object({
 });
 export type Config = z.infer<typeof schema>;
 export const loadConfig = (env = process.env): Config => schema.parse(env);
+export const configurationErrorMessage = () => 'Configuration is invalid. Set MONGODB_URI, MONGODB_DB_NAME, and a 32+ character JWT_SECRET in the root .env file.';

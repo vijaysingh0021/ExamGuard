@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "node:crypto";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
@@ -40,7 +41,7 @@ import {
   VerificationRequest,
 } from "./models.js";
 import { canStartExam, deadlineFor, isAttemptOpen } from "./exam.js";
-import { putPrivateDocument, storageConfigured } from "./storage.js";
+import { privateDocumentUrl, putPrivateDocument, storageConfigured } from "./storage.js";
 import { dedupeWindow, fingerprintFor, reviewPriority } from "./proctor.js";
 import { automaticallyGrade } from "./grading.js";
 import {
@@ -205,7 +206,7 @@ const proctorEventInput = z.object({
   occurredAt: z.string().datetime(),
   source: z.literal("browser"),
   details: z.record(z.unknown()).optional(),
-  evidenceKey: z.never().optional(),
+  evidenceKey: z.string().max(512).optional(),
 });
 const radioObservationInput = z
   .object({
@@ -1272,7 +1273,7 @@ app.get(
       organizationId,
       candidateId: candidate._id,
     })
-      .populate("examId", "title status startsAt endsAt durationMinutes instructions")
+      .populate("examId", "title status startsAt endsAt durationMinutes instructions requireVerification")
       .lean();
     const attempts = await ExamAttempt.find({
       organizationId,
@@ -1287,8 +1288,15 @@ app.get(
     })
       .select("examId totalMarks maxMarks feedback publishedAt")
       .lean();
+    const verification = await VerificationRequest.findOne({
+      organizationId,
+      candidateId: candidate._id,
+    })
+      .select("status submittedAt reviewedAt rejectionReason")
+      .lean();
     res.json({
       candidate: { id: String(candidate._id), name: candidate.name },
+      verification: verification ?? { status: "not_submitted" },
       assignments: assignments.map((assignment) => {
         const exam = assignment.examId as unknown as { _id?: unknown };
         const examId = String(exam?._id ?? assignment.examId);
@@ -1604,6 +1612,21 @@ app.get(
     ),
 );
 app.post(
+  "/api/student/attempts/:attemptId/evidence",
+  authenticate,
+  upload.single("file"),
+  async (req: AuthRequest, res, next) => {
+    try {
+      if (!storageConfigured()) return res.status(503).json({ error: "Private evidence storage is not configured" });
+      const attempt = await ExamAttempt.findOne({ _id: req.params.attemptId, userId: req.auth!.userId, status: "in_progress", deadlineAt: { $gt: new Date() } });
+      if (!attempt || !req.file || !["image/jpeg", "image/png", "image/webp"].includes(req.file.mimetype)) return res.status(403).json({ error: "An active attempt and a JPEG, PNG, or WebP image are required" });
+      const key = `organizations/${attempt.organizationId}/attempts/${attempt.id}/evidence/${crypto.randomUUID()}`;
+      await putPrivateDocument(key, req.file.buffer, req.file.mimetype);
+      res.status(201).json({ evidenceKey: key });
+    } catch (error) { next(error); }
+  },
+);
+app.post(
   "/api/organizations/:organizationId/proctoring/events",
   authenticate,
   async (req: AuthRequest, res, next) => {
@@ -1628,6 +1651,8 @@ app.post(
         return res
           .status(403)
           .json({ error: "An active authorized attempt is required" });
+      if (data.evidenceKey && !data.evidenceKey.startsWith(`organizations/${organizationId}/attempts/${attempt.id}/evidence/`))
+        return res.status(403).json({ error: "Evidence does not belong to this active attempt" });
       const policy = exam.interventionPolicy ?? {
         windowSeconds: 300,
         warningAt: 1,
@@ -2064,15 +2089,17 @@ app.get(
   "/api/organizations/:organizationId/incidents",
   authenticate,
   authorize("institute_admin", "teacher", "proctor"),
-  async (req: AuthRequest, res) =>
-    res.json(
-      await Incident.find({ organizationId: req.auth!.organizationId })
+  async (req: AuthRequest, res, next) => {
+    try {
+      const incidents = await Incident.find({ organizationId: req.auth!.organizationId })
         .sort({ createdAt: -1 })
         .populate("eventIds")
         .populate("candidateId", "name email")
         .populate("examId", "title")
-        .lean(),
-    ),
+        .lean();
+      res.json(await Promise.all(incidents.map(async (incident) => ({ ...incident, eventIds: await Promise.all((incident.eventIds as Array<{ evidenceKey?: string }>).map(async (event) => ({ ...event, evidenceUrl: event.evidenceKey && storageConfigured() ? await privateDocumentUrl(event.evidenceKey) : undefined }))) }))));
+    } catch (error) { next(error); }
+  },
 );
 app.post(
   "/api/organizations/:organizationId/incidents/:incidentId/decision",

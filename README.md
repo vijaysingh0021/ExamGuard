@@ -8,6 +8,17 @@ Multi-institute online examinations and AI-assisted integrity operations. The Re
 2. Run `npm install` then `npm run dev`.
 3. Open `http://localhost:5173`.
 
+### Atlas-free local demo
+
+For a complete local demo without MongoDB Atlas or Docker, run `npm install` once and then `npm run dev:local`. It creates an ephemeral in-memory database, seeds synthetic data, and starts the API and client. Press `Ctrl+C` to remove the local database. This explicit mode downloads a MongoDB binary, so avoid it when disk space is limited. It does not use or modify `.env` or cloud data.
+
+Use the login that matches the selected portal:
+
+- Institute: `aarav.admin@demo.examguard.test` / `ExamGuardLocalDemo2026!`
+- Student: `aditi.candidate@demo.examguard.test` / `ExamGuardLocalDemo2026!`
+
+If an old API/client pair is already listening on ports 4000 or 5173, stop it before starting the local demo; the startup script deliberately refuses to mix processes with a fresh in-memory database.
+
 The API deliberately exits when MongoDB Atlas configuration or connection fails. It does not fall back to a local database. To add clearly labelled development data after configuring Atlas, run `npm run seed` and sign in with the credentials printed by the command.
 
 ## Verification
