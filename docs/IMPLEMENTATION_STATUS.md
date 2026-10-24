@@ -2,7 +2,7 @@
 
 ## Repository audit
 
-- The React/Vite client and Express/MongoDB API already support tenant-scoped attempts, proctoring events, incidents, audit logs, and reviewer decisions.
+- The React/Vite client and Express/PostgreSQL API already support tenant-scoped attempts, proctoring events, incidents, audit logs, and reviewer decisions.
 - `device-monitor/` was only a placeholder; no previous desktop framework existed.
 - The institution directory uses the Hipolabs public endpoint through the API. It has timeout, one retry, and a five-minute in-memory cache; failures expose a real unavailable state plus the existing review-request fallback.
 
@@ -10,7 +10,7 @@
 
 - Windows .NET 8 companion source using `BluetoothLEAdvertisementWatcher` and Native Wi-Fi `WlanScan`/`WlanGetNetworkBssList`.
 - Explicit consent, visible scan status, timestamps/activity log, scan-stop action, error reporting, and session-scoped in-memory identifier pseudonyms.
-- MongoDB records for raw radio observations and separate candidate signals.
+- PostgreSQL tables for raw radio observations and separate candidate signals.
 - Authenticated, rate-limited observation ingestion; the API verifies the bearer user owns the active candidate attempt and uses server timestamps.
 - A conservative server rule creates a review-only candidate signal after three observations of a category within five minutes. It cannot pause, terminate, grade, or penalize an attempt.
 - Authorized reviewer listing and decisions with audit logs.

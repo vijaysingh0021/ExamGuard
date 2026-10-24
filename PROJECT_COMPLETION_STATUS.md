@@ -2,7 +2,7 @@
 
 ## Completed
 
-- Preserved the existing tenant-scoped Express/MongoDB examination, grading, verification, reporting, and proctoring implementation.
+- Preserved the existing tenant-scoped Express/PostgreSQL examination, grading, verification, reporting, and proctoring implementation.
 - Added password-policy enforcement to organization registration and made recovery responses account-enumeration safe.
 - Added Google and Microsoft OIDC authorization-code sign-in support with PKCE, nonce, state, issuer/audience validation, short-lived server-side authorization state, and explicit existing-identity linking only.
 - Added login-provider discovery and real provider actions only when server credentials are configured.
@@ -18,7 +18,7 @@
 
 ## External configuration required
 
-- MongoDB Atlas credentials/network access.
+- PostgreSQL connection details (`DATABASE_URL`) and applied Prisma migrations.
 - A private S3-compatible bucket for candidate documents.
 - A mail-webhook endpoint for password-reset delivery.
 - Google and/or Microsoft application registrations, client credentials, and exact API callback URLs.

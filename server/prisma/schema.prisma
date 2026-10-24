@@ -1,0 +1,760 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  platform_admin
+  institute_admin
+  teacher
+  proctor
+  student
+}
+
+enum AuthProvider {
+  google
+  microsoft
+  apple
+  github
+  oidc
+}
+
+enum InstitutionRequestStatus {
+  submitted
+  under_review
+  approved
+  rejected
+}
+
+enum ExamStatus {
+  draft
+  published
+  scheduled
+  live
+  completed
+}
+
+enum QuestionType {
+  mcq
+  multiple_select
+  true_false
+  short_answer
+  descriptive
+}
+
+enum AttemptStatus {
+  in_progress
+  paused
+  terminated
+  submitted
+  expired
+}
+
+enum GradeStatus {
+  pending_manual
+  graded
+  published
+}
+
+enum VerificationStatus {
+  draft
+  submitted
+  approved
+  rejected
+  resubmission_required
+}
+
+enum NotificationDelivery {
+  in_app
+  email_unconfigured
+}
+
+enum EventSource {
+  browser
+  ai_service
+}
+
+enum PolicyAction {
+  recorded
+  warning
+  paused
+  terminated
+  technical
+}
+
+enum Severity {
+  low
+  medium
+  high
+}
+
+enum IncidentStatus {
+  open
+  dismissed
+  resolved
+  escalated
+  awaiting_student
+}
+
+enum ExplanationStatus {
+  requested
+  responded
+  follow_up
+  closed
+}
+
+enum RadioSource {
+  bluetooth_le
+  wifi
+  scanner_health
+}
+
+enum RadioKind {
+  advertisement
+  access_point
+  scan_unavailable
+  permission_denied
+  scan_error
+  scan_stopped
+}
+
+enum ScannerStatus {
+  active
+  unavailable
+  permission_denied
+  stopped
+  error
+}
+
+enum RadioSignalStatus {
+  pending_review
+  reviewed_no_concern
+  reviewed_concern_retained
+  insufficient_evidence
+}
+
+model Organization {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  status    String   @default("active")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships           Membership[]
+  exams                 Exam[]
+  questionBanks         QuestionBank[]
+  questions             Question[]
+  candidates            Candidate[]
+  examAssignments       ExamAssignment[]
+  examAttempts          ExamAttempt[]
+  attemptAnswers        AttemptAnswer[]
+  examSessions          ExamSession[]
+  grades                Grade[]
+  verificationRequests  VerificationRequest[]
+  proctoringConfig      ProctoringConfig?
+  notifications         Notification[]
+  auditLogs             AuditLog[]
+  proctoringEvents      ProctoringEvent[]
+  incidents             Incident[]
+  studentExplanations   StudentExplanation[]
+  radioObservations     RadioObservation[]
+  radioCandidateSignals RadioCandidateSignal[]
+
+  @@map("organizations")
+}
+
+model User {
+  id              String   @id @default(uuid()) @db.Uuid
+  name            String
+  email           String   @unique
+  passwordHash    String
+  isPlatformAdmin Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  memberships           Membership[]
+  identities            AuthIdentity[]
+  passwordResetTokens   PasswordResetToken[]
+  reviewedRequests      InstitutionRequest[]
+  createdExams          Exam[]
+  createdQuestionBanks  QuestionBank[]
+  candidates            Candidate[]
+  attempts              ExamAttempt[]
+  publishedGrades       Grade[]
+  reviewedVerifications VerificationRequest[]
+  notifications         Notification[]
+  auditLogs             AuditLog[]
+  reviewedRadioSignals  RadioCandidateSignal[]
+
+  @@map("users")
+}
+
+model Membership {
+  userId         String   @db.Uuid
+  organizationId String   @db.Uuid
+  role           Role
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@id([userId, organizationId])
+  @@index([organizationId])
+  @@map("memberships")
+}
+
+model AuthIdentity {
+  id              String       @id @default(uuid()) @db.Uuid
+  userId          String       @db.Uuid
+  provider        AuthProvider
+  providerSubject String
+  emailAtLink     String?
+  linkedAt        DateTime     @default(now())
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerSubject])
+  @@unique([userId, provider])
+  @@map("auth_identities")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
+}
+
+model OAuthAuthorization {
+  id           String       @id @default(uuid()) @db.Uuid
+  provider     AuthProvider
+  state        String       @unique
+  nonce        String
+  codeVerifier String
+  expiresAt    DateTime
+  createdAt    DateTime     @default(now())
+
+  @@index([expiresAt])
+  @@map("oauth_authorizations")
+}
+
+model InstitutionRequest {
+  id             String                   @id @default(uuid()) @db.Uuid
+  name           String
+  countryCode    String
+  region         String?
+  website        String?
+  details        String?
+  requesterEmail String
+  status         InstitutionRequestStatus @default(submitted)
+  reviewerId     String?                  @db.Uuid
+  reviewReason   String?
+  createdAt      DateTime                 @default(now())
+  updatedAt      DateTime                 @updatedAt
+
+  reviewer User? @relation(fields: [reviewerId], references: [id])
+
+  @@unique([name, countryCode, requesterEmail])
+  @@map("institution_requests")
+}
+
+model Exam {
+  id                  String     @id @default(uuid()) @db.Uuid
+  organizationId      String     @db.Uuid
+  title               String
+  instructions        String     @default("")
+  status              ExamStatus @default(draft)
+  startsAt            DateTime?
+  endsAt              DateTime?
+  durationMinutes     Int
+  accessCodeHash      String?
+  randomizeQuestions  Boolean    @default(false)
+  randomizeOptions    Boolean    @default(false)
+  requireVerification Boolean    @default(true)
+
+  policyWindowSeconds               Int     @default(300)
+  policyWarningAt                   Int     @default(1)
+  policyPauseAt                     Int     @default(3)
+  policyTerminateAt                 Int     @default(5)
+  policyAutomaticTerminationEnabled Boolean @default(false)
+  policyFullscreenRequired          Boolean @default(false)
+
+  createdById String   @db.Uuid
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  organization          Organization           @relation(fields: [organizationId], references: [id])
+  createdBy             User                   @relation(fields: [createdById], references: [id])
+  questions             Question[]
+  assignments           ExamAssignment[]
+  attempts              ExamAttempt[]
+  sessions              ExamSession[]
+  grades                Grade[]
+  proctoringEvents      ProctoringEvent[]
+  incidents             Incident[]
+  radioObservations     RadioObservation[]
+  radioCandidateSignals RadioCandidateSignal[]
+
+  @@index([organizationId])
+  @@map("exams")
+}
+
+model QuestionBank {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  name           String
+  description    String?
+  createdById    String   @db.Uuid
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  createdBy    User         @relation(fields: [createdById], references: [id])
+  questions    Question[]
+
+  @@index([organizationId])
+  @@map("question_banks")
+}
+
+model Question {
+  id             String       @id @default(uuid()) @db.Uuid
+  organizationId String       @db.Uuid
+  bankId         String?      @db.Uuid
+  examId         String?      @db.Uuid
+  type           QuestionType
+  prompt         String
+  options        Json?
+  correctAnswer  Json?
+  marks          Float
+  negativeMarks  Float        @default(0)
+  position       Int?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  organization Organization    @relation(fields: [organizationId], references: [id])
+  bank         QuestionBank?   @relation(fields: [bankId], references: [id])
+  exam         Exam?           @relation(fields: [examId], references: [id])
+  answers      AttemptAnswer[]
+
+  @@index([organizationId])
+  @@index([examId])
+  @@index([bankId])
+  @@map("questions")
+}
+
+model Candidate {
+  id              String    @id @default(uuid()) @db.Uuid
+  organizationId  String    @db.Uuid
+  userId          String?   @db.Uuid
+  name            String
+  email           String
+  phone           String?
+  emailVerifiedAt DateTime?
+  phoneVerifiedAt DateTime?
+  externalId      String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  organization          Organization           @relation(fields: [organizationId], references: [id])
+  user                  User?                  @relation(fields: [userId], references: [id])
+  assignments           ExamAssignment[]
+  attempts              ExamAttempt[]
+  sessions              ExamSession[]
+  grades                Grade[]
+  verificationRequests  VerificationRequest[]
+  proctoringEvents      ProctoringEvent[]
+  incidents             Incident[]
+  studentExplanations   StudentExplanation[]
+  radioObservations     RadioObservation[]
+  radioCandidateSignals RadioCandidateSignal[]
+
+  @@unique([organizationId, email])
+  @@index([userId])
+  @@map("candidates")
+}
+
+model ExamAssignment {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  examId         String   @db.Uuid
+  candidateId    String   @db.Uuid
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  exam         Exam         @relation(fields: [examId], references: [id])
+  candidate    Candidate    @relation(fields: [candidateId], references: [id])
+
+  @@unique([examId, candidateId])
+  @@index([organizationId])
+  @@index([candidateId])
+  @@map("exam_assignments")
+}
+
+model ExamAttempt {
+  id                 String        @id @default(uuid()) @db.Uuid
+  organizationId     String        @db.Uuid
+  examId             String        @db.Uuid
+  candidateId        String        @db.Uuid
+  userId             String        @db.Uuid
+  status             AttemptStatus @default(in_progress)
+  startedAt          DateTime
+  deadlineAt         DateTime
+  submittedAt        DateTime?
+  receiptCode        String?
+  interventionReason String?
+  pausedAt           DateTime?
+  terminatedAt       DateTime?
+  questionOrder      String[]      @default([])
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  organization          Organization           @relation(fields: [organizationId], references: [id])
+  exam                  Exam                   @relation(fields: [examId], references: [id])
+  candidate             Candidate              @relation(fields: [candidateId], references: [id])
+  user                  User                   @relation(fields: [userId], references: [id])
+  answers               AttemptAnswer[]
+  grade                 Grade?
+  proctoringEvents      ProctoringEvent[]
+  radioObservations     RadioObservation[]
+  radioCandidateSignals RadioCandidateSignal[]
+
+  @@unique([examId, candidateId])
+  @@index([organizationId, status])
+  @@index([candidateId])
+  @@index([userId])
+  @@map("exam_attempts")
+}
+
+model AttemptAnswer {
+  attemptId      String   @db.Uuid
+  questionId     String   @db.Uuid
+  organizationId String   @db.Uuid
+  value          Json?
+  savedAt        DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  attempt      ExamAttempt  @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  question     Question     @relation(fields: [questionId], references: [id])
+
+  @@id([attemptId, questionId])
+  @@index([organizationId])
+  @@map("attempt_answers")
+}
+
+model ExamSession {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  examId         String   @db.Uuid
+  candidateId    String   @db.Uuid
+  status         String   @default("pending")
+  riskScore      Float    @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization     Organization      @relation(fields: [organizationId], references: [id])
+  exam             Exam              @relation(fields: [examId], references: [id])
+  candidate        Candidate         @relation(fields: [candidateId], references: [id])
+  proctoringEvents ProctoringEvent[]
+  incidents        Incident[]
+
+  @@index([organizationId])
+  @@index([examId])
+  @@index([candidateId])
+  @@map("exam_sessions")
+}
+
+model Grade {
+  id             String      @id @default(uuid()) @db.Uuid
+  organizationId String      @db.Uuid
+  attemptId      String      @unique @db.Uuid
+  examId         String      @db.Uuid
+  candidateId    String      @db.Uuid
+  autoMarks      Float       @default(0)
+  manualMarks    Float       @default(0)
+  totalMarks     Float       @default(0)
+  maxMarks       Float
+  status         GradeStatus @default(pending_manual)
+  feedback       String?
+  publishedAt    DateTime?
+  publishedById  String?     @db.Uuid
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  attempt      ExamAttempt  @relation(fields: [attemptId], references: [id])
+  exam         Exam         @relation(fields: [examId], references: [id])
+  candidate    Candidate    @relation(fields: [candidateId], references: [id])
+  publishedBy  User?        @relation(fields: [publishedById], references: [id])
+
+  @@index([organizationId])
+  @@index([examId])
+  @@index([candidateId])
+  @@map("grades")
+}
+
+model VerificationRequest {
+  id              String             @id @default(uuid()) @db.Uuid
+  organizationId  String             @db.Uuid
+  candidateId     String             @db.Uuid
+  status          VerificationStatus @default(draft)
+  profilePhoto    String?
+  idDocument      String?
+  rejectionReason String?
+  submittedAt     DateTime?
+  reviewedAt      DateTime?
+  reviewedById    String?            @db.Uuid
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  candidate    Candidate    @relation(fields: [candidateId], references: [id])
+  reviewedBy   User?        @relation(fields: [reviewedById], references: [id])
+
+  @@unique([organizationId, candidateId])
+  @@index([organizationId, status])
+  @@index([candidateId])
+  @@map("verification_requests")
+}
+
+model ProctoringConfig {
+  id                       String   @id @default(uuid()) @db.Uuid
+  organizationId           String   @unique @db.Uuid
+  samplingIntervalMs       Int      @default(5000)
+  cooldownSeconds          Int      @default(30)
+  lookingAwayDegrees       Int      @default(30)
+  multipleFaceFrames       Int      @default(3)
+  phoneDetectionEnabled    Boolean  @default(false)
+  explanationDeadlineHours Int      @default(72)
+  signalWeights            Json     @default("{\"face_missing\": 15, \"multiple_faces\": 25, \"looking_away\": 10, \"phone_detected\": 30, \"visibility_hidden\": 10, \"fullscreen_exit\": 10}")
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@map("proctoring_configs")
+}
+
+model Notification {
+  id             String               @id @default(uuid()) @db.Uuid
+  organizationId String               @db.Uuid
+  userId         String               @db.Uuid
+  type           String
+  title          String
+  body           String
+  readAt         DateTime?
+  delivery       NotificationDelivery @default(in_app)
+  metadata       Json?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([organizationId])
+  @@map("notifications")
+}
+
+model AuditLog {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  actorId        String?  @db.Uuid
+  action         String
+  targetType     String?
+  targetId       String?
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  actor        User?        @relation(fields: [actorId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@index([actorId])
+  @@map("audit_logs")
+}
+
+model ProctoringEvent {
+  id             String       @id @default(uuid()) @db.Uuid
+  organizationId String       @db.Uuid
+  examId         String       @db.Uuid
+  candidateId    String       @db.Uuid
+  sessionId      String?      @db.Uuid
+  attemptId      String?      @db.Uuid
+  type           String
+  occurredAt     DateTime
+  source         EventSource
+  confidence     Float?
+  evidenceKey    String?
+  fingerprint    String
+  warningCount   Int          @default(0)
+  policyAction   PolicyAction @default(recorded)
+  details        Json?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  organization Organization    @relation(fields: [organizationId], references: [id])
+  exam         Exam            @relation(fields: [examId], references: [id])
+  candidate    Candidate       @relation(fields: [candidateId], references: [id])
+  session      ExamSession?    @relation(fields: [sessionId], references: [id])
+  attempt      ExamAttempt?    @relation(fields: [attemptId], references: [id])
+  incidents    IncidentEvent[]
+
+  @@index([organizationId, fingerprint, occurredAt(sort: Desc)])
+  @@index([examId])
+  @@index([attemptId])
+  @@map("proctoring_events")
+}
+
+model Incident {
+  id                    String         @id @default(uuid()) @db.Uuid
+  organizationId        String         @db.Uuid
+  examId                String?        @db.Uuid
+  candidateId           String?        @db.Uuid
+  sessionId             String?        @db.Uuid
+  severity              Severity
+  type                  String
+  status                IncidentStatus @default(open)
+  details               String?
+  riskPriority          Float          @default(0)
+  contributingSignals   Json           @default("[]")
+  decisionReason        String?
+  reviewerNotes         String?
+  explanationDeadlineAt DateTime?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  organization Organization         @relation(fields: [organizationId], references: [id])
+  exam         Exam?                @relation(fields: [examId], references: [id])
+  candidate    Candidate?           @relation(fields: [candidateId], references: [id])
+  session      ExamSession?         @relation(fields: [sessionId], references: [id])
+  events       IncidentEvent[]
+  explanations StudentExplanation[]
+
+  @@index([organizationId, status])
+  @@index([examId])
+  @@index([candidateId])
+  @@map("incidents")
+}
+
+model IncidentEvent {
+  incidentId String @db.Uuid
+  eventId    String @db.Uuid
+
+  incident Incident        @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  event    ProctoringEvent @relation(fields: [eventId], references: [id])
+
+  @@id([incidentId, eventId])
+  @@index([eventId])
+  @@map("incident_events")
+}
+
+model StudentExplanation {
+  id               String            @id @default(uuid()) @db.Uuid
+  organizationId   String            @db.Uuid
+  incidentId       String            @db.Uuid
+  candidateId      String            @db.Uuid
+  body             String            @default("")
+  evidenceKey      String?
+  followUpQuestion String?
+  status           ExplanationStatus @default(requested)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  incident     Incident     @relation(fields: [incidentId], references: [id])
+  candidate    Candidate    @relation(fields: [candidateId], references: [id])
+
+  @@unique([incidentId, candidateId])
+  @@index([organizationId])
+  @@index([incidentId])
+  @@index([candidateId])
+  @@map("student_explanations")
+}
+
+model RadioObservation {
+  id             String        @id @default(uuid()) @db.Uuid
+  organizationId String        @db.Uuid
+  examId         String        @db.Uuid
+  candidateId    String        @db.Uuid
+  attemptId      String        @db.Uuid
+  source         RadioSource
+  kind           RadioKind
+  observedAt     DateTime
+  rssi           Int?
+  pseudonym      String?
+  scannerStatus  ScannerStatus
+  errorCode      String?
+  fingerprint    String
+  limitations    String
+  expiresAt      DateTime      @default(dbgenerated("(CURRENT_TIMESTAMP + interval '30 days')"))
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  organization Organization             @relation(fields: [organizationId], references: [id])
+  exam         Exam                     @relation(fields: [examId], references: [id])
+  candidate    Candidate                @relation(fields: [candidateId], references: [id])
+  attempt      ExamAttempt              @relation(fields: [attemptId], references: [id])
+  signals      RadioSignalObservation[]
+
+  @@unique([organizationId, fingerprint])
+  @@index([expiresAt])
+  @@index([organizationId, attemptId, observedAt(sort: Desc)])
+  @@map("radio_observations")
+}
+
+model RadioCandidateSignal {
+  id             String            @id @default(uuid()) @db.Uuid
+  organizationId String            @db.Uuid
+  examId         String            @db.Uuid
+  candidateId    String            @db.Uuid
+  attemptId      String            @db.Uuid
+  rule           String
+  label          String
+  status         RadioSignalStatus @default(pending_review)
+  reviewerId     String?           @db.Uuid
+  reviewerNotes  String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  organization Organization             @relation(fields: [organizationId], references: [id])
+  exam         Exam                     @relation(fields: [examId], references: [id])
+  candidate    Candidate                @relation(fields: [candidateId], references: [id])
+  attempt      ExamAttempt              @relation(fields: [attemptId], references: [id])
+  reviewer     User?                    @relation(fields: [reviewerId], references: [id])
+  observations RadioSignalObservation[]
+
+  @@index([organizationId, attemptId, rule, status])
+  @@map("radio_candidate_signals")
+}
+
+model RadioSignalObservation {
+  signalId      String @db.Uuid
+  observationId String @db.Uuid
+
+  signal      RadioCandidateSignal @relation(fields: [signalId], references: [id], onDelete: Cascade)
+  observation RadioObservation     @relation(fields: [observationId], references: [id])
+
+  @@id([signalId, observationId])
+  @@index([observationId])
+  @@map("radio_signal_observations")
+}

@@ -4,17 +4,12 @@
   "version": "0.1.0",
   "workspaces": ["client", "server"],
   "scripts": {
-    "dev": "npm run dev:atlas",
-    "dev:atlas": "node scripts/dev-atlas.mjs",
-    "dev:local": "node scripts/dev-local.mjs",
+    "dev": "concurrently \"npm run dev -w server\" \"npm run dev -w client\"",
     "build": "npm run build -w server && npm run build -w client",
     "typecheck": "npm run typecheck -w server && npm run typecheck -w client",
     "lint": "npm run lint -w server && npm run lint -w client",
     "test": "npm run test -w server",
     "seed": "npm run seed -w server"
   },
-  "devDependencies": {
-    "concurrently": "^9.1.2",
-    "mongodb-memory-server": "^10.3.0"
-  }
+  "devDependencies": { "concurrently": "^9.1.2" }
 }

@@ -1,8 +1,7 @@
-import mongoose from 'mongoose';
-import { loadConfig } from './config.js';
+import { prisma } from './prisma.js';
 
 export async function connectDatabase() {
-  const config = loadConfig();
-  await mongoose.connect(config.MONGODB_URI, { dbName: config.MONGODB_DB_NAME, serverSelectionTimeoutMS: 15_000 });
-  console.info(`MongoDB connected: ${mongoose.connection.name}`);
+  await prisma.$connect();
+  const [{ current_database }] = await prisma.$queryRaw<{ current_database: string }[]>`SELECT current_database()`;
+  console.info(`PostgreSQL connected: ${current_database}`);
 }

@@ -1,25 +1,31 @@
 # ExamGuard
 
-Multi-institute online examinations and AI-assisted integrity operations. The React/Vite client lives in `client/`; the Express/MongoDB Atlas API lives in `server/`. `ai-service/` and `device-monitor/` are intentional service boundaries; no dedicated hardware integration is included.
+Multi-institute online examinations and AI-assisted integrity operations. The React/Vite client lives in `client/`; the Express/PostgreSQL (Prisma) API lives in `server/`. `ai-service/` and `device-monitor/` are intentional service boundaries; no dedicated hardware integration is included.
 
 ## Run locally
 
-1. Copy `.env.example` to `.env` and provide a real MongoDB Atlas connection string, database name, and 32+ character JWT secret.
-2. Run `npm install` then `npm run dev`.
-3. Open `http://localhost:5173`.
+1. Install PostgreSQL 16+ and create an empty database plus a user for it. In development the user also needs the `CREATEDB` permission, because Prisma uses a temporary shadow database when it creates migrations.
+2. Copy `.env.example` to `.env` and set `DATABASE_URL` and a 32+ character `JWT_SECRET`.
+3. Run `npm install`, then from `server/` run `npx prisma migrate deploy` (or `npx prisma migrate dev` while changing the schema) and `npx prisma generate`.
+4. Run `npm run dev` from the repository root and open `http://localhost:5173`.
 
-### Atlas-free local demo
+The API deliberately exits when the PostgreSQL configuration or connection fails. It does not fall back to a different database.
 
-For a complete local demo without MongoDB Atlas or Docker, run `npm install` once and then `npm run dev:local`. It creates an ephemeral in-memory database, seeds synthetic data, and starts the API and client. Press `Ctrl+C` to remove the local database. This explicit mode downloads a MongoDB binary, so avoid it when disk space is limited. It does not use or modify `.env` or cloud data.
+### Demo data
 
-Use the login that matches the selected portal:
+To add clearly labelled development data after the migrations are applied, use a non-production database and run (PowerShell):
 
-- Institute: `aarav.admin@demo.examguard.test` / `ExamGuardLocalDemo2026!`
-- Student: `aditi.candidate@demo.examguard.test` / `ExamGuardLocalDemo2026!`
+```powershell
+$env:DEMO_SEED = 'yes'
+$env:DEMO_SEED_PASSWORD = 'choose-a-local-password-with-12-or-more-characters'
+npm.cmd run seed
+```
 
-If an old API/client pair is already listening on ports 4000 or 5173, stop it before starting the local demo; the startup script deliberately refuses to mix processes with a fresh in-memory database.
+Sign in with `aarav.admin@demo.examguard.test` (institute) or `aditi.candidate@demo.examguard.test` (student) and the password above. See `docs/DEVELOPMENT_DEMO.md` for details.
 
-The API deliberately exits when MongoDB Atlas configuration or connection fails. It does not fall back to a local database. To add clearly labelled development data after configuring Atlas, run `npm run seed` and sign in with the credentials printed by the command.
+### Maintenance
+
+PostgreSQL has no automatic expiry of short-lived rows. Remove expired password-reset tokens, OAuth states and radio observations periodically (for example daily) with `npx tsx scripts/purge-expired.ts` from `server/`.
 
 ## Verification
 

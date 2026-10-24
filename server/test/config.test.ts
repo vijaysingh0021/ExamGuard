@@ -1,3 +1,4 @@
 import test from 'node:test'; import assert from 'node:assert/strict'; import { loadConfig } from '../src/config.js';
-test('requires Atlas configuration', () => assert.throws(() => loadConfig({ MONGODB_URI: '', MONGODB_DB_NAME: '', JWT_SECRET: '' })));
-test('accepts Atlas configuration', () => assert.equal(loadConfig({ MONGODB_URI: 'mongodb+srv://user:pass@cluster/test', MONGODB_DB_NAME: 'test', JWT_SECRET: 'a'.repeat(32) }).MONGODB_DB_NAME, 'test'));
+test('requires PostgreSQL configuration', () => assert.throws(() => loadConfig({ DATABASE_URL: '', JWT_SECRET: '' })));
+test('accepts PostgreSQL configuration', () => assert.equal(loadConfig({ DATABASE_URL: 'postgresql://user:pass@localhost:5432/test', JWT_SECRET: 'a'.repeat(32) }).DATABASE_URL, 'postgresql://user:pass@localhost:5432/test'));
+test('rejects a non-PostgreSQL database URL', () => assert.throws(() => loadConfig({ DATABASE_URL: 'mongodb://localhost/test', JWT_SECRET: 'a'.repeat(32) })));

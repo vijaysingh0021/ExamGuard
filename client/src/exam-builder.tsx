@@ -4,7 +4,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 
 type Session = { organization: { id: string } };
 type Question = {
-  _id?: string;
+  id?: string;
   type:
     "mcq" | "multiple_select" | "true_false" | "short_answer" | "descriptive";
   prompt: string;
@@ -13,7 +13,7 @@ type Question = {
   marks: number;
   negativeMarks: number;
 };
-type QuestionBank = { _id: string; name: string };
+type QuestionBank = { id: string; name: string };
 const api = axios.create();
 api.interceptors.request.use((config) => {
   const raw = localStorage.getItem("sentinel-session");
@@ -139,7 +139,7 @@ export function ExamBuilder({ session }: { session: Session }) {
             `/api/organizations/${session.organization.id}/exams`,
             payload,
           );
-      const id = response.data._id ?? response.data.id;
+      const id = response.data.id ?? response.data.id;
       setExamId(id);
       setNotice("Draft saved.");
       return id as string;
@@ -180,7 +180,7 @@ export function ExamBuilder({ session }: { session: Session }) {
   const removeQuestion = async (index: number) => {
     const question = questions[index];
     if (!question) return;
-    if (!question._id) {
+    if (!question.id) {
       setQuestions((current) =>
         current.filter((_, itemIndex) => itemIndex !== index),
       );
@@ -191,7 +191,7 @@ export function ExamBuilder({ session }: { session: Session }) {
     setError("");
     try {
       await api.delete(
-        `/api/organizations/${session.organization.id}/exams/${examId}/questions/${question._id}`,
+        `/api/organizations/${session.organization.id}/exams/${examId}/questions/${question.id}`,
       );
       setQuestions((current) =>
         current.filter((_, itemIndex) => itemIndex !== index),
@@ -214,7 +214,7 @@ export function ExamBuilder({ session }: { session: Session }) {
   const saveQuestions = async () => {
     const id = examId ?? (await saveDraft());
     if (!id) return;
-    const unsaved = questions.filter((q) => !q._id);
+    const unsaved = questions.filter((q) => !q.id);
     for (const q of unsaved) {
       if (!q.prompt.trim() || q.marks <= 0)
         return setError("Every question needs a prompt and positive marks.");
@@ -239,7 +239,7 @@ export function ExamBuilder({ session }: { session: Session }) {
       let savedIndex = 0;
       setQuestions((current) =>
         current.map((question) =>
-          question._id ? question : (saved[savedIndex++] ?? question),
+          question.id ? question : (saved[savedIndex++] ?? question),
         ),
       );
       setNotice(
@@ -436,7 +436,7 @@ export function ExamBuilder({ session }: { session: Session }) {
                 >
                   <option value="">Choose a bank</option>
                   {banks.map((bank) => (
-                    <option key={bank._id} value={bank._id}>
+                    <option key={bank.id} value={bank.id}>
                       {bank.name}
                     </option>
                   ))}
@@ -448,7 +448,7 @@ export function ExamBuilder({ session }: { session: Session }) {
                 {bankQuestions.length ? (
                   bankQuestions.map((question) => (
                     <div
-                      key={question._id}
+                      key={question.id}
                       className="flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-3 sm:flex-row sm:items-center sm:justify-between"
                     >
                       <div>
@@ -464,7 +464,7 @@ export function ExamBuilder({ session }: { session: Session }) {
                         type="button"
                         className="button shrink-0"
                         disabled={busy}
-                        onClick={() => addFromBank(question._id!)}
+                        onClick={() => addFromBank(question.id!)}
                       >
                         Add to draft
                       </button>

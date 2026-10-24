@@ -12,8 +12,7 @@ const envFile = [repositoryEnv, resolve(cwd, '.env')].find(existsSync);
 if (envFile) dotenv.config({ path: envFile, override: false });
 
 const schema = z.object({
-  MONGODB_URI: z.string().url().startsWith('mongodb'),
-  MONGODB_DB_NAME: z.string().min(1),
+  DATABASE_URL: z.string().url().startsWith('postgres'),
   JWT_SECRET: z.string().min(32),
   PORT: z.coerce.number().default(4000),
   CLIENT_URL: z.string().url().default('http://localhost:5173'),
@@ -26,4 +25,4 @@ const schema = z.object({
 });
 export type Config = z.infer<typeof schema>;
 export const loadConfig = (env = process.env): Config => schema.parse(env);
-export const configurationErrorMessage = () => 'Configuration is invalid. Set MONGODB_URI, MONGODB_DB_NAME, and a 32+ character JWT_SECRET in the root .env file.';
+export const configurationErrorMessage = () => 'Configuration is invalid. Set DATABASE_URL and a 32+ character JWT_SECRET in the root .env file.';
