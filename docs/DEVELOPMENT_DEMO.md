@@ -2,7 +2,7 @@
 
 The fixture is disabled by default. It creates a clearly labelled demo organization, two teachers, one administrator, five candidate accounts, ten objective questions, one published assessment, and candidate assignments. It creates no monitoring observations.
 
-Use a dedicated, non-production MongoDB database:
+Use a dedicated, non-production PostgreSQL database (the database name in `DATABASE_URL` must not look like production):
 
 ```powershell
 $env:DEMO_SEED = 'yes'

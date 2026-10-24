@@ -9,3 +9,4 @@ bin/
 obj/
 .venv/
 __pycache__/
+server/src/generated

@@ -801,17 +801,17 @@ function StudentExam({ session }: { session: Session }) {
       {attentionWarning && <div role="alert" className="mb-3 flex items-start justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"><span><b>Attention required.</b> {attentionWarning}</span><button type="button" onClick={() => setAttentionWarning("")} className="font-semibold">Dismiss</button></div>}
       <div className="grid gap-5 lg:grid-cols-[1fr_250px]">
         <section className="card">
-          <div className="flex items-center justify-between gap-3"><p className="font-medium">Question {current + 1} of {payload.questions.length}</p><button type="button" onClick={() => setMarked((items) => ({ ...items, [question._id]: !items[question._id] }))} className="text-sm font-semibold text-blue-700">{marked[question._id] ? "Remove review mark" : "Mark for review"}</button></div>
+          <div className="flex items-center justify-between gap-3"><p className="font-medium">Question {current + 1} of {payload.questions.length}</p><button type="button" onClick={() => setMarked((items) => ({ ...items, [question.id]: !items[question.id] }))} className="text-sm font-semibold text-blue-700">{marked[question.id] ? "Remove review mark" : "Mark for review"}</button></div>
           <p className="mt-5 text-lg font-medium">{question.prompt}</p>
           {question.options?.length ? <div className="mt-5 space-y-3">{question.options.map((option: any) => {
-            const selected = question.type === "multiple_select" ? Array.isArray(answers[question._id]) && answers[question._id].includes(option.id) : answers[question._id] === option.id;
-            return <label className="flex cursor-pointer gap-3 rounded-xl border border-slate-200 p-3 hover:border-blue-300" key={option.id}><input type={question.type === "multiple_select" ? "checkbox" : "radio"} name={question._id} checked={selected} onChange={(event) => { const previous = Array.isArray(answers[question._id]) ? answers[question._id] : []; const value = question.type === "multiple_select" ? (event.target.checked ? [...previous, option.id] : previous.filter((item: string) => item !== option.id)) : option.id; void save(question._id, value); }} /><span>{option.text}</span></label>;
-          })}</div> : <textarea className="input mt-5 min-h-40" value={String(answers[question._id] ?? "")} onChange={(event) => setAnswers((items) => ({ ...items, [question._id]: event.target.value }))} onBlur={(event) => void save(question._id, event.target.value)} placeholder="Write your answer" />}
+            const selected = question.type === "multiple_select" ? Array.isArray(answers[question.id]) && answers[question.id].includes(option.id) : answers[question.id] === option.id;
+            return <label className="flex cursor-pointer gap-3 rounded-xl border border-slate-200 p-3 hover:border-blue-300" key={option.id}><input type={question.type === "multiple_select" ? "checkbox" : "radio"} name={question.id} checked={selected} onChange={(event) => { const previous = Array.isArray(answers[question.id]) ? answers[question.id] : []; const value = question.type === "multiple_select" ? (event.target.checked ? [...previous, option.id] : previous.filter((item: string) => item !== option.id)) : option.id; void save(question.id, value); }} /><span>{option.text}</span></label>;
+          })}</div> : <textarea className="input mt-5 min-h-40" value={String(answers[question.id] ?? "")} onChange={(event) => setAnswers((items) => ({ ...items, [question.id]: event.target.value }))} onBlur={(event) => void save(question.id, event.target.value)} placeholder="Write your answer" />}
           <div className="mt-7 flex justify-between"><button type="button" disabled={current === 0} onClick={() => setCurrent((value) => value - 1)} className="button disabled:opacity-50">Previous</button><button type="button" disabled={current === payload.questions.length - 1} onClick={() => setCurrent((value) => value + 1)} className="button disabled:opacity-50">Next</button></div>
         </section>
-        <aside className="card h-fit"><div className="flex items-center justify-between"><h3 className="font-semibold">Question palette</h3><button type="button" onClick={() => setReviewing(true)} className="text-sm font-semibold text-blue-700">Review</button></div><div className="mt-4 grid grid-cols-5 gap-2">{payload.questions.map((item: any, index: number) => <button type="button" key={item._id} onClick={() => setCurrent(index)} aria-label={`Question ${index + 1}`} className={`rounded-lg p-2 text-sm font-semibold ${index === current ? "bg-blue-600 text-white" : marked[item._id] ? "bg-amber-100 text-amber-800" : answered(item._id) ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-700"}`}>{index + 1}</button>)}</div><p className="mt-4 text-xs text-slate-500">Blue: current · green: answered · amber: marked for review</p><button type="button" onClick={() => void submit()} className="button mt-5 w-full">Submit exam</button></aside>
+        <aside className="card h-fit"><div className="flex items-center justify-between"><h3 className="font-semibold">Question palette</h3><button type="button" onClick={() => setReviewing(true)} className="text-sm font-semibold text-blue-700">Review</button></div><div className="mt-4 grid grid-cols-5 gap-2">{payload.questions.map((item: any, index: number) => <button type="button" key={item.id} onClick={() => setCurrent(index)} aria-label={`Question ${index + 1}`} className={`rounded-lg p-2 text-sm font-semibold ${index === current ? "bg-blue-600 text-white" : marked[item.id] ? "bg-amber-100 text-amber-800" : answered(item.id) ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-700"}`}>{index + 1}</button>)}</div><p className="mt-4 text-xs text-slate-500">Blue: current · green: answered · amber: marked for review</p><button type="button" onClick={() => void submit()} className="button mt-5 w-full">Submit exam</button></aside>
       </div>
-      {reviewing && <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/30 p-4"><div className="card w-full max-w-lg"><h3 className="font-semibold">Submission review</h3><p className="mt-2 text-sm text-slate-500">{payload.questions.filter((item: any) => answered(item._id)).length} of {payload.questions.length} questions answered. {Object.values(marked).filter(Boolean).length} marked for review.</p><div className="mt-5 flex justify-end gap-3"><button type="button" onClick={() => setReviewing(false)} className="text-sm font-semibold text-slate-700">Continue editing</button><button type="button" onClick={() => { setReviewing(false); void submit(); }} className="button">Confirm submission</button></div></div></div>}
+      {reviewing && <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/30 p-4"><div className="card w-full max-w-lg"><h3 className="font-semibold">Submission review</h3><p className="mt-2 text-sm text-slate-500">{payload.questions.filter((item: any) => answered(item.id)).length} of {payload.questions.length} questions answered. {Object.values(marked).filter(Boolean).length} marked for review.</p><div className="mt-5 flex justify-end gap-3"><button type="button" onClick={() => setReviewing(false)} className="text-sm font-semibold text-slate-700">Continue editing</button><button type="button" onClick={() => { setReviewing(false); void submit(); }} className="button">Confirm submission</button></div></div></div>}
       {pairingError && <p role="alert" className="mt-3 text-sm text-red-600">{pairingError}</p>}
       {pairingOpen && <div role="dialog" aria-modal="true" aria-label="Windows companion pairing" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/45 p-4"><div className="card w-full max-w-xl"><p className="eyebrow">Optional device monitor</p><h3 className="mt-1 text-lg font-semibold">Pair Windows companion</h3><p className="mt-2 text-sm leading-6 text-slate-600">Open ExamGuard Device Monitor on this Windows laptop, set its API URL to this ExamGuard API, paste this short-lived token, and select <b>Verify pairing</b>. It expires in 10 minutes and works only for this active attempt.</p><label className="mt-5 block text-sm font-medium">Short-lived pairing token<textarea readOnly value={pairingToken} className="input mt-1 min-h-24 font-mono text-xs" onFocus={(event) => event.currentTarget.select()} /></label><p className="mt-3 text-xs leading-5 text-slate-500">The companion asks for consent before Bluetooth/Wi-Fi scanning. It sends session-pseudonymized observations for human review; it cannot automatically grade or penalize this attempt.</p><div className="mt-5 flex justify-end"><button type="button" onClick={() => { setPairingOpen(false); setPairingToken(""); }} className="button">Done</button></div></div></div>}
     </div>
@@ -887,14 +887,14 @@ function Dashboard({ session }: { session: Session }) {
           <div className="space-y-2">
             {data.incidents.map(
               (i: {
-                _id: string;
+                id: string;
                 type: string;
                 severity: string;
                 createdAt: string;
               }) => (
                 <div
                   className="flex items-center justify-between rounded-lg bg-slate-50 p-3"
-                  key={i._id}
+                  key={i.id}
                 >
                   <span className="font-medium">{i.type}</span>
                   <span className="text-xs text-slate-500">
@@ -947,7 +947,7 @@ function CandidateDashboard({ session }: { session: Session }) {
   return <div className="mx-auto max-w-5xl space-y-5">
     <div className="card bg-gradient-to-br from-white to-blue-50"><p className="eyebrow">Candidate workspace</p><h2 className="mt-1 text-2xl font-semibold">Your assessments</h2><p className="mt-2 text-sm text-slate-500">Start only during the published assessment window.</p></div>
     {verificationRequired && <section className="card border-amber-200 bg-amber-50/60"><h3 className="font-semibold">Identity verification</h3><p className="mt-1 text-sm text-slate-600">Status: <b className="capitalize">{String(verification.status).replaceAll("_", " ")}</b>{verification.rejectionReason ? ` — ${verification.rejectionReason}` : ""}</p>{verification.status === "approved" ? <p className="mt-3 text-sm text-emerald-700">Approved. You can start protected assessments during their availability window.</p> : verification.status === "submitted" ? <p className="mt-3 text-sm text-amber-800">Your request is awaiting review by your institute.</p> : <button type="button" onClick={() => void submitVerification()} disabled={submitting} className="button mt-4 disabled:opacity-60">{submitting ? "Submitting…" : verification.status === "resubmission_required" ? "Resubmit identity verification" : "Submit identity verification"}</button>}{notice && <p role="status" className="mt-3 text-sm text-emerald-700">{notice}</p>}{error && <p role="alert" className="mt-3 text-sm text-red-700">{error}</p>}</section>}
-    <section className="card"><h3 className="font-semibold">Assigned assessments</h3><div className="mt-4 space-y-3">{assignments.length ? assignments.map((item: any) => { const exam = item.exam; const attempt = item.attempt; const now = Date.now(); const startsAt = exam?.startsAt ? new Date(exam.startsAt).getTime() : 0; const endsAt = exam?.endsAt ? new Date(exam.endsAt).getTime() : Number.MAX_SAFE_INTEGER; const available = ["published", "scheduled", "live"].includes(exam?.status) && now >= startsAt && now < endsAt && !["submitted", "expired", "terminated"].includes(attempt?.status); return <article key={item.id} className="flex flex-col gap-3 rounded-xl border border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium">{exam?.title ?? "Assessment unavailable"}</p><p className="mt-1 text-sm text-slate-500">{exam?.durationMinutes ?? "—"} minutes · {attempt?.status?.replaceAll("_", " ") ?? (available ? "Available" : "Scheduled")}</p></div>{available ? <button type="button" onClick={() => navigate(`/app/take/${exam._id}`)} className="button">{attempt ? "Resume assessment" : "Start readiness"}</button> : <span className="text-sm text-slate-500">{attempt?.receiptCode ? `Receipt: ${attempt.receiptCode}` : "Not currently available"}</span>}</article>; }) : <p className="rounded-xl border border-dashed p-8 text-center text-sm text-slate-500">No assessments have been assigned to you yet.</p>}</div></section>
+    <section className="card"><h3 className="font-semibold">Assigned assessments</h3><div className="mt-4 space-y-3">{assignments.length ? assignments.map((item: any) => { const exam = item.exam; const attempt = item.attempt; const now = Date.now(); const startsAt = exam?.startsAt ? new Date(exam.startsAt).getTime() : 0; const endsAt = exam?.endsAt ? new Date(exam.endsAt).getTime() : Number.MAX_SAFE_INTEGER; const available = ["published", "scheduled", "live"].includes(exam?.status) && now >= startsAt && now < endsAt && !["submitted", "expired", "terminated"].includes(attempt?.status); return <article key={item.id} className="flex flex-col gap-3 rounded-xl border border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium">{exam?.title ?? "Assessment unavailable"}</p><p className="mt-1 text-sm text-slate-500">{exam?.durationMinutes ?? "—"} minutes · {attempt?.status?.replaceAll("_", " ") ?? (available ? "Available" : "Scheduled")}</p></div>{available ? <button type="button" onClick={() => navigate(`/app/take/${exam.id}`)} className="button">{attempt ? "Resume assessment" : "Start readiness"}</button> : <span className="text-sm text-slate-500">{attempt?.receiptCode ? `Receipt: ${attempt.receiptCode}` : "Not currently available"}</span>}</article>; }) : <p className="rounded-xl border border-dashed p-8 text-center text-sm text-slate-500">No assessments have been assigned to you yet.</p>}</div></section>
   </div>;
 }
 /* Legacy dashboard retained temporarily below for reference while the candidate
@@ -962,7 +962,7 @@ function LegacyCandidateDashboard({ session }: { session: Session }) {
   if (isError) return <div className="card text-center"><AlertTriangle className="mx-auto text-red-500" /><h2 className="mt-3 font-semibold">Your assessments could not be loaded</h2><p className="mt-1 text-sm text-slate-500">Your account needs an assigned candidate record. Contact your examination administrator.</p></div>;
   const now = Date.now();
   const assigned = data.assignments ?? [];
-  return <div className="mx-auto max-w-5xl space-y-5"><div className="card bg-gradient-to-br from-white to-blue-50"><p className="eyebrow">Candidate workspace</p><h2 className="mt-1 text-2xl font-semibold">Your assessments</h2><p className="mt-2 text-sm text-slate-500">Start only during the published assessment window. Your saved progress is restored when you return to an open attempt.</p></div><section className="card"><h3 className="font-semibold">Assigned assessments</h3><div className="mt-4 space-y-3">{assigned.length ? assigned.map((item: any) => { const exam = item.exam; const attempt = item.attempt; const startsAt = exam?.startsAt ? new Date(exam.startsAt).getTime() : 0; const endsAt = exam?.endsAt ? new Date(exam.endsAt).getTime() : Number.MAX_SAFE_INTEGER; const available = ["published", "scheduled", "live"].includes(exam?.status) && now >= startsAt && now < endsAt && !["submitted", "expired", "terminated"].includes(attempt?.status); return <article key={item.id} className="flex flex-col gap-3 rounded-xl border border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium">{exam?.title ?? "Assessment unavailable"}</p><p className="mt-1 text-sm text-slate-500">{exam?.durationMinutes ?? "—"} minutes · {attempt?.status?.replaceAll("_", " ") ?? (available ? "Available" : "Scheduled")}</p>{exam?.startsAt && <p className="mt-1 text-xs text-slate-500">Starts {new Date(exam.startsAt).toLocaleString()}</p>}</div>{available ? <button type="button" onClick={() => navigate(`/app/take/${exam._id}`)} className="button">{attempt ? "Resume assessment" : "Start readiness"}</button> : <span className="text-sm text-slate-500">{attempt?.receiptCode ? `Receipt: ${attempt.receiptCode}` : "Not currently available"}</span>}</article>; }) : <p className="rounded-xl border border-dashed p-8 text-center text-sm text-slate-500">No assessments have been assigned to you yet.</p>}</div></section><section className="card"><h3 className="font-semibold">Released results</h3><div className="mt-4 space-y-2">{assigned.filter((item: any) => item.grade).length ? assigned.filter((item: any) => item.grade).map((item: any) => <div key={item.id} className="flex justify-between rounded-lg bg-slate-50 p-3 text-sm"><span>{item.exam?.title}</span><span className="font-semibold">{item.grade.totalMarks}/{item.grade.maxMarks}</span></div>) : <p className="text-sm text-slate-500">Results appear here only after your organization releases them.</p>}</div></section></div>;
+  return <div className="mx-auto max-w-5xl space-y-5"><div className="card bg-gradient-to-br from-white to-blue-50"><p className="eyebrow">Candidate workspace</p><h2 className="mt-1 text-2xl font-semibold">Your assessments</h2><p className="mt-2 text-sm text-slate-500">Start only during the published assessment window. Your saved progress is restored when you return to an open attempt.</p></div><section className="card"><h3 className="font-semibold">Assigned assessments</h3><div className="mt-4 space-y-3">{assigned.length ? assigned.map((item: any) => { const exam = item.exam; const attempt = item.attempt; const startsAt = exam?.startsAt ? new Date(exam.startsAt).getTime() : 0; const endsAt = exam?.endsAt ? new Date(exam.endsAt).getTime() : Number.MAX_SAFE_INTEGER; const available = ["published", "scheduled", "live"].includes(exam?.status) && now >= startsAt && now < endsAt && !["submitted", "expired", "terminated"].includes(attempt?.status); return <article key={item.id} className="flex flex-col gap-3 rounded-xl border border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium">{exam?.title ?? "Assessment unavailable"}</p><p className="mt-1 text-sm text-slate-500">{exam?.durationMinutes ?? "—"} minutes · {attempt?.status?.replaceAll("_", " ") ?? (available ? "Available" : "Scheduled")}</p>{exam?.startsAt && <p className="mt-1 text-xs text-slate-500">Starts {new Date(exam.startsAt).toLocaleString()}</p>}</div>{available ? <button type="button" onClick={() => navigate(`/app/take/${exam.id}`)} className="button">{attempt ? "Resume assessment" : "Start readiness"}</button> : <span className="text-sm text-slate-500">{attempt?.receiptCode ? `Receipt: ${attempt.receiptCode}` : "Not currently available"}</span>}</article>; }) : <p className="rounded-xl border border-dashed p-8 text-center text-sm text-slate-500">No assessments have been assigned to you yet.</p>}</div></section><section className="card"><h3 className="font-semibold">Released results</h3><div className="mt-4 space-y-2">{assigned.filter((item: any) => item.grade).length ? assigned.filter((item: any) => item.grade).map((item: any) => <div key={item.id} className="flex justify-between rounded-lg bg-slate-50 p-3 text-sm"><span>{item.exam?.title}</span><span className="font-semibold">{item.grade.totalMarks}/{item.grade.maxMarks}</span></div>) : <p className="text-sm text-slate-500">Results appear here only after your organization releases them.</p>}</div></section></div>;
 }
 }
 */
@@ -999,7 +999,7 @@ function Exams({ session }: { session: Session }) {
     setAssigning(true);
     setAssignmentError("");
     try {
-      await Promise.all(selectedCandidateIds.map((candidateId) => api.post(`/api/organizations/${session.organization.id}/exams/${assignmentExam._id}/assignments`, { candidateId })));
+      await Promise.all(selectedCandidateIds.map((candidateId) => api.post(`/api/organizations/${session.organization.id}/exams/${assignmentExam.id}/assignments`, { candidateId })));
       setAssignmentNotice(`${selectedCandidateIds.length} student${selectedCandidateIds.length === 1 ? "" : "s"} assigned successfully.`);
       setSelectedCandidateIds([]);
     } catch (error) {
@@ -1041,12 +1041,12 @@ function Exams({ session }: { session: Session }) {
             ) : data.length ? (
               data.map(
                 (e: {
-                  _id: string;
+                  id: string;
                   title: string;
                   status: string;
                   durationMinutes: number;
                 }) => (
-                  <tr className="border-b last:border-0" key={e._id}>
+                  <tr className="border-b last:border-0" key={e.id}>
                     <td className="py-4 font-medium">{e.title}</td>
                     <td className="py-4">
                       <span className="rounded-full bg-blue-50 px-2 py-1 text-xs text-blue-700">
@@ -1061,7 +1061,7 @@ function Exams({ session }: { session: Session }) {
                         <button
                           type="button"
                           disabled={e.status !== "draft"}
-                          onClick={() => navigate(`/app/exam-builder/${e._id}`)}
+                          onClick={() => navigate(`/app/exam-builder/${e.id}`)}
                           className="text-sm font-semibold text-blue-700 disabled:text-slate-400"
                         >
                           {e.status === "draft" ? "Edit draft" : "Locked"}
@@ -1092,7 +1092,7 @@ function Exams({ session }: { session: Session }) {
       {assignmentExam && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4" role="dialog" aria-modal="true" aria-label="Assign assessment">
         <section className="max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-2xl bg-white p-6 shadow-2xl">
           <div className="flex items-start justify-between gap-4"><div><p className="eyebrow">Assessment delivery</p><h3 className="mt-1 text-lg font-semibold">Assign candidates</h3><p className="mt-1 text-sm text-slate-500">{assignmentExam.title} · {assignmentExam.durationMinutes} minutes</p></div><button type="button" onClick={() => setAssignmentExam(null)} className="rounded-lg px-2 py-1 text-sm font-medium text-slate-500 hover:bg-slate-100">Close</button></div>
-          <div className="mt-5 space-y-2">{candidates.length ? candidates.map((candidate: any) => <label key={candidate._id} className="flex cursor-pointer items-center gap-3 rounded-xl border border-slate-200 p-3 transition hover:border-blue-300 hover:bg-blue-50/40"><input type="checkbox" checked={selectedCandidateIds.includes(candidate._id)} onChange={() => toggleCandidate(candidate._id)} className="h-4 w-4 rounded border-slate-300 text-blue-600" /><span><span className="block text-sm font-semibold">{candidate.name}</span><span className="block text-xs text-slate-500">{candidate.email}</span></span></label>) : <p className="rounded-xl border border-dashed p-5 text-center text-sm text-slate-500">Create a student account before assigning this assessment.</p>}</div>
+          <div className="mt-5 space-y-2">{candidates.length ? candidates.map((candidate: any) => <label key={candidate.id} className="flex cursor-pointer items-center gap-3 rounded-xl border border-slate-200 p-3 transition hover:border-blue-300 hover:bg-blue-50/40"><input type="checkbox" checked={selectedCandidateIds.includes(candidate.id)} onChange={() => toggleCandidate(candidate.id)} className="h-4 w-4 rounded border-slate-300 text-blue-600" /><span><span className="block text-sm font-semibold">{candidate.name}</span><span className="block text-xs text-slate-500">{candidate.email}</span></span></label>) : <p className="rounded-xl border border-dashed p-5 text-center text-sm text-slate-500">Create a student account before assigning this assessment.</p>}</div>
           {assignmentError && <p role="alert" className="mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{assignmentError}</p>}
           {assignmentNotice && <p className="mt-4 rounded-lg bg-emerald-50 p-3 text-sm text-emerald-700">{assignmentNotice}</p>}
           <div className="mt-6 flex justify-end gap-3"><button type="button" onClick={() => setAssignmentExam(null)} className="rounded-lg px-4 py-2.5 text-sm font-semibold text-slate-600 hover:bg-slate-100">Cancel</button><button type="button" disabled={assigning || !candidates.length} onClick={assignSelected} className="button">{assigning ? "Assigning…" : `Assign selected (${selectedCandidateIds.length})`}</button></div>
@@ -1262,7 +1262,7 @@ function Candidates({ session }: { session: Session }) {
     }
   };
   const reviewVerification = async (approved: boolean) => {
-    const verificationId = candidateDetails?.verification?._id;
+    const verificationId = candidateDetails?.verification?.id;
     if (!verificationId) return;
     const reason = approved ? "Approved by institute review" : window.prompt("Enter the rejection reason for the candidate");
     if (!reason) return;
@@ -1345,18 +1345,18 @@ function Candidates({ session }: { session: Session }) {
             {data.length ? (
               data.map(
                 (c: {
-                  _id: string;
+                  id: string;
                   name: string;
                   email: string;
                   emailVerifiedAt?: string;
                    userId?: string;
                 }) => (
-                  <tr className="border-b" key={c._id}>
+                  <tr className="border-b" key={c.id}>
                     <td className="py-3 font-medium">{c.name}</td>
                     <td>{c.email}</td>
                     <td>{c.emailVerifiedAt ? "Verified" : "Not verified"}</td>
                     <td>{c.userId ? "Linked" : "Not linked"}</td>
-                    <td><button type="button" onClick={() => setSelectedCandidateId(c._id)} className="font-semibold text-blue-700 hover:text-blue-800">View details</button></td>
+                    <td><button type="button" onClick={() => setSelectedCandidateId(c.id)} className="font-semibold text-blue-700 hover:text-blue-800">View details</button></td>
                   </tr>
                 ),
               )
@@ -1378,9 +1378,9 @@ function Candidates({ session }: { session: Session }) {
 }
 function CandidateDetails({ details, exams, onAssign, onReview, canReview, onClose }: { details: any; exams: any[]; onAssign: (examId: string) => void; onReview: (approved: boolean) => void; canReview: boolean; onClose: () => void }) {
   const c = details.candidate;
-  const assignedIds = new Set(details.assessments.map((item: any) => String(item.exam?._id)));
-  const assignable = exams.filter((exam) => ["published", "scheduled", "live"].includes(exam.status) && !assignedIds.has(String(exam._id)));
-  return <div><div className="flex items-start justify-between gap-3"><div><p className="eyebrow">Candidate profile</p><h2 className="mt-1 text-lg font-semibold">{c.name}</h2></div><button type="button" onClick={onClose} className="text-sm font-semibold text-slate-500 hover:text-slate-900">Close</button></div><dl className="mt-5 space-y-3 text-sm"><div><dt className="text-slate-500">Email</dt><dd className="mt-1 break-all font-medium">{c.email}</dd></div><div className="grid grid-cols-2 gap-3"><div><dt className="text-slate-500">Email status</dt><dd className="mt-1 font-medium">{c.emailVerifiedAt ? "Verified" : "Not verified"}</dd></div><div><dt className="text-slate-500">Exam account</dt><dd className="mt-1 font-medium">{c.accountLinked ? "Linked" : "Not linked"}</dd></div></div><div><dt className="text-slate-500">Identity verification</dt><dd className="mt-1 font-medium capitalize">{String(details.verification.status).replaceAll("_", " ")}</dd>{canReview && ["submitted", "resubmission_required"].includes(details.verification.status) && <div className="mt-3 flex gap-3"><button type="button" onClick={() => onReview(true)} className="text-sm font-semibold text-emerald-700">Approve identity</button><button type="button" onClick={() => onReview(false)} className="text-sm font-semibold text-red-700">Reject</button></div>}</div>{c.externalId && <div><dt className="text-slate-500">Candidate ID</dt><dd className="mt-1 font-medium">{c.externalId}</dd></div>}</dl><div className="mt-6 border-t pt-5"><h3 className="font-semibold">Assign an assessment</h3>{assignable.length ? <div className="mt-3 space-y-2">{assignable.map((exam) => <button type="button" key={exam._id} onClick={() => onAssign(exam._id)} className="flex w-full items-center justify-between rounded-xl border border-blue-100 bg-blue-50 p-3 text-left text-sm hover:border-blue-300"><span><b className="block text-slate-900">{exam.title}</b><span className="text-slate-600">{exam.durationMinutes} minutes · {exam.status}</span></span><span className="font-semibold text-blue-700">Assign</span></button>)}</div> : <p className="mt-2 text-sm text-slate-500">No unassigned published assessments are available.</p>}<h3 className="mt-6 font-semibold">Assigned assessments</h3><div className="mt-3 space-y-3">{details.assessments.length ? details.assessments.map((item: any, index: number) => <article key={index} className="rounded-xl border border-slate-200 p-3 text-sm"><p className="font-medium">{item.exam?.title ?? "Assessment unavailable"}</p><p className="mt-1 capitalize text-slate-500">{item.attempt?.status?.replaceAll("_", " ") ?? "Assigned — not started"}</p>{item.attempt?.receiptCode && <p className="mt-1 text-xs text-slate-500">Receipt: {item.attempt.receiptCode}</p>}{item.grade && <p className="mt-2 font-semibold text-emerald-700">Score: {item.grade.totalMarks}/{item.grade.maxMarks} · {item.grade.status}</p>}</article>) : <p className="text-sm text-slate-500">No assessments assigned yet.</p>}</div></div></div>;
+  const assignedIds = new Set(details.assessments.map((item: any) => String(item.exam?.id)));
+  const assignable = exams.filter((exam) => ["published", "scheduled", "live"].includes(exam.status) && !assignedIds.has(String(exam.id)));
+  return <div><div className="flex items-start justify-between gap-3"><div><p className="eyebrow">Candidate profile</p><h2 className="mt-1 text-lg font-semibold">{c.name}</h2></div><button type="button" onClick={onClose} className="text-sm font-semibold text-slate-500 hover:text-slate-900">Close</button></div><dl className="mt-5 space-y-3 text-sm"><div><dt className="text-slate-500">Email</dt><dd className="mt-1 break-all font-medium">{c.email}</dd></div><div className="grid grid-cols-2 gap-3"><div><dt className="text-slate-500">Email status</dt><dd className="mt-1 font-medium">{c.emailVerifiedAt ? "Verified" : "Not verified"}</dd></div><div><dt className="text-slate-500">Exam account</dt><dd className="mt-1 font-medium">{c.accountLinked ? "Linked" : "Not linked"}</dd></div></div><div><dt className="text-slate-500">Identity verification</dt><dd className="mt-1 font-medium capitalize">{String(details.verification.status).replaceAll("_", " ")}</dd>{canReview && ["submitted", "resubmission_required"].includes(details.verification.status) && <div className="mt-3 flex gap-3"><button type="button" onClick={() => onReview(true)} className="text-sm font-semibold text-emerald-700">Approve identity</button><button type="button" onClick={() => onReview(false)} className="text-sm font-semibold text-red-700">Reject</button></div>}</div>{c.externalId && <div><dt className="text-slate-500">Candidate ID</dt><dd className="mt-1 font-medium">{c.externalId}</dd></div>}</dl><div className="mt-6 border-t pt-5"><h3 className="font-semibold">Assign an assessment</h3>{assignable.length ? <div className="mt-3 space-y-2">{assignable.map((exam) => <button type="button" key={exam.id} onClick={() => onAssign(exam.id)} className="flex w-full items-center justify-between rounded-xl border border-blue-100 bg-blue-50 p-3 text-left text-sm hover:border-blue-300"><span><b className="block text-slate-900">{exam.title}</b><span className="text-slate-600">{exam.durationMinutes} minutes · {exam.status}</span></span><span className="font-semibold text-blue-700">Assign</span></button>)}</div> : <p className="mt-2 text-sm text-slate-500">No unassigned published assessments are available.</p>}<h3 className="mt-6 font-semibold">Assigned assessments</h3><div className="mt-3 space-y-3">{details.assessments.length ? details.assessments.map((item: any, index: number) => <article key={index} className="rounded-xl border border-slate-200 p-3 text-sm"><p className="font-medium">{item.exam?.title ?? "Assessment unavailable"}</p><p className="mt-1 capitalize text-slate-500">{item.attempt?.status?.replaceAll("_", " ") ?? "Assigned — not started"}</p>{item.attempt?.receiptCode && <p className="mt-1 text-xs text-slate-500">Receipt: {item.attempt.receiptCode}</p>}{item.grade && <p className="mt-2 font-semibold text-emerald-700">Score: {item.grade.totalMarks}/{item.grade.maxMarks} · {item.grade.status}</p>}</article>) : <p className="text-sm text-slate-500">No assessments assigned yet.</p>}</div></div></div>;
 }
 function Verification({ session }: { session: Session }) {
   const {
@@ -1424,7 +1424,7 @@ function Verification({ session }: { session: Session }) {
         <tbody>
           {data.length ? (
             data.map((v: any) => (
-              <tr className="border-b" key={v._id}>
+              <tr className="border-b" key={v.id}>
                 <td className="py-3">
                   {v.candidateId?.name ?? "Candidate"}
                   <span className="block text-xs text-slate-500">
@@ -1438,13 +1438,13 @@ function Verification({ session }: { session: Session }) {
                   ) && (
                     <>
                       <button
-                        onClick={() => review(v._id, true)}
+                        onClick={() => review(v.id, true)}
                         className="text-emerald-700"
                       >
                         Approve
                       </button>
                       <button
-                        onClick={() => review(v._id, false)}
+                        onClick={() => review(v.id, false)}
                         className="text-red-700"
                       >
                         Reject
@@ -1501,7 +1501,7 @@ function Incidents({ session }: { session: Session }) {
       <div className="mt-5 space-y-3">
         {visible.length ? (
           visible.map((i: any) => (
-            <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" key={i._id}>
+            <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" key={i.id}>
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <b>{i.type.replaceAll("_", " ")}</b>
                 <span className="text-sm text-slate-500">
@@ -1512,18 +1512,18 @@ function Incidents({ session }: { session: Session }) {
               <div className="mt-4 grid gap-3 md:grid-cols-[220px_1fr]"><div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50">{i.eventIds?.some((event: any) => event?.details?.demo) ? <img src={`/demo-evidence/${i.type.replaceAll("_", "-")}.svg`} alt={`Simulated training evidence for ${i.type.replaceAll("_", " ")}`} className="aspect-video h-full w-full object-cover" /> : <div className="flex min-h-24 items-center justify-center p-3 text-center text-xs leading-5 text-slate-500"><span><ShieldCheck className="mx-auto mb-1 text-slate-400" size={20}/>No image evidence attached</span></div>}<p className="border-t border-slate-200 px-2 py-1.5 text-center text-[10px] font-semibold uppercase tracking-[.12em] text-slate-500">Simulated training visual</p></div><div><p className="text-xs font-semibold uppercase tracking-[.14em] text-slate-500">Review flags</p><div className="mt-2 flex flex-wrap gap-2">{(i.contributingSignals ?? []).map((signal: any, index: number) => <span key={index} className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-700">{signal.type.replaceAll("_", " ")} · weight {signal.weight}</span>)}</div><p className="mt-3 text-xs text-slate-500">Created {new Date(i.createdAt).toLocaleString()} · authorized reviewers only.</p></div></div>
               <div className="mt-4 flex flex-wrap gap-x-4 gap-y-2 text-sm"><button type="button" onClick={() => setSelected(i)} className="font-semibold text-blue-700">View case details</button>
                 <button
-                  onClick={() => decide(i._id, "dismissed")}
+                  onClick={() => decide(i.id, "dismissed")}
                   className="text-slate-700"
                 >
                   Dismiss
                 </button>
                 <button
-                  onClick={() => decide(i._id, "resolved")}
+                  onClick={() => decide(i.id, "resolved")}
                   className="text-emerald-700"
                 >
                   Resolve
                 </button>
-                {i.status === "awaiting_student" ? <span className="font-medium text-amber-700">Student explanation requested</span> : <button onClick={() => decide(i._id, "awaiting_student")} className="text-blue-700">Ask student for context</button>}
+                {i.status === "awaiting_student" ? <span className="font-medium text-amber-700">Student explanation requested</span> : <button onClick={() => decide(i.id, "awaiting_student")} className="text-blue-700">Ask student for context</button>}
               </div>
             </article>
           ))
@@ -1585,7 +1585,7 @@ function Monitoring({ session }: { session: Session }) {
             <div className="mt-2 space-y-2">
               {observations.length ? (
                 observations.slice(0, 8).map((o: any) => (
-                  <div className="rounded-lg border p-3 text-sm" key={o._id}>
+                  <div className="rounded-lg border p-3 text-sm" key={o.id}>
                     <b>{o.source.replace("_", " ")}</b> ·{" "}
                     {o.kind.replace("_", " ")}{" "}
                     {typeof o.rssi === "number" && ` · ${o.rssi} dBm`}
@@ -1610,7 +1610,7 @@ function Monitoring({ session }: { session: Session }) {
             <div className="mt-2 space-y-2">
               {signals.length ? (
                 signals.map((s: any) => (
-                  <div className="rounded-lg border p-3 text-sm" key={s._id}>
+                  <div className="rounded-lg border p-3 text-sm" key={s.id}>
                     <b>{s.label}</b>
                     <span className="mt-1 block text-xs text-slate-500">
                       {s.status.replaceAll("_", " ")} · {s.rule}

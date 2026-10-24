@@ -6,9 +6,9 @@
 - API: `npm run dev -w server` (port 4000)
 - AI service: `cd ai-service; .\.venv\Scripts\python -m pip install -r requirements.txt; .\.venv\Scripts\python -m uvicorn main:app --port 8000` (create the virtual environment first with `python -m venv .venv`)
 
-Use `npm run build` for production artifacts. Provide `MONGODB_URI`, `MONGODB_DB_NAME`, and a unique 32+ character `JWT_SECRET` to the API environment. Do not place any server secret in a Vite `VITE_*` variable.
+Use `npm run build` for production artifacts. Provide `DATABASE_URL` and a unique 32+ character `JWT_SECRET` to the API environment. Do not place any server secret in a Vite `VITE_*` variable.
 
-MongoDB Atlas must permit the deployed API's outbound IP/network and use a least-privilege database user. The application does not fall back to a local database.
+PostgreSQL must be reachable from the deployed API. Apply schema changes with `npx prisma migrate deploy` using a migration-capable user, and run the API itself with a least-privilege database user. The application does not fall back to a different database.
 
 Configure an S3-compatible private bucket using every `OBJECT_STORAGE_*` value. Block public bucket access, require encryption at rest, and scope credentials to the configured bucket/prefix. Candidate documents are not publicly downloadable; document-download routes should be added only with per-object authorization and short-lived signed URLs.
 
@@ -22,7 +22,7 @@ The AI service is optional and must be separately deployed. Its `/health` endpoi
 
 ## Troubleshooting
 
-- **API exits on startup:** validate Atlas URI, database name, JWT secret, and Atlas network access.
+- **API exits on startup:** validate `DATABASE_URL`, the JWT secret, and database network access.
 - **Uploads fail:** configure private storage values and ensure the bucket allows server credentials to write.
 - **Email is unavailable:** leave it unset for in-app-only delivery or configure both email variables.
 - **AI says unavailable:** first install `ai-service/requirements.txt` in an isolated Python environment. The health endpoint intentionally reports computer vision as unavailable until the approved host also installs `ai-service/requirements-ai.txt`; set `YOLO_MODEL_PATH` only for a tested model.
