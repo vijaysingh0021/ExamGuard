@@ -382,8 +382,9 @@ internal sealed class MonitorForm : Form
 
         try
         {
-            // NativeWifi is the existing helper in this project.
-            var results = NativeWifi.Scan();
+            // NativeWifi is a synchronous native helper. Run it away from the
+            // UI thread so permission prompts and driver delays stay visible.
+            var results = await Task.Run(NativeWifi.Scan);
 
             SetWifiStatus(
                 $"Wi-Fi: scan completed ({results.Count} access points)");

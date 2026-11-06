@@ -44,6 +44,46 @@ enum QuestionType {
   true_false
   short_answer
   descriptive
+  coding
+}
+
+enum CodingProblemMode {
+  function
+  stdin_stdout
+}
+
+enum CodingDifficulty {
+  easy
+  medium
+  hard
+}
+
+enum CodingTestCaseVisibility {
+  sample
+  private
+}
+
+enum CodeSubmissionKind {
+  run
+  submit
+}
+
+enum ExecutionStatus {
+  queued
+  running
+  accepted
+  wrong_answer
+  compile_error
+  runtime_error
+  time_limit_exceeded
+  memory_limit_exceeded
+  runner_unavailable
+  internal_error
+}
+
+enum OutputComparisonMode {
+  exact
+  whitespace_normalized
 }
 
 enum AttemptStatus {
@@ -164,6 +204,11 @@ model Organization {
   studentExplanations   StudentExplanation[]
   radioObservations     RadioObservation[]
   radioCandidateSignals RadioCandidateSignal[]
+  codingQuestions       CodingQuestion[]
+  codingTestCases       CodingTestCase[]
+  attemptCodes          AttemptCode[]
+  codingSubmissions     CodeSubmission[]
+  executionJobs         ExecutionJob[]
 
   @@map("organizations")
 }
@@ -352,6 +397,9 @@ model Question {
   bank         QuestionBank?   @relation(fields: [bankId], references: [id])
   exam         Exam?           @relation(fields: [examId], references: [id])
   answers      AttemptAnswer[]
+  codingQuestion CodingQuestion?
+  attemptCodes AttemptCode[]
+  codingSubmissions CodeSubmission[]
 
   @@index([organizationId])
   @@index([examId])
@@ -384,6 +432,7 @@ model Candidate {
   studentExplanations   StudentExplanation[]
   radioObservations     RadioObservation[]
   radioCandidateSignals RadioCandidateSignal[]
+  codingSubmissions     CodeSubmission[]
 
   @@unique([organizationId, email])
   @@index([userId])
@@ -431,6 +480,8 @@ model ExamAttempt {
   candidate             Candidate              @relation(fields: [candidateId], references: [id])
   user                  User                   @relation(fields: [userId], references: [id])
   answers               AttemptAnswer[]
+  attemptCodes          AttemptCode[]
+  codingSubmissions     CodeSubmission[]
   grade                 Grade?
   proctoringEvents      ProctoringEvent[]
   radioObservations     RadioObservation[]
@@ -459,6 +510,150 @@ model AttemptAnswer {
   @@id([attemptId, questionId])
   @@index([organizationId])
   @@map("attempt_answers")
+}
+
+model CodingQuestion {
+  id             String               @id @default(uuid()) @db.Uuid
+  organizationId String               @db.Uuid
+  questionId     String               @unique @db.Uuid
+  title          String
+  description    String
+  difficulty     CodingDifficulty
+  mode           CodingProblemMode
+  inputFormat    String               @default("")
+  outputFormat   String               @default("")
+  constraints    String               @default("")
+  explanation    String               @default("")
+  languageIds    String[]
+  starterCode    Json                 @default("{}")
+  timeLimitMs    Int                  @default(2000)
+  memoryLimitKb  Int                  @default(262144)
+  comparisonMode OutputComparisonMode @default(exact)
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  organization       Organization       @relation(fields: [organizationId], references: [id])
+  question           Question           @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  testCases          CodingTestCase[]
+  attemptCodes       AttemptCode[]
+  codingSubmissions  CodeSubmission[]
+
+  @@index([organizationId])
+  @@map("coding_questions")
+}
+
+model CodingTestCase {
+  id               String                   @id @default(uuid()) @db.Uuid
+  organizationId   String                   @db.Uuid
+  codingQuestionId String                   @db.Uuid
+  input            String
+  expectedOutput   String
+  visibility       CodingTestCaseVisibility
+  position         Int
+  createdAt        DateTime                 @default(now())
+  updatedAt        DateTime                 @updatedAt
+
+  organization   Organization        @relation(fields: [organizationId], references: [id])
+  codingQuestion CodingQuestion      @relation(fields: [codingQuestionId], references: [id], onDelete: Cascade)
+  results        ExecutionResult[]
+
+  @@unique([codingQuestionId, position])
+  @@index([organizationId, visibility])
+  @@map("coding_test_cases")
+}
+
+model AttemptCode {
+  id               String   @id @default(uuid()) @db.Uuid
+  organizationId   String   @db.Uuid
+  attemptId        String   @db.Uuid
+  questionId       String   @db.Uuid
+  codingQuestionId String   @db.Uuid
+  languageId       String
+  sourceCode       String
+  version          Int      @default(1)
+  savedAt          DateTime @default(now())
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  organization   Organization   @relation(fields: [organizationId], references: [id])
+  attempt        ExamAttempt    @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  question       Question       @relation(fields: [questionId], references: [id])
+  codingQuestion CodingQuestion @relation(fields: [codingQuestionId], references: [id])
+
+  @@unique([attemptId, questionId])
+  @@index([organizationId, savedAt])
+  @@map("attempt_codes")
+}
+
+model CodeSubmission {
+  id               String             @id @default(uuid()) @db.Uuid
+  organizationId   String             @db.Uuid
+  attemptId        String             @db.Uuid
+  candidateId      String             @db.Uuid
+  questionId       String             @db.Uuid
+  codingQuestionId String             @db.Uuid
+  languageId       String
+  sourceCode       String
+  kind             CodeSubmissionKind
+  status           ExecutionStatus    @default(queued)
+  submittedAt      DateTime           @default(now())
+  completedAt      DateTime?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  organization   Organization   @relation(fields: [organizationId], references: [id])
+  attempt        ExamAttempt    @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  candidate      Candidate      @relation(fields: [candidateId], references: [id])
+  question       Question       @relation(fields: [questionId], references: [id])
+  codingQuestion CodingQuestion @relation(fields: [codingQuestionId], references: [id])
+  executionJob   ExecutionJob?
+
+  @@index([organizationId, attemptId, submittedAt(sort: Desc)])
+  @@index([candidateId, submittedAt(sort: Desc)])
+  @@map("code_submissions")
+}
+
+model ExecutionJob {
+  id             String          @id @default(uuid()) @db.Uuid
+  organizationId String          @db.Uuid
+  submissionId   String          @unique @db.Uuid
+  runnerToken    String?         @unique
+  status         ExecutionStatus @default(queued)
+  queuedAt       DateTime        @default(now())
+  startedAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  submission   CodeSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  results      ExecutionResult[]
+
+  @@index([organizationId, status, queuedAt])
+  @@map("execution_jobs")
+}
+
+model ExecutionResult {
+  id             String          @id @default(uuid()) @db.Uuid
+  jobId          String          @db.Uuid
+  testCaseId     String          @db.Uuid
+  status         ExecutionStatus
+  passed         Boolean
+  executionTimeMs Int?
+  memoryKb       Int?
+  stdout         String?
+  stderr         String?
+  compileOutput  String?
+  score          Float           @default(0)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  job      ExecutionJob  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  testCase CodingTestCase @relation(fields: [testCaseId], references: [id])
+
+  @@unique([jobId, testCaseId])
+  @@index([testCaseId])
+  @@map("execution_results")
 }
 
 model ExamSession {

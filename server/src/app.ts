@@ -7,20 +7,55 @@ import multer from 'multer';
 import rateLimit from 'express-rate-limit';
 import { authenticate, authenticateCompanion, authorize, signCompanionToken, signToken, tenantFilter, type AuthRequest, type CompanionClaims } from './auth.js';
 import { canStartExam, deadlineFor, isAttemptOpen } from './exam.js';
-import { privateDocumentUrl, putPrivateDocument, storageConfigured } from './storage.js';
+import { StorageInterface, realStorage } from './storage.js';
 import { dedupeWindow, fingerprintFor, reviewPriority } from './proctor.js';
 import { automaticallyGrade } from './grading.js';
 import { createResetToken, hashResetToken, passwordPolicy } from './password-reset.js';
 import { sendPasswordResetEmail } from './mailer.js';
 import { loadConfig } from './config.js';
 import { regionsForCountry, searchDirectory } from './institutions.js';
-import { interventionFor } from './intervention.js';
 import { beginAuthorization, configuredProviders, finishAuthorization, type OAuthProvider } from './oauth.js';
 import { prisma } from './prisma.js';
 import { Prisma } from './generated/prisma/client.js';
 import { isUuid } from './ids.js';
 import { examToJson, policyOf } from './serializers.js';
 import { validateAnswerValue } from './answers.js';
+import { isSupportedImage, isSupportedIdentityDocument } from './upload-validation.js';
+export const validateFileContent = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+
+  const { mimetype, buffer } = req.file;
+
+  if (!buffer || buffer.length === 0) {
+    return res.status(400).json({ error: 'Invalid file' });
+  }
+
+  // Check if MIME type is supported
+  if (!['image/jpeg', 'image/png', 'image/webp', 'application/pdf'].includes(mimetype)) {
+    return res.status(415).json({ error: 'Unsupported file type' });
+  }
+
+  // Validate file content matches declared MIME type
+  if (mimetype === 'image/jpeg' && !isSupportedImage(mimetype, buffer)) {
+    return res.status(422).json({ error: 'Invalid JPEG file content' });
+  }
+
+  if (mimetype === 'image/png' && !isSupportedImage(mimetype, buffer)) {
+    return res.status(422).json({ error: 'Invalid PNG file content' });
+  }
+
+  if (mimetype === 'image/webp' && !isSupportedImage(mimetype, buffer)) {
+    return res.status(422).json({ error: 'Invalid WebP file content' });
+  }
+
+  if (mimetype === 'application/pdf' && !isSupportedIdentityDocument(mimetype, buffer)) {
+    return res.status(422).json({ error: 'Invalid PDF file content' });
+  }
+
+  next();
+};
 
 const registration = z.object({ name: z.string().min(2), email: z.string().email().transform(value => value.toLowerCase()), password: z.string().min(10), organizationName: z.string().min(2) });
 const credentials = z.object({ email: z.string().email().transform(value => value.toLowerCase()), password: z.string().min(1) });
@@ -28,7 +63,7 @@ const resetRequest = z.object({ email: z.string().email().transform(value => val
 const resetPassword = z.object({ token: z.string().min(20).max(200), password: z.string().min(10), confirmPassword: z.string() }).refine(data => data.password === data.confirmPassword, { message: 'Passwords do not match', path: ['confirmPassword'] });
 const examInput = z.object({ title: z.string().min(3), instructions: z.string().max(10000).default(''), durationMinutes: z.number().int().positive().default(60), startsAt: z.string().datetime().optional(), endsAt: z.string().datetime().optional(), randomizeQuestions: z.boolean().default(false), randomizeOptions: z.boolean().default(false), requireVerification: z.boolean().default(true), interventionPolicy: z.object({ windowSeconds: z.number().int().min(30).max(3600).default(300), warningAt: z.number().int().min(1).default(1), pauseAt: z.number().int().min(2).default(3), terminateAt: z.number().int().min(3).default(5), automaticTerminationEnabled: z.boolean().default(false), fullscreenRequired: z.boolean().default(false) }).default({ windowSeconds: 300, warningAt: 1, pauseAt: 3, terminateAt: 5, automaticTerminationEnabled: false, fullscreenRequired: false }), accessCode: z.string().min(4).optional() });
 const questionInput = z.object({ type: z.enum(['mcq', 'multiple_select', 'true_false', 'short_answer', 'descriptive']), prompt: z.string().min(1), options: z.array(z.object({ id: z.string(), text: z.string() })).default([]), correctAnswer: z.unknown().optional(), marks: z.number().positive(), negativeMarks: z.number().min(0).default(0) });
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 }, fileFilter: (_req, file, cb) => cb(null, ['image/jpeg', 'image/png', 'application/pdf'].includes(file.mimetype)) });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 const audit = (organizationId: string, actorId: string, action: string, targetType: string, targetId: string, metadata?: unknown) => prisma.auditLog.create({ data: { organizationId, actorId, action, targetType, targetId, metadata: metadata as Prisma.InputJsonValue | undefined } });
 const notify = (organizationId: string, userId: string, type: string, title: string, body: string, metadata?: unknown) => prisma.notification.create({ data: { organizationId, userId, type, title, body, metadata: metadata as Prisma.InputJsonValue | undefined, delivery: 'email_unconfigured' } });
 const questionFields = (data: z.infer<typeof questionInput>, clearMissing = false) => ({
@@ -43,107 +78,106 @@ const orgConfig = (organizationId: string) => prisma.proctoringConfig.upsert({ w
 const shuffle = <T>(items: T[]) => { const copy = [...items]; for (let i = copy.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [copy[i], copy[j]] = [copy[j], copy[i]]; } return copy; };
 const proctorEventInput = z.object({ examId: z.string().uuid(), candidateId: z.string().uuid(), sessionId: z.string().uuid().optional(), attemptId: z.string().uuid(), type: z.enum(['face_missing', 'multiple_faces', 'looking_away', 'phone_detected', 'visibility_hidden', 'fullscreen_exit', 'network_interruption', 'camera_permission_lost']), occurredAt: z.string().datetime(), source: z.literal('browser'), details: z.record(z.unknown()).optional(), evidenceKey: z.string().max(512).optional() });
 const radioObservationInput = z.object({ organizationId: z.string().uuid(), examId: z.string().uuid(), candidateId: z.string().uuid(), attemptId: z.string().uuid(), source: z.enum(['bluetooth_le', 'wifi', 'scanner_health']), kind: z.enum(['advertisement', 'access_point', 'scan_unavailable', 'permission_denied', 'scan_error', 'scan_stopped']), rssi: z.number().int().min(-127).max(0).optional(), pseudonym: z.string().min(16).max(128).optional(), scannerStatus: z.enum(['active', 'unavailable', 'permission_denied', 'stopped', 'error']), errorCode: z.string().max(120).optional() }).superRefine((data, ctx) => { if (data.kind === 'advertisement' || data.kind === 'access_point') { if (!data.pseudonym) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'A session-scoped pseudonym is required for a radio observation' }); if (data.scannerStatus !== 'active') ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Radio observations require an active scanner status' }); } });
-export const app = express();
-app.disable('x-powered-by');
-app.use(cors({ origin: process.env.CLIENT_URL ?? 'http://localhost:5173' }));
-app.use((_req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=(), payment=(), usb=()');
-  res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
-  if (process.env.NODE_ENV === 'production') res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  next();
-});
-app.use(express.json());
-app.use('/api', (_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
-app.use('/api/auth', rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false }));
-const passwordResetLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 5, standardHeaders: 'draft-7', legacyHeaders: false });
-const directoryLimiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false });
-const radioObservationLimiter = rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false });
-app.use('/api', rateLimit({ windowMs: 60_000, limit: 240, standardHeaders: 'draft-7', legacyHeaders: false }));
-for (const name of ['organizationId', 'examId', 'candidateId', 'attemptId', 'questionId', 'incidentId', 'signalId', 'gradeId', 'id']) {
-  app.param(name, (_req, res, next, value) => (isUuid(value) ? next() : res.status(404).json({ error: 'Not found' })));
-}
-app.get('/health', (_req, res) => res.json({ status: 'ok' }));
-app.get('/api/auth/providers', (_req, res) => { const providers = configuredProviders(); res.json({ providers, status: providers.length ? 'configured' : 'not_configured', message: providers.length ? undefined : 'Google or Microsoft credentials have not been configured by this institution.' }); });
-app.get('/api/auth/oauth/:provider/start', async (req, res, next) => { try {
-  const provider = z.enum(['google', 'microsoft']).parse(req.params.provider) as OAuthProvider;
-  const redirectUri = `${loadConfig().API_BASE_URL.replace(/\/$/, '')}/api/auth/oauth/${provider}/callback`;
-  const { url, state, nonce, codeVerifier } = await beginAuthorization(provider, redirectUri);
-  await prisma.oAuthAuthorization.create({ data: { provider, state, nonce, codeVerifier, expiresAt: new Date(Date.now() + 10 * 60_000) } });
-  res.redirect(303, url);
-} catch (error) { next(error); } });
-app.get('/api/auth/oauth/:provider/callback', async (req, res) => { try {
-  const provider = z.enum(['google', 'microsoft']).parse(req.params.provider) as OAuthProvider;
-  const state = typeof req.query.state === 'string' ? req.query.state : '';
-  const stored = await prisma.oAuthAuthorization.delete({ where: { state } }).catch((error: unknown) => {
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') return null;
-    throw error;
+export function createApp(storageImpl?: StorageInterface): express.Express {
+  const app = express();
+  const storage = storageImpl ?? realStorage;
+
+  app.disable('x-powered-by');
+  app.use(cors({ origin: process.env.CLIENT_URL ?? 'http://localhost:5173' }));
+  app.set('storage', storage);
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=(), payment=(), usb=()');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
+    if (process.env.NODE_ENV === 'production') res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    next();
   });
-  if (!stored || stored.provider !== provider || stored.expiresAt <= new Date()) return res.status(400).send('This sign-in request has expired or is invalid. Please return to ExamGuard and try again.');
-  const config = loadConfig();
-  const redirectUri = `${config.API_BASE_URL.replace(/\/$/, '')}/api/auth/oauth/${provider}/callback`;
-  const identity = await finishAuthorization(provider, redirectUri, `${config.API_BASE_URL.replace(/\/$/, '')}${req.originalUrl}`, stored.state, stored.nonce, stored.codeVerifier);
-  const linked = await prisma.authIdentity.findUnique({ where: { provider_providerSubject: { provider, providerSubject: identity.subject } }, include: { user: true } });
-  if (!linked) return res.status(403).send('This provider account is not linked to an ExamGuard account. Sign in with your password first and ask an administrator to link it.');
-  const user = linked.user;
-  const membership = await prisma.membership.findFirst({ where: { userId: user.id, active: true }, include: { organization: true }, orderBy: { createdAt: 'asc' } });
-  if (!membership) return res.status(403).send('No active ExamGuard membership exists for this account.');
-  const payload = Buffer.from(JSON.stringify({ token: signToken(user.id), user: { id: user.id, name: user.name, email: user.email }, organization: { id: membership.organization.id, name: membership.organization.name }, role: membership.role })).toString('base64url');
-  res.redirect(303, `${config.CLIENT_URL.replace(/\/$/, '')}/login?oauth=${payload}`);
-} catch { res.status(400).send('We could not complete provider sign-in. Verify the provider configuration and try again.'); } });
-app.get('/api/public/institutions/regions', directoryLimiter, (req, res) => { const countryCode = typeof req.query.countryCode === 'string' ? req.query.countryCode : ''; if (!/^[A-Za-z]{2}$/.test(countryCode)) return res.status(400).json({ error: 'A two-letter country code is required' }); res.json({ countryCode: countryCode.toUpperCase(), regions: regionsForCountry(countryCode) }); });
-app.get('/api/public/institutions/search', directoryLimiter, async (req, res) => { const country = typeof req.query.country === 'string' ? req.query.country.trim() : ''; const name = typeof req.query.name === 'string' ? req.query.name.trim() : ''; if (country.length < 2 || name.length < 2) return res.status(400).json({ error: 'Country and a two-character institution search are required' }); try { res.json({ source: 'hipolabs', results: await searchDirectory(country, name) }); } catch { res.status(503).json({ error: 'The public institution directory could not be reached after retrying. You can submit an institution review request below; this does not verify or create an institution.' }); } });
-app.post('/api/public/institution-requests', directoryLimiter, async (req, res, next) => { try {
-  const data = z.object({ name: z.string().min(2).max(200), countryCode: z.string().regex(/^[A-Za-z]{2}$/), region: z.string().max(120).optional(), website: z.string().url().optional(), details: z.string().max(2000).optional(), requesterEmail: z.string().email().transform(value => value.toLowerCase()) }).parse(req.body);
-  const request = await prisma.institutionRequest.create({ data: { ...data, countryCode: data.countryCode.toUpperCase() } });
-  res.status(201).json({ reference: request.id, status: request.status });
-} catch (error) {
-  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return res.status(409).json({ error: 'A matching institution request already exists' });
-  next(error);
-} });
-app.post('/api/auth/register', async (req, res, next) => { try {
-  const data = registration.parse(req.body);
-  if (!passwordPolicy(data.password)) return res.status(400).json({ error: 'Password must contain upper and lower case letters, a number, and be at least 10 characters.' });
-  const exists = await prisma.user.findUnique({ where: { email: data.email }, select: { id: true } });
-  if (exists) return res.status(409).json({ error: 'Email already registered' });
-  const slug = data.organizationName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') + '-' + Math.random().toString(36).slice(2, 6);
-  const user = await prisma.user.create({
-    data: {
-      name: data.name,
-      email: data.email,
-      passwordHash: await bcrypt.hash(data.password, 12),
-      memberships: { create: { role: 'institute_admin', organization: { create: { name: data.organizationName, slug } } } }
-    },
-    include: { memberships: { include: { organization: true } } }
-  });
-  const { organization } = user.memberships[0];
-  res.status(201).json({ token: signToken(user.id), user: { id: user.id, name: user.name, email: user.email }, organization: { id: organization.id, name: organization.name }, role: 'institute_admin' });
-} catch (error) { next(error); } });
-app.post('/api/auth/login', async (req, res, next) => { try {
-  const data = credentials.parse(req.body);
-  const user = await prisma.user.findUnique({ where: { email: data.email } });
-  if (!user || !(await bcrypt.compare(data.password, user.passwordHash))) return res.status(401).json({ error: 'Invalid email or password' });
-  const membership = await prisma.membership.findFirst({ where: { userId: user.id, active: true }, include: { organization: true }, orderBy: { createdAt: 'asc' } });
-  if (!membership) return res.status(403).json({ error: 'No active organization membership' });
-  res.json({ token: signToken(user.id), user: { id: user.id, name: user.name, email: user.email }, organization: { id: membership.organization.id, name: membership.organization.name }, role: membership.role });
-} catch (error) { next(error); } });
-app.post('/api/auth/password-reset/request', passwordResetLimiter, async (req, res, next) => { try {
-  const { email } = resetRequest.parse(req.body);
-  const generic = { message: 'If an account exists, password recovery instructions will be sent.' };
-  const user = await prisma.user.findUnique({ where: { email } });
-  if (!user || process.env.EMAIL_PROVIDER !== 'webhook' || !process.env.EMAIL_URL || !process.env.EMAIL_FROM) return res.status(202).json(generic);
-  const token = createResetToken();
-  const tokenHash = hashResetToken(token);
-  const config = loadConfig();
-  const resetLink = `${config.APP_BASE_URL.replace(/\/$/, '')}/reset-password?token=${encodeURIComponent(token)}`;
-  await prisma.passwordResetToken.deleteMany({ where: { userId: user.id, usedAt: null } });
-  const reset = await prisma.passwordResetToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 15 * 60_000) } });
-  try { await sendPasswordResetEmail(user.email, resetLink); } catch { await prisma.passwordResetToken.delete({ where: { id: reset.id } }); }
-  const membership = await prisma.membership.findFirst({ where: { userId: user.id, active: true } });
-  if (membership) await audit(membership.organizationId, user.id, 'password_reset.requested', 'User', user.id);
-  res.status(202).json(generic);
-} catch (error) { next(error); } });
+  app.use(express.json());
+  app.use('/api', (_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
+  app.use('/api/auth', rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false }));
+  const passwordResetLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 5, standardHeaders: 'draft-7', legacyHeaders: false });
+  const directoryLimiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false });
+  const radioObservationLimiter = rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false });
+  app.use('/api', rateLimit({ windowMs: 60_000, limit: 240, standardHeaders: 'draft-7', legacyHeaders: false }));
+  for (const name of ['organizationId', 'examId', 'candidateId', 'attemptId', 'questionId', 'incidentId', 'signalId', 'gradeId', 'id']) {
+    app.param(name, (_req, res, next, value) => (isUuid(value) ? next() : res.status(404).json({ error: 'Not found' })));
+  }
+  app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+  app.get('/api/auth/providers', (_req, res) => { const providers = configuredProviders(); res.json({ providers, status: providers.length ? 'configured' : 'not_configured', message: providers.length ? undefined : 'Google or Microsoft credentials have not been configured by this institution.' }); });
+  app.get('/api/auth/oauth/:provider/start', async (req, res, next) => { try {
+    const provider = z.enum(['google', 'microsoft']).parse(req.params.provider) as OAuthProvider;
+    const redirectUri = `${loadConfig().API_BASE_URL.replace(/\/$/, '')}/api/auth/oauth/${provider}/callback`;
+    const { url, state, nonce, codeVerifier } = await beginAuthorization(provider, redirectUri);
+    await prisma.oAuthAuthorization.create({ data: { provider, state, nonce, codeVerifier, expiresAt: new Date(Date.now() + 10 * 60_000) } });
+    res.redirect(303, url);
+  } catch (error) { next(error); } });
+  app.get('/api/auth/oauth/:provider/callback', async (req, res) => { try {
+    const provider = z.enum(['google', 'microsoft']).parse(req.params.provider) as OAuthProvider;
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+    const stored = await prisma.oAuthAuthorization.delete({ where: { state } }).catch((error: unknown) => {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') return null;
+      throw error;
+    });
+    if (!stored || stored.provider !== provider || stored.expiresAt <= new Date()) return res.status(400).send('This sign-in request has expired or is invalid. Please return to ExamGuard and try again.');
+    const config = loadConfig();
+    const redirectUri = `${config.API_BASE_URL.replace(/\/$/, '')}/api/auth/oauth/${provider}/callback`;
+    const identity = await finishAuthorization(provider, redirectUri, `${config.API_BASE_URL.replace(/\/$/, '')}${req.originalUrl}`, stored.state, stored.nonce, stored.codeVerifier);
+    const linked = await prisma.authIdentity.findUnique({ where: { provider_providerSubject: { provider, providerSubject: identity.subject } }, include: { user: true } });
+    if (!linked) return res.status(403).send('This provider account is not linked to an ExamGuard account. Sign in with your password first and ask an administrator to link it.');
+    const user = linked.user;
+    const membership = await prisma.membership.findFirst({ where: { userId: user.id, active: true }, include: { organization: true }, orderBy: { createdAt: 'asc' } });
+    if (!membership) return res.status(403).send('No active ExamGuard membership exists for this account.');
+    const payload = Buffer.from(JSON.stringify({ token: signToken(user.id), user: { id: user.id, name: user.name, email: user.email }, organization: { id: membership.organization.id, name: membership.organization.name }, role: membership.role })).toString('base64url');
+    // Fragments are not sent in HTTP requests, unlike query strings. This
+    // keeps the short-lived session payload out of proxy/server logs and
+    // referrer headers while the client exchanges it into local session state.
+    res.redirect(303, `${config.CLIENT_URL.replace(/\/$/, '')}/login#oauth=${payload}`);
+  } catch { res.status(400).send('We could not complete provider sign-in. Verify the provider configuration and try again.'); } });
+  app.get('/api/public/institutions/regions', directoryLimiter, (req, res) => { const countryCode = typeof req.query.countryCode === 'string' ? req.query.countryCode : ''; if (!/^[A-Za-z]{2}$/.test(countryCode)) return res.status(400).json({ error: 'A two-letter country code is required' }); res.json({ countryCode: countryCode.toUpperCase(), regions: regionsForCountry(countryCode) }); });
+  app.get('/api/public/institutions/search', directoryLimiter, async (req, res) => { const country = typeof req.query.country === 'string' ? req.query.country.trim() : ''; const name = typeof req.query.name === 'string' ? req.query.name.trim() : ''; if (country.length < 2 || name.length < 2) return res.status(400).json({ error: 'Country and a two-character institution search are required' }); try { res.json({ source: 'hipolabs', results: await searchDirectory(country, name) }); } catch { res.status(503).json({ error: 'The public institution directory could not be reached after retrying. You can submit an institution review request below; this does not verify or create an institution.' }); } });
+  app.post('/api/public/institution-requests', directoryLimiter, async (req, res, next) => { try {
+    const data = z.object({ name: z.string().min(2).max(200), countryCode: z.string().regex(/^[A-Za-z]{2}$/), region: z.string().max(120).optional(), website: z.string().url().optional(), details: z.string().max(2000).optional(), requesterEmail: z.string().email().transform(value => value.toLowerCase()) }).parse(req.body);
+    const request = await prisma.institutionRequest.create({ data: { ...data, countryCode: data.countryCode.toUpperCase() } });
+    res.status(201).json({ reference: request.id, status: request.status });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return res.status(409).json({ error: 'A matching institution request already exists' });
+    next(error);
+  } });
+  app.post('/api/auth/register', async (req, res, next) => { try {
+    const data = registration.parse(req.body);
+    if (!passwordPolicy(data.password)) return res.status(400).json({ error: 'Password must contain upper and lower case letters, a number, and be at least 10 characters.' });
+    const exists = await prisma.user.findUnique({ where: { email: data.email }, select: { id: true } });
+    if (exists) return res.status(409).json({ error: 'Email already registered' });
+    const slug = data.organizationName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') + '-' + Math.random().toString(36).slice(2, 6);
+    const user = await prisma.user.create({ data: { name: data.name, email: data.email, passwordHash: await bcrypt.hash(data.password, 12), memberships: { create: { role: 'institute_admin', organization: { create: { name: data.organizationName, slug } } } } }, include: { memberships: { include: { organization: true } } } });
+    const { organization } = user.memberships[0];
+    res.status(201).json({ token: signToken(user.id), user: { id: user.id, name: user.name, email: user.email }, organization: { id: organization.id, name: organization.name }, role: 'institute_admin' });
+  } catch (error) { next(error); } });
+  app.post('/api/auth/login', async (req, res, next) => { try {
+    const data = credentials.parse(req.body);
+    const user = await prisma.user.findUnique({ where: { email: data.email } });
+    if (!user || !(await bcrypt.compare(data.password, user.passwordHash))) return res.status(401).json({ error: 'Invalid email or password' });
+    const membership = await prisma.membership.findFirst({ where: { userId: user.id, active: true }, include: { organization: true }, orderBy: { createdAt: 'asc' } });
+    if (!membership) return res.status(403).json({ error: 'No active organization membership' });
+    res.json({ token: signToken(user.id), user: { id: user.id, name: user.name, email: user.email }, organization: { id: membership.organization.id, name: membership.organization.name }, role: membership.role });
+  } catch (error) { next(error); } });
+  app.post('/api/auth/password-reset/request', passwordResetLimiter, async (req, res, next) => { try {
+    const { email } = resetRequest.parse(req.body);
+    const generic = { message: 'If an account exists, password recovery instructions will be sent.' };
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user || process.env.EMAIL_PROVIDER !== 'webhook' || !process.env.EMAIL_URL || !process.env.EMAIL_FROM) return res.status(202).json(generic);
+    const token = createResetToken();
+    const tokenHash = hashResetToken(token);
+    const config = loadConfig();
+    const resetLink = `${config.APP_BASE_URL.replace(/\/$/, '')}/reset-password?token=${encodeURIComponent(token)}`;
+    await prisma.passwordResetToken.deleteMany({ where: { userId: user.id, usedAt: null } });
+    const reset = await prisma.passwordResetToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 15 * 60_000) } });
+    try { await sendPasswordResetEmail(user.email, resetLink); } catch { await prisma.passwordResetToken.delete({ where: { id: reset.id } }); }
+    const membership = await prisma.membership.findFirst({ where: { userId: user.id, active: true } });
+    if (membership) await audit(membership.organizationId, user.id, 'password_reset.requested', 'User', user.id);
+    res.status(202).json(generic);
+  } catch (error) { next(error); } });
 app.post('/api/auth/password-reset/confirm', passwordResetLimiter, async (req, res, next) => { try {
   const data = resetPassword.parse(req.body);
   if (!passwordPolicy(data.password)) return res.status(400).json({ error: 'Password must contain upper and lower case letters, a number, and be at least 10 characters.' });
@@ -174,7 +208,22 @@ app.get('/api/organizations/:organizationId/dashboard', authenticate, authorize(
   ]);
   res.json({ stats: { exams, candidates, verificationPending, openIncidents, activeSessions, pendingExplanations }, incidents });
 } catch (error) { next(error); } });
-app.get('/api/system/status', authenticate, async (_req: AuthRequest, res) => res.json({ api: 'healthy', storage: storageConfigured() ? 'configured_not_verified' : 'unconfigured', aiService: process.env.AI_SERVICE_URL ? 'configured_not_verified' : 'unconfigured', email: 'unavailable_no_adapter' }));
+app.get('/api/system/status', authenticate, async (_req: AuthRequest, res) => {
+  const storage = realStorage;
+  res.json({ api: 'healthy', storage: storage.storageConfigured() ? 'configured_not_verified' : 'unconfigured', aiService: process.env.AI_SERVICE_URL ? 'configured_not_verified' : 'unconfigured', email: 'unavailable_no_adapter' });
+});
+app.get('/api/organizations/:organizationId', authenticate, authorize('institute_admin', 'teacher', 'proctor'), async (req: AuthRequest, res, next) => { try {
+  const organization = await prisma.organization.findFirst({ where: { id: req.auth!.organizationId! }, select: { id: true, name: true, slug: true, status: true, createdAt: true, updatedAt: true } });
+  if (!organization) return res.status(404).json({ error: 'Organization not found' });
+  res.json(organization);
+} catch (error) { next(error); } });
+app.patch('/api/organizations/:organizationId', authenticate, authorize('institute_admin'), async (req: AuthRequest, res, next) => { try {
+  const data = z.object({ name: z.string().min(2).max(160), slug: z.string().min(2).max(100).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Use lowercase letters, numbers, and hyphens only') }).parse(req.body);
+  const organizationId = req.auth!.organizationId!;
+  const changed = await prisma.organization.update({ where: { id: organizationId }, data });
+  await audit(organizationId, req.auth!.userId, 'organization.updated', 'Organization', organizationId, { name: changed.name, slug: changed.slug });
+  res.json({ id: changed.id, name: changed.name, slug: changed.slug, status: changed.status, updatedAt: changed.updatedAt });
+} catch (error) { next(error); } });
 app.get('/api/organizations/:organizationId/exams', authenticate, authorize('institute_admin', 'teacher', 'proctor'), async (req: AuthRequest, res, next) => { try {
   const exams = await prisma.exam.findMany({ where: tenantFilter(req.auth!.organizationId!), orderBy: { createdAt: 'desc' } });
   res.json(exams.map(examToJson));
@@ -401,13 +450,15 @@ app.post('/api/organizations/:organizationId/candidates/:candidateId/verificatio
   await audit(organizationId, req.auth!.userId, 'verification.submitted', 'VerificationRequest', verification.id);
   res.json(verification);
 } catch (error) { next(error); } });
-app.post('/api/organizations/:organizationId/candidates/:candidateId/documents/:kind', authenticate, upload.single('file'), async (req: AuthRequest, res, next) => { try {
+app.post('/api/organizations/:organizationId/candidates/:candidateId/documents/:kind', authenticate, upload.single('file'), validateFileContent, async (req: AuthRequest, res, next) => { try {
   const organizationId = String(req.params.organizationId);
   const kind = String(req.params.kind);
   const candidate = await prisma.candidate.findFirst({ where: { id: String(req.params.candidateId), organizationId, userId: req.auth!.userId } });
   if (!candidate || !req.file || !['photo', 'idDocument'].includes(kind)) return res.status(403).json({ error: 'Authorized file required' });
+  if (kind === 'photo' && !['image/jpeg', 'image/png', 'image/webp'].includes(req.file.mimetype)) return res.status(400).json({ error: 'A profile photo must be a JPEG, PNG, or WebP image' });
   const key = `organizations/${organizationId}/candidates/${candidate.id}/${kind}-${Date.now()}`;
-  await putPrivateDocument(key, req.file.buffer, req.file.mimetype);
+  const storage = req.app.get('storage');
+  await storage.putPrivateDocument(key, req.file.buffer, req.file.mimetype);
   const fileData = kind === 'photo' ? { profilePhoto: key } : { idDocument: key };
   const verification = await prisma.verificationRequest.upsert({
     where: { organizationId_candidateId: { organizationId, candidateId: candidate.id } },
@@ -499,12 +550,13 @@ app.post('/api/student/attempts/:attemptId/submit', authenticate, async (req: Au
 app.get('/api/organizations/:organizationId/proctoring/config', authenticate, authorize('institute_admin', 'teacher', 'proctor'), async (req: AuthRequest, res, next) => { try {
   res.json(await orgConfig(req.auth!.organizationId!));
 } catch (error) { next(error); } });
-app.post('/api/student/attempts/:attemptId/evidence', authenticate, upload.single('file'), async (req: AuthRequest, res, next) => { try {
-  if (!storageConfigured()) return res.status(503).json({ error: 'Private evidence storage is not configured' });
+app.post('/api/student/attempts/:attemptId/evidence', authenticate, upload.single('file'), validateFileContent, async (req: AuthRequest, res, next) => { try {
+  const storage = req.app.get('storage');
+  if (!storage.storageConfigured()) return res.status(503).json({ error: 'Private evidence storage is not configured' });
   const attempt = await prisma.examAttempt.findFirst({ where: { id: String(req.params.attemptId), userId: req.auth!.userId, status: 'in_progress', deadlineAt: { gt: new Date() } } });
   if (!attempt || !req.file || !['image/jpeg', 'image/png', 'image/webp'].includes(req.file.mimetype)) return res.status(403).json({ error: 'An active attempt and a JPEG, PNG, or WebP image are required' });
   const key = `organizations/${attempt.organizationId}/attempts/${attempt.id}/evidence/${crypto.randomUUID()}`;
-  await putPrivateDocument(key, req.file.buffer, req.file.mimetype);
+  await storage.putPrivateDocument(key, req.file.buffer, req.file.mimetype);
   res.status(201).json({ evidenceKey: key });
 } catch (error) { next(error); } });
 app.post('/api/organizations/:organizationId/proctoring/events', authenticate, async (req: AuthRequest, res, next) => { try {
@@ -522,7 +574,9 @@ app.post('/api/organizations/:organizationId/proctoring/events', authenticate, a
   if (await prisma.proctoringEvent.findFirst({ where: { organizationId, fingerprint }, select: { id: true } })) return res.status(202).json({ deduplicated: true });
   const windowStart = new Date(occurredAt.getTime() - policy.windowSeconds * 1000);
   const eventCount = await prisma.proctoringEvent.count({ where: { organizationId, attemptId: attempt.id, type: data.type, occurredAt: { gte: windowStart } } }) + 1;
-  const action = interventionFor(policy, data.type, eventCount);
+  // Browser face/phone detections are advisory signals. They may inform a reviewer,
+  // but must never automatically pause or terminate an examination attempt.
+  const action = 'recorded' as const;
   const event = await prisma.proctoringEvent.create({ data: { organizationId, examId: data.examId, candidateId: candidate.id, sessionId: data.sessionId, attemptId: attempt.id, type: data.type, occurredAt, source: data.source, evidenceKey: data.evidenceKey, fingerprint, warningCount: eventCount, policyAction: action, details: data.details as Prisma.InputJsonValue | undefined } });
   const weight = Number((config.signalWeights as Record<string, number>)[data.type] ?? 0);
   const priority = reviewPriority([{ type: data.type, weight }]);
@@ -532,22 +586,14 @@ app.post('/api/organizations/:organizationId/proctoring/events', authenticate, a
       severity: priority.score >= 30 ? 'high' : priority.score >= 15 ? 'medium' : 'low',
       riskPriority: priority.score,
       contributingSignals: priority.contributingSignals.map(x => ({ ...x, eventId: event.id })),
-      details: action === 'technical' ? `Technical event: ${data.type}` : `Automated signal: ${data.type}`,
+      details: `Automated signal queued for human review: ${data.type}`,
       events: { create: { eventId: event.id } }
     }
   });
-  if (action === 'paused' || action === 'terminated') {
-    const changed = await prisma.examAttempt.updateMany({
-      where: { id: attempt.id, status: 'in_progress' },
-      data: action === 'paused' ? { status: 'paused', pausedAt: occurredAt, interventionReason: `Repeated ${data.type}` } : { status: 'terminated', terminatedAt: occurredAt, interventionReason: `Policy threshold reached for ${data.type}` }
-    });
-    if (changed.count === 0) return res.status(409).json({ error: 'Attempt state changed before intervention could be applied' });
-    await audit(organizationId, req.auth!.userId, `attempt.${action}`, 'ExamAttempt', attempt.id, { eventType: data.type, eventCount });
-  }
   await audit(organizationId, req.auth!.userId, 'proctoring.event_recorded', 'Incident', incident.id, { eventId: event.id, action, eventCount });
   const broadcast = app.get('broadcast') as undefined | ((room: string, payload: unknown) => void);
   broadcast?.(`org:${organizationId}:exam:${data.examId}`, { incidentId: incident.id, attemptId: attempt.id, type: event.type, action, warningCount: eventCount, occurredAt: event.occurredAt });
-  res.status(201).json({ incidentId: incident.id, eventId: event.id, action, warningCount: eventCount, message: action === 'warning' ? `Warning ${eventCount}: follow your examination rules to continue.` : action === 'paused' ? 'Your attempt has been paused pending reviewer action.' : action === 'terminated' ? 'Your attempt has been ended under the configured examination policy.' : undefined });
+  res.status(201).json({ incidentId: incident.id, eventId: event.id, action, warningCount: eventCount });
 } catch (error) { next(error); } });
 app.post('/api/organizations/:organizationId/attempts/:attemptId/resume', authenticate, authorize('institute_admin', 'proctor'), async (req: AuthRequest, res, next) => { try {
   const data = z.object({ reason: z.string().min(3).max(2000) }).parse(req.body);
@@ -630,7 +676,7 @@ app.get('/api/organizations/:organizationId/incidents', authenticate, authorize(
     ...incident,
     candidateId: candidate ?? incident.candidateId,
     examId: exam ?? incident.examId,
-    eventIds: await Promise.all(events.map(async ({ event }) => ({ ...event, evidenceUrl: event.evidenceKey && storageConfigured() ? await privateDocumentUrl(event.evidenceKey) : undefined })))
+    eventIds: await Promise.all(events.map(async ({ event }) => ({ ...event, evidenceUrl: event.evidenceKey && storage.storageConfigured() ? await storage.privateDocumentUrl(event.evidenceKey) : undefined })))
   }))));
 } catch (error) { next(error); } });
 app.post('/api/organizations/:organizationId/incidents/:incidentId/decision', authenticate, authorize('institute_admin', 'proctor'), async (req: AuthRequest, res, next) => { try {
@@ -748,3 +794,6 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
   console.error(error);
   res.status(500).json({ error: 'Unexpected server error' });
 });
+
+  return app;
+}

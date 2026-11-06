@@ -41,6 +41,7 @@ import {
 } from "lucide-react";
 import { ForgotPasswordPage, ResetPasswordPage } from "./auth-pages";
 import { Landing } from "./marketing";
+import { CodingExamWorkspace } from "./coding-exam";
 import "./index.css";
 type Session = {
   token: string;
@@ -107,7 +108,7 @@ const countries = [
   ["SG", "Singapore"],
   ["ZA", "South Africa"],
 ];
-function StudentEntry() {
+export function StudentEntry() {
   const navigate = useNavigate();
   const [country, setCountry] = useState("");
   const [region, setRegion] = useState("");
@@ -455,14 +456,12 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
     ? [{ label: "My assessments", icon: BookOpen, path: "/app" }]
     : nav;
   return (
-    <div className="app-surface min-h-screen overflow-x-hidden bg-slate-50 md:flex">
-      <aside className="workspace-sidebar w-full shrink-0 p-4 text-white md:min-h-screen md:w-72">
-        <div className="mb-8 flex items-center gap-3 px-2 pt-1 font-bold">
-          <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-blue-400 to-blue-600 text-white shadow-lg shadow-blue-950/30"><ShieldCheck size={20} /></span>
-          <span><span className="block text-[15px] tracking-tight">ExamGuard</span><span className="mt-0.5 block text-[10px] font-medium uppercase tracking-[.18em] text-blue-300">Assessment cloud</span></span>
-        </div>
-        <p className="mb-3 px-3 text-[10px] font-semibold uppercase tracking-[.18em] text-slate-500">Workspace</p>
-        <nav className="space-y-1">
+    <div className={`app-surface ${session.role === "student" ? "candidate-shell" : "staff-shell"} min-h-screen overflow-x-hidden`}>
+      <a className="skip-link" href="#workspace-content">Skip to workspace content</a>
+      <header className="app-header">
+        <div className="app-header-inner">
+          <button type="button" onClick={() => navigate("/app")} className="brand-mark" aria-label="ExamGuard workspace home"><span className="brand-glyph"><ShieldCheck size={18} /></span><span>ExamGuard <small>{session.role === "student" ? "Candidate" : "Studio"}</small></span></button>
+          <nav className="workspace-tabs" aria-label="Workspace navigation">
           {workspaceNav.map((n) => {
             const Icon = n.icon;
             const active = n.path === "/app" ? location.pathname === "/app" || location.pathname === "/app/" : location.pathname.startsWith(n.path);
@@ -470,27 +469,20 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
               <button
                 key={n.path}
                 onClick={() => navigate(n.path)}
-                className={`workspace-nav-item w-full ${active ? "workspace-nav-item-active" : ""}`}
+                className={`workspace-tab ${active ? "workspace-tab-active" : ""}`}
+                aria-current={active ? "page" : undefined}
               >
                 <Icon size={17} />
                 {n.label}
               </button>
             );
           })}
-        </nav>
-        <button
-          onClick={() => {
-            clear();
-            navigate("/login");
-          }}
-          className="workspace-nav-item mt-10 w-full"
-        >
-          <LogOut size={17} />
-          Sign out
-        </button>
-      </aside>
-      <main className="min-w-0 flex-1 p-5 md:p-8 lg:p-10">
-        <div className="workspace-topbar mb-8 flex items-center justify-between gap-4">
+          </nav>
+          <div className="account-control"><span className="hidden text-right text-xs text-stone-500 sm:block"><b className="block text-stone-800">{session.user.name}</b>{session.organization.name}</span><button type="button" onClick={() => { clear(); navigate("/login"); }} className="icon-button" aria-label="Sign out"><LogOut size={17} /></button></div>
+        </div>
+      </header>
+      <main id="workspace-content" tabIndex={-1} className="workspace-frame">
+        <div className="workspace-topbar mb-8 flex items-end justify-between gap-4">
           <div>
             <p className="text-xs font-medium uppercase tracking-[.14em] text-slate-500">
               {session.organization.name}
@@ -519,6 +511,10 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
             element={<StudentExam session={session} />}
           />
           <Route path="reports" element={<Reports session={session} />} />
+          <Route
+            path="settings"
+            element={<OrganizationSettings session={session} />}
+          />
           {nav
             .slice(2)
             .filter(
@@ -529,6 +525,7 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
                   "/app/monitoring",
                   "/app/incidents",
                   "/app/reports",
+                  "/app/settings",
                 ].includes(n.path),
             )
             .map((n) => (
@@ -783,6 +780,27 @@ function StudentExam({ session }: { session: Session }) {
         </p>
       </div>
     );
+  if (payload.questions?.some((item: any) => item.type === "coding")) {
+    return <CodingExamWorkspace
+      assessment={{ title: payload.exam.title, instructions: payload.exam.instructions, deadlineAt: payload.attempt.deadlineAt }}
+      attemptId={payload.attempt.id}
+      questions={payload.questions.filter((item: any) => item.type === "coding").map((item: any) => ({
+        id: item.id,
+        title: item.coding?.title ?? "Coding problem",
+        description: item.coding?.description ?? item.prompt,
+        difficulty: item.coding?.difficulty ?? "medium",
+        inputFormat: item.coding?.inputFormat,
+        outputFormat: item.coding?.outputFormat,
+        constraints: item.coding?.constraints,
+        explanation: item.coding?.explanation,
+        marks: item.marks,
+        languageIds: item.coding?.languageIds ?? [],
+        starterCode: item.coding?.starterCode ?? {},
+        samples: item.coding?.samples ?? []
+      }))}
+      initialCodes={Object.fromEntries((payload.answers ?? []).filter((answer: any) => answer.value?.sourceCode).map((answer: any) => [answer.questionId, answer.value]))}
+    />;
+  }
   const question = payload.questions[current];
   const answered = (id: string) => {
     const value = answers[id];
@@ -917,7 +935,7 @@ function Dashboard({ session }: { session: Session }) {
     </>
   );
 }
-function CandidateDashboard({ session }: { session: Session }) {
+export function CandidateDashboard({ session }: { session: Session }) {
   const navigate = useNavigate();
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["candidate-dashboard"],
@@ -966,7 +984,7 @@ function LegacyCandidateDashboard({ session }: { session: Session }) {
 }
 }
 */
-function Exams({ session }: { session: Session }) {
+export function Exams({ session }: { session: Session }) {
   const navigate = useNavigate();
   const { data = [], isLoading } = useQuery({
     queryKey: ["exams"],
@@ -1630,6 +1648,84 @@ function Monitoring({ session }: { session: Session }) {
     </div>
   );
 }
+function OrganizationSettings({ session }: { session: Session }) {
+  const isAdministrator = session.role === "institute_admin";
+  const errorSummaryRef = useRef<HTMLDivElement>(null);
+  const [form, setForm] = useState({ name: "", slug: "" });
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [saveError, setSaveError] = useState("");
+  const [saved, setSaved] = useState("");
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ["organization", session.organization.id],
+    queryFn: () =>
+      api
+        .get(`/api/organizations/${session.organization.id}`)
+        .then((response) => response.data),
+  });
+
+  useEffect(() => {
+    if (data) setForm({ name: data.name ?? "", slug: data.slug ?? "" });
+  }, [data]);
+
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setSaved("");
+    setSaveError("");
+    const errors: Record<string, string> = {};
+    const name = form.name.trim();
+    const slug = form.slug.trim();
+    if (name.length < 2) errors.name = "Enter an organization name with at least 2 characters.";
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug)) errors.slug = "Use lowercase letters, numbers, and single hyphens only.";
+    if (Object.keys(errors).length) {
+      setFieldErrors(errors);
+      requestAnimationFrame(() => errorSummaryRef.current?.focus());
+      return;
+    }
+    setFieldErrors({});
+    try {
+      await api.patch(`/api/organizations/${session.organization.id}`, { name, slug });
+      await refetch();
+      setSaved("Organization profile saved.");
+    } catch (error: any) {
+      setSaveError(error?.response?.data?.error ?? "The organization profile could not be saved. Try again.");
+    }
+  };
+
+  if (isLoading) return <div className="h-64 animate-pulse rounded-sm bg-stone-200" />;
+  if (isError) return <div className="card max-w-2xl"><AlertTriangle className="text-amber-700" size={28} /><h2 className="mt-3 text-lg font-semibold">Organization profile is unavailable</h2><p className="mt-1 text-sm text-slate-600">The current organization record could not be loaded. Check your access and try again.</p><button type="button" className="button mt-5" onClick={() => refetch()}>Retry</button></div>;
+
+  return (
+    <section className="mx-auto max-w-3xl">
+      <div className="border-b border-stone-300 pb-6">
+        <p className="eyebrow">Organization</p>
+        <h2 className="mt-2 text-3xl font-medium tracking-tight text-stone-950">Profile and workspace identity</h2>
+        <p className="mt-2 max-w-2xl text-sm leading-6 text-stone-600">Keep the organization name and URL identifier accurate for your assessment workspace.</p>
+      </div>
+      <form className="card mt-6" onSubmit={save} noValidate>
+        <div className="flex flex-wrap items-start justify-between gap-4 border-b border-stone-200 pb-5">
+          <div><h3 className="font-semibold text-stone-950">Profile details</h3><p className="mt-1 text-sm text-stone-600">These are the only organization profile fields stored by ExamGuard today.</p></div>
+          <span className={`status-badge ${data.status === "active" ? "status-ready" : "status-neutral"}`}>{data.status}</span>
+        </div>
+        {!isAdministrator && <div className="mt-5 rounded-sm border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-900"><b>Read-only access.</b> Only an institute administrator can change this organization profile.</div>}
+        {(Object.keys(fieldErrors).length > 0 || saveError) && <div ref={errorSummaryRef} tabIndex={-1} role="alert" className="mt-5 rounded-sm border border-red-200 bg-red-50 p-4 text-sm text-red-900"><b>There is a problem with this form.</b><ul className="mt-2 list-disc pl-5">{Object.values(fieldErrors).map((message) => <li key={message}>{message}</li>)}{saveError && <li>{saveError}</li>}</ul></div>}
+        {saved && <p className="mt-5 rounded-sm border border-emerald-200 bg-emerald-50 p-4 text-sm font-medium text-emerald-900" role="status">{saved}</p>}
+        <div className="mt-6 grid gap-5">
+          <label className="block text-sm font-semibold text-stone-800" htmlFor="organization-name">Organization name
+            <input id="organization-name" className={`input mt-2 ${fieldErrors.name ? "border-red-500" : ""}`} value={form.name} disabled={!isAdministrator} onChange={(event) => setForm({ ...form, name: event.target.value })} aria-invalid={Boolean(fieldErrors.name)} aria-describedby={fieldErrors.name ? "organization-name-error" : undefined} />
+            {fieldErrors.name && <span id="organization-name-error" className="mt-2 block text-sm font-medium text-red-700">{fieldErrors.name}</span>}
+          </label>
+          <label className="block text-sm font-semibold text-stone-800" htmlFor="organization-slug">Workspace identifier
+            <input id="organization-slug" className={`input mt-2 ${fieldErrors.slug ? "border-red-500" : ""}`} value={form.slug} disabled={!isAdministrator} onChange={(event) => setForm({ ...form, slug: event.target.value })} aria-invalid={Boolean(fieldErrors.slug)} aria-describedby={fieldErrors.slug ? "organization-slug-help organization-slug-error" : "organization-slug-help"} />
+            <span id="organization-slug-help" className="mt-2 block text-sm font-normal leading-5 text-stone-500">Lowercase letters, numbers, and hyphens only. This is not a public URL until the application exposes one.</span>
+            {fieldErrors.slug && <span id="organization-slug-error" className="mt-2 block text-sm font-medium text-red-700">{fieldErrors.slug}</span>}
+          </label>
+        </div>
+        <div className="mt-7 flex flex-wrap items-center justify-between gap-3 border-t border-stone-200 pt-5"><p className="text-xs leading-5 text-stone-500">Created {new Date(data.createdAt).toLocaleDateString()} · Last updated {new Date(data.updatedAt).toLocaleString()}.</p>{isAdministrator && <button className="button" type="submit">Save organization profile</button>}</div>
+      </form>
+      <aside className="mt-6 border-l-2 border-stone-900 bg-stone-100 px-5 py-4 text-sm leading-6 text-stone-700"><b className="text-stone-950">Not configured here.</b> Branding, contact details, retention rules, and assessment policy settings do not have organization-level stored fields. They are intentionally not shown as pretend controls.</aside>
+    </section>
+  );
+}
 function Placeholder({
   title,
   icon: Icon,
@@ -1785,12 +1881,15 @@ function App() {
     </Routes>
   );
 }
-createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <QueryClientProvider client={new QueryClient()}>
-      <BrowserRouter>
-        <App />
-      </BrowserRouter>
-    </QueryClientProvider>
-  </React.StrictMode>,
-);
+const root = document.getElementById("root");
+if (root) {
+  createRoot(root).render(
+    <React.StrictMode>
+      <QueryClientProvider client={new QueryClient()}>
+        <BrowserRouter>
+          <App />
+        </BrowserRouter>
+      </QueryClientProvider>
+    </React.StrictMode>,
+  );
+}

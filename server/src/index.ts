@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { Server } from 'socket.io';
 import jwt from 'jsonwebtoken';
-import { app } from './app.js';
+import { createApp } from './app.js';
 import { connectDatabase } from './db.js';
 import { configurationErrorMessage, loadConfig, type Config } from './config.js';
 import { prisma } from './prisma.js';
@@ -14,6 +14,7 @@ try { config = loadConfig(); } catch (error) {
   console.error(configurationErrorMessage(), names ? `Invalid or missing: ${names}.` : '');
   process.exit(1);
 }
+const app = createApp();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: config.CLIENT_URL } });
 

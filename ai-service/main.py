@@ -76,11 +76,17 @@ async def analyze(frame: UploadFile):
     phone_confidence = None
 
     if yolo is not None:
-        predictions = yolo.predict(
-            source=image,
-            conf=0.35,
-            verbose=False
-        )
+        try:
+            predictions = yolo.predict(
+                source=image,
+                conf=0.35,
+                verbose=False
+            )
+        except Exception as exc:
+            # A failed optional model must never be represented as a signal.
+            # The caller can retain the frame locally or retry with a healthy
+            # model; this service does not create incidents or take action.
+            raise HTTPException(503, "Phone-detection model inference is unavailable") from exc
 
         names = predictions[0].names
         boxes = predictions[0].boxes
