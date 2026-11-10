@@ -647,6 +647,7 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
   const [microphone, setMicrophone] = useState("Not checked");
   const [level, setLevel] = useState(0);
   const [acknowledged, setAcknowledged] = useState(false);
+  const [practiceCompleted, setPracticeCompleted] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [companionStatus, setCompanionStatus] = useState("Checking local Windows Companion…");
   const [companionReady, setCompanionReady] = useState(false);
@@ -752,9 +753,10 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
     </div>
     <dl className="mt-5 grid gap-2 rounded-xl bg-slate-50 p-4 text-sm sm:grid-cols-2"><div><dt className="text-slate-500">Browser</dt><dd>{supported ? "Compatible" : "Limited device support"}</dd></div><div><dt className="text-slate-500">Network</dt><dd>{online ? "Connected" : "Offline — reconnect before starting"}</dd></div><div><dt className="text-slate-500">Instructions</dt><dd>{acknowledged ? "Acknowledged" : "Awaiting acknowledgement"}</dd></div><div><dt className="text-slate-500">Windows Companion — required</dt><dd className={companionReady ? "text-emerald-700" : "text-red-700"}>{companionStatus}</dd></div><div className="sm:col-span-2"><dt className="text-slate-500">Local AI service — required</dt><dd className={aiReady ? "text-emerald-700" : "text-red-700"}>{aiStatus}</dd></div></dl>
     <label className="mt-5 flex gap-2 text-sm"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /> I have read the instructions and understand the examination rules.</label>
+    <label className="mt-4 flex items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm leading-6"><input type="checkbox" className="mt-1" checked={practiceCompleted} onChange={(event) => setPracticeCompleted(event.target.checked)} /><span><b>Practice check complete.</b> I have used the answer controls, checked my camera and microphone, and understand how to submit. This short readiness exercise does not submit exam answers.</span></label>
     <label className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-950"><input type="checkbox" className="mt-1" checked={monitoringConsent} onChange={(event) => setMonitoringConsent(event.target.checked)} /><span><b>Required monitoring consent.</b> I consent to camera-frame AI analysis and to capturing still images when a repeated review signal is recorded. I also consent to Bluetooth and Wi-Fi access-point observations by the required Windows Companion. Images are stored in ExamGuard’s private evidence storage for authorized review. This local prototype does not automatically purge image files; my institution must publish and apply its retention schedule. Automated signals are review aids, not proof of misconduct; audio is not recorded or uploaded.</span></label>
     {error && <p role="alert" className="mt-4 text-sm text-red-600">{error}</p>}
-    <button onClick={async () => { try { await document.documentElement.requestFullscreen?.(); } catch {} onStart(); }} disabled={!acknowledged || !monitoringConsent || !online || !companionReady || !aiReady || camera !== "Camera ready" || !microphone.startsWith("Microphone ready")} className="button mt-6 disabled:cursor-not-allowed disabled:opacity-50">Start secure exam</button>
+    <button onClick={async () => { try { await document.documentElement.requestFullscreen?.(); } catch {} onStart(); }} disabled={!acknowledged || !practiceCompleted || !monitoringConsent || !online || !companionReady || !aiReady || camera !== "Camera ready" || !microphone.startsWith("Microphone ready")} className="button mt-6 disabled:cursor-not-allowed disabled:opacity-50">Start secure exam</button>
   </div>;
 }
 function StudentExam({ session }: { session: Session }) {
@@ -869,6 +871,8 @@ function StudentExam({ session }: { session: Session }) {
   useEffect(() => { if (attemptId) saveMarks(typeof sessionStorage === "undefined" ? undefined : sessionStorage, attemptId, marked); }, [attemptId, marked]);
   useEffect(() => {
     if (!payload) return;
+    let hiddenAt: number | null = null;
+    let blurredAt: number | null = null;
     const report = (type: "visibility_hidden" | "fullscreen_exit", message: string) => {
       setAttentionWarning(message);
       void (async () => { let evidenceKey: string | undefined; try { evidenceKey = await captureEvidence(); } catch { /* Evidence is optional; the signal is still recorded. */ } return api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
@@ -882,13 +886,50 @@ function StudentExam({ session }: { session: Session }) {
         details: { clientWarning: true },
       }); })().catch(() => undefined);
     };
-    const visibility = () => { if (document.visibilityState === "hidden") report("visibility_hidden", "Warning: you left the examination tab. Return immediately and keep this exam in focus."); };
+    const reportBrowserSignal = (type: "visibility_hidden" | "window_blur" | "focus_regain" | "multiple_window_hint", message: string, details: Record<string, unknown> = {}) => {
+      setAttentionWarning(message);
+      void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+        examId: payload.attempt.examId, candidateId: payload.attempt.candidateId, attemptId: payload.attempt.id,
+        type, occurredAt: new Date().toISOString(), source: "browser", details: { clientWarning: true, ...details },
+      }).catch(() => undefined);
+    };
+    const visibility = () => {
+      if (document.visibilityState === "hidden") {
+        hiddenAt = Date.now();
+        reportBrowserSignal("visibility_hidden", "Warning: you left the examination tab. Return immediately and keep this exam in focus.");
+      } else if (hiddenAt !== null) {
+        const hiddenDurationMs = Date.now() - hiddenAt;
+        hiddenAt = null;
+        reportBrowserSignal("focus_regain", "You returned to the examination tab.", { hiddenDurationMs });
+      }
+    };
     const fullscreen = () => { if (!document.fullscreenElement) report("fullscreen_exit", "Warning: fullscreen was exited. Return to fullscreen and remain on the examination screen."); };
+    const blur = () => { blurredAt = Date.now(); reportBrowserSignal("window_blur", "Warning: the examination window lost focus. Return immediately."); };
+    const focus = () => {
+      if (blurredAt !== null) {
+        const blurDurationMs = Date.now() - blurredAt;
+        blurredAt = null;
+        reportBrowserSignal("focus_regain", "The examination window regained focus.", { blurDurationMs });
+      }
+    };
+    const resize = () => {
+      if (document.visibilityState === "visible" && document.hasFocus()) reportBrowserSignal("multiple_window_hint", "Warning: another window may be open over the examination. Keep only the examination window visible.");
+    };
     const unload = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = "Your examination is still in progress."; };
     document.addEventListener("visibilitychange", visibility);
     document.addEventListener("fullscreenchange", fullscreen);
+    window.addEventListener("blur", blur);
+    window.addEventListener("focus", focus);
+    window.addEventListener("resize", resize);
     window.addEventListener("beforeunload", unload);
-    return () => { document.removeEventListener("visibilitychange", visibility); document.removeEventListener("fullscreenchange", fullscreen); window.removeEventListener("beforeunload", unload); };
+    return () => {
+      document.removeEventListener("visibilitychange", visibility);
+      document.removeEventListener("fullscreenchange", fullscreen);
+      window.removeEventListener("blur", blur);
+      window.removeEventListener("focus", focus);
+      window.removeEventListener("resize", resize);
+      window.removeEventListener("beforeunload", unload);
+    };
   }, [payload, session.organization.id]);
   const save = async (questionId: string, value: unknown) => {
     // Keep what the candidate typed on screen immediately; the engine saves it (latest value only, in order, with retries).

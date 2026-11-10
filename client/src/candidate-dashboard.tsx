@@ -9,9 +9,9 @@ import { PHASE_LABEL, formatStartsIn, readinessItems, resultText, sections, subm
 import type { NotificationsPayload } from "./notifications";
 
 type Session = { user: { name: string; email: string }; organization: { id: string; name: string } };
-type Verification = { status: string; rejectionReason?: string | null };
+type Verification = { status: string; rejectionReason?: string | null; profilePhoto?: string | null; idDocument?: string | null };
 type Payload = { candidate: { id: string; name: string }; verification: Verification; assignments: Assignment[] };
-type ExplanationRequest = { id: string; question: string; body: string; status: string; deadlineAt?: string | null; respondedAt?: string | null; decision?: string | null; decisionReason?: string | null; decisionAt?: string | null; incident: { exam?: { title: string } | null; type: string; createdAt: string } };
+type ExplanationRequest = { id: string; question: string; body: string; evidenceKey?: string | null; status: string; deadlineAt?: string | null; respondedAt?: string | null; decision?: string | null; decisionReason?: string | null; decisionAt?: string | null; incident: { exam?: { title: string } | null; type: string; createdAt: string } };
 const when = (v?: string | null) => (v ? new Date(v).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "");
 const windowText = (a: Assignment) => (a.exam?.startsAt || a.exam?.endsAt ? `${a.exam?.startsAt ? when(a.exam.startsAt) : "Any time"} – ${a.exam?.endsAt ? when(a.exam.endsAt) : "no end"}` : "No fixed window");
 
@@ -50,6 +50,7 @@ export function CandidateDashboard({ session }: { session: Session }) {
   const [notice, setNotice] = useState(""); const [error, setError] = useState(""); const [submitting, setSubmitting] = useState(false);
   const [responses, setResponses] = useState<Record<string, string>>({});
   const [responseFiles, setResponseFiles] = useState<Record<string, File | undefined>>({});
+  const [verificationFiles, setVerificationFiles] = useState<{ photo?: File; idDocument?: File }>({});
   const responseMutation = useMutation({
     mutationFn: async ({ requestId, body, file }: { requestId: string; body: string; file?: File }) => {
       const form = new FormData();
@@ -69,7 +70,17 @@ export function CandidateDashboard({ session }: { session: Session }) {
   const sec = sections(assignments, now);
   const submitVerification = async () => {
     setSubmitting(true); setError(""); setNotice("");
-    try { await api.post(`/api/organizations/${session.organization.id}/candidates/${data.candidate.id}/verification`); setNotice("Identity verification submitted. Your institute must approve it before you can start this assessment."); await refetch(); }
+    try {
+      if (!verificationFiles.photo || !verificationFiles.idDocument) throw new Error("Add both a selfie and an identity document before submitting.");
+      for (const [kind, file] of [["photo", verificationFiles.photo], ["idDocument", verificationFiles.idDocument] as const]) {
+        const form = new FormData();
+        form.append("file", file);
+        await api.post(`/api/organizations/${session.organization.id}/candidates/${data.candidate.id}/documents/${kind}`, form);
+      }
+      await api.post(`/api/organizations/${session.organization.id}/candidates/${data.candidate.id}/verification`);
+      setNotice("Identity verification submitted. Your institute must approve it before you can start this assessment.");
+      await refetch();
+    }
     catch (e) { setError(axios.isAxiosError(e) ? (e.response?.data?.error ?? "Could not submit identity verification.") : "Could not submit identity verification."); }
     finally { setSubmitting(false); }
   };
@@ -91,7 +102,7 @@ export function CandidateDashboard({ session }: { session: Session }) {
             {request.deadlineAt && <p className="mt-1 text-xs text-stone-500">Response deadline: {new Date(request.deadlineAt).toLocaleString()}</p>}
             {request.decisionReason && <p className="mt-2 text-sm text-stone-600"><b>Reviewer note:</b> {request.decisionReason}</p>}
             {canRespond && <div className="mt-3 space-y-2"><label className="block text-xs font-semibold text-stone-600">Your explanation<Textarea value={responses[request.id] ?? ""} onChange={event => setResponses(existing => ({ ...existing, [request.id]: event.target.value }))} rows={4} maxLength={5000} placeholder="Explain what happened in your own words." /></label><label className="block text-xs font-semibold text-stone-600">Supporting document (optional)<input className="input mt-1 w-full" type="file" accept="image/jpeg,image/png,image/webp,application/pdf" onChange={event => setResponseFiles(existing => ({ ...existing, [request.id]: event.target.files?.[0] }))} /></label>{responseMutation.isError && <p role="alert" className="text-sm text-red-700">{axios.isAxiosError(responseMutation.error) ? responseMutation.error.response?.data?.error ?? "Could not submit your explanation." : "Could not submit your explanation."}</p>}<Button disabled={responseMutation.isPending || (responses[request.id] ?? "").trim().length < 3} onClick={() => responseMutation.mutate({ requestId: request.id, body: responses[request.id] ?? "", file: responseFiles[request.id] })}>{responseMutation.isPending ? "Submitting…" : "Submit explanation"}</Button></div>}
-            {request.body && !canRespond && <p className="mt-3 rounded-lg bg-stone-50 p-3 text-sm text-stone-700"><b>Your submitted explanation:</b> {request.body}</p>}
+            {request.body && !canRespond && <div className="mt-3 rounded-lg bg-stone-50 p-3 text-sm text-stone-700"><p><b>Your submitted explanation:</b> {request.body}</p>{request.evidenceKey && <Button className="mt-2" size="sm" variant="outline" onClick={async () => { const response = await api.get(`/api/student/explanation-requests/${request.id}/attachment`, { responseType: "blob" }); const url = URL.createObjectURL(response.data); const link = document.createElement("a"); link.href = url; link.download = "explanation-attachment"; link.click(); URL.revokeObjectURL(url); }}>Download attachment</Button>}</div>}
           </article>;
         })}</div>
       </section>}
@@ -101,7 +112,11 @@ export function CandidateDashboard({ session }: { session: Session }) {
           <p className="mt-1 text-sm text-stone-600">Status: <b className="capitalize">{String(verification.status).replaceAll("_", " ")}</b>{verification.rejectionReason ? ` — ${verification.rejectionReason}` : ""}</p>
           {verification.status === "approved" ? <p className="mt-3 text-sm text-emerald-700">Approved. You can start protected assessments during their availability window.</p>
             : verification.status === "submitted" ? <p className="mt-3 text-sm text-amber-800">Your request is awaiting review by your institute.</p>
-            : <Button className="mt-4" disabled={submitting} onClick={() => void submitVerification()}>{submitting ? "Submitting…" : verification.status === "resubmission_required" ? "Resubmit identity verification" : "Submit identity verification"}</Button>}
+            : <div className="mt-4 space-y-3">
+              <label className="block text-sm font-medium text-stone-700">Live selfie<input className="input mt-1 w-full" type="file" accept="image/jpeg,image/png,image/webp" capture="user" onChange={event => setVerificationFiles(existing => ({ ...existing, photo: event.target.files?.[0] }))} /></label>
+              <label className="block text-sm font-medium text-stone-700">Identity document<input className="input mt-1 w-full" type="file" accept="image/jpeg,image/png,image/webp,application/pdf" onChange={event => setVerificationFiles(existing => ({ ...existing, idDocument: event.target.files?.[0] }))} /></label>
+              <Button disabled={submitting || !verificationFiles.photo || !verificationFiles.idDocument} onClick={() => void submitVerification()}>{submitting ? "Submitting…" : verification.status === "resubmission_required" ? "Resubmit identity verification" : "Submit identity verification"}</Button>
+            </div>}
           {notice && <p role="status" className="mt-3 text-sm text-emerald-700">{notice}</p>}{error && <p role="alert" className="mt-3 text-sm text-red-700">{error}</p>}
         </section>)}
 
