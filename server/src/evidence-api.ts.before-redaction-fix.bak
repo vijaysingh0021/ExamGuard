@@ -1,0 +1,119 @@
+import { z } from 'zod';
+
+const pageSchema = z.coerce.number().int().min(1).max(1_000).default(1);
+const pageSizeSchema = z.coerce.number().int().min(1).max(100).default(50);
+
+export const evidenceInventoryQuerySchema = z.object({
+  page: pageSchema,
+  pageSize: pageSizeSchema,
+  candidateId: z.string().uuid().optional(),
+  examId: z.string().uuid().optional(),
+  attemptId: z.string().uuid().optional(),
+  type: z.enum(['image', 'browser_event', 'ai_signal', 'radio_observation', 'coding_submission']).optional(),
+  reviewStatus: z.enum(['pending_review', 'reviewed', 'escalated']).optional(),
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional(),
+  search: z.string().trim().max(120).optional(),
+}).superRefine((value, ctx) => {
+  if (value.from && value.to && new Date(value.from) > new Date(value.to)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['to'], message: '`to` must be on or after `from`' });
+  }
+});
+
+export const evidenceReviewerRoles = ['institute_admin', 'teacher', 'proctor'] as const;
+export const evidenceMimeTypes = ['image/jpeg', 'image/png', 'image/webp'] as const;
+export const evidenceMaxBytes = 5 * 1024 * 1024;
+export const evidenceUrlTtlSeconds = 60;
+
+
+export type IncidentDecision = 'dismissed' | 'resolved' | 'escalated' | 'awaiting_student';
+export type RadioDecision = 'reviewed_no_concern' | 'reviewed_concern_retained' | 'insufficient_evidence';
+
+const incidentTransitions: Record<string, readonly IncidentDecision[]> = {
+  open: ['dismissed', 'resolved', 'escalated', 'awaiting_student'],
+  awaiting_student: ['dismissed', 'resolved', 'escalated'],
+  escalated: ['dismissed', 'resolved', 'awaiting_student'],
+  resolved: [],
+  dismissed: [],
+};
+
+export function canTransitionIncident(from: string, to: IncidentDecision): boolean {
+  return incidentTransitions[from]?.includes(to) ?? false;
+}
+
+export function canTransitionRadio(from: string, to: RadioDecision): boolean {
+  return from === 'pending_review' && ['reviewed_no_concern', 'reviewed_concern_retained', 'insufficient_evidence'].includes(to);
+}
+
+export type EvidenceReviewStatus = 'pending_review' | 'reviewed' | 'escalated' | 'not_available';
+
+export function incidentReviewStatus(statusOrStatuses: string | string[]): EvidenceReviewStatus {
+  const statuses = Array.isArray(statusOrStatuses) ? statusOrStatuses : [statusOrStatuses];
+  if (statuses.includes('escalated')) return 'escalated';
+  if (statuses.some(status => status === 'open' || status === 'awaiting_student')) return 'pending_review';
+  if (statuses.some(status => status === 'resolved' || status === 'dismissed')) return 'reviewed';
+  return 'pending_review';
+}
+
+export function radioReviewStatus(statuses: string[]): EvidenceReviewStatus {
+  if (statuses.includes('pending_review') || statuses.length === 0) return 'pending_review';
+  return 'reviewed';
+}
+
+export function evidencePaginationHeaders(page: number, pageSize: number, total: number) {
+  return {
+    'X-Page': String(page),
+    'X-Page-Size': String(pageSize),
+    'X-Total-Count': String(total),
+    'X-Total-Pages': String(Math.ceil(total / pageSize)),
+  };
+}
+
+export function evidenceOffset(page: number, pageSize: number) {
+  return (page - 1) * pageSize;
+}
+
+export function privateEvidenceMetadataError(metadata: { contentType?: string; contentLength?: number } | null): { status: number; message: string } | null {
+  if (!metadata) return { status: 404, message: 'Evidence object is missing or expired' };
+  if (!metadata.contentType || !evidenceMimeTypes.includes(metadata.contentType as typeof evidenceMimeTypes[number])) return { status: 415, message: 'Evidence media type is not supported' };
+  if (metadata.contentLength === undefined || !Number.isSafeInteger(metadata.contentLength) || metadata.contentLength <= 0 || metadata.contentLength > evidenceMaxBytes) return { status: 413, message: 'Evidence object size is invalid or exceeds the permitted limit' };
+  return null;
+}
+
+export function evidenceKeyMatchesAttempt(key: string | null | undefined, organizationId: string, attemptId: string): boolean {
+  return Boolean(key && key.startsWith(`organizations/${organizationId}/attempts/${attemptId}/evidence/`) && key.length > `organizations/${organizationId}/attempts/${attemptId}/evidence/`.length);
+}
+
+export function evidenceAttemptScopeMatches(
+  attempt: { organizationId: string; examId: string; candidateId: string } | null | undefined,
+  evidence: { organizationId: string; examId: string; candidateId: string },
+  authorizedOrganizationId: string,
+): boolean {
+  return Boolean(attempt && evidence.organizationId === authorizedOrganizationId && attempt.organizationId === authorizedOrganizationId && attempt.examId === evidence.examId && attempt.candidateId === evidence.candidateId);
+}
+
+export function uploadErrorHttpStatus(code: string): number {
+  return code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+}
+
+export function signedEvidenceUrlExpiresAt(issuedAtMs: number, ttlSeconds = evidenceUrlTtlSeconds): number {
+  return issuedAtMs + ttlSeconds * 1000;
+}
+
+export function signedEvidenceUrlExpired(expiresAtMs: number, nowMs = Date.now()): boolean {
+  return nowMs >= expiresAtMs;
+}
+
+const sensitiveEvidenceDetailKey = /(?:token|secret|password|authorization|cookie|credential|object.?key|evidence.?key|storage.?path|file.?path|bucket)/i;
+
+/** Remove credential-like and storage-internal fields from untrusted event metadata before reviewer serialization. */
+export function sanitizeEvidenceDetails(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeEvidenceDetails);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !sensitiveEvidenceDetailKey.test(key))
+      .map(([key, child]) => [key, sanitizeEvidenceDetails(child)]));
+  }
+  if (typeof value === 'string' && /(https?:\/\/|s3:\/\/|file:\/\/)/i.test(value)) return '[redacted external resource reference]';
+  return value;
+}

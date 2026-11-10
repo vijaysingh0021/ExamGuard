@@ -1,0 +1,196 @@
+﻿using System.Runtime.InteropServices;
+
+namespace ExamGuard.DeviceMonitor;
+
+// Uses the documented Windows WLAN API. Does not enter monitor mode or inspect traffic.
+internal static class NativeWifi
+{
+    internal record AccessPoint(string Bssid, int Rssi);
+
+    public static IReadOnlyList<AccessPoint> Scan()
+    {
+        var code = WlanOpenHandle(2, IntPtr.Zero, out _, out var client);
+        if (code != 0)
+            throw new InvalidOperationException($"WlanOpenHandle failed: {code}");
+
+        try
+        {
+            code = WlanEnumInterfaces(client, IntPtr.Zero, out var interfaces);
+            if (code != 0)
+                throw new InvalidOperationException($"WlanEnumInterfaces failed: {code}");
+
+            try
+            {
+                var header = Marshal.PtrToStructure<ListHeader>(interfaces);
+                var interfaceSize = Marshal.SizeOf<InterfaceInfo>();
+                var result = new List<AccessPoint>();
+
+                for (var i = 0; i < header.Count; i++)
+                {
+                    var item = Marshal.PtrToStructure<InterfaceInfo>(
+                        IntPtr.Add(interfaces, Marshal.SizeOf<ListHeader>() + i * interfaceSize));
+
+                    WlanScan(client, ref item.Guid, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                    Thread.Sleep(750);
+
+                    foreach (var securityEnabled in new[] { false, true })
+                    {
+                        code = WlanGetNetworkBssList(
+                            client, ref item.Guid, IntPtr.Zero,
+                            Dot11BssType.Any, securityEnabled, IntPtr.Zero, out var bss);
+
+                        if (code != 0 || bss == IntPtr.Zero)
+                            continue;
+
+                        try
+                        {
+                            var bssHeader = Marshal.PtrToStructure<BssListHeader>(bss);
+                            var bssSize = Marshal.SizeOf<BssEntry>();
+                            var headerSize = Marshal.SizeOf<BssListHeader>();
+
+                            if (bssHeader.TotalSize < headerSize)
+                                throw new InvalidOperationException("Invalid WLAN BSS list size.");
+
+                            var maximumEntries = (bssHeader.TotalSize - headerSize) / bssSize;
+                            var entryCount = Math.Min(bssHeader.NumberOfItems, maximumEntries);
+
+                            for (var j = 0; j < entryCount; j++)
+                            {
+                                var entry = Marshal.PtrToStructure<BssEntry>(
+                                    IntPtr.Add(bss, headerSize + (int)j * bssSize));
+
+                                if (entry.Bssid == null || entry.Bssid.Length != 6)
+                                    continue;
+
+                                if (entry.Rssi < -127 || entry.Rssi > 0)
+                                    continue;
+
+                                var bssid = string.Join(
+                                    ":", entry.Bssid.Select(x => x.ToString("X2")));
+
+                                if (!result.Any(ap => ap.Bssid == bssid))
+                                    result.Add(new AccessPoint(bssid, entry.Rssi));
+                            }
+                        }
+                        finally
+                        {
+                            WlanFreeMemory(bss);
+                        }
+                    }
+                }
+
+                return result;
+            }
+            finally
+            {
+                WlanFreeMemory(interfaces);
+            }
+        }
+        finally
+        {
+            WlanCloseHandle(client, IntPtr.Zero);
+        }
+    }
+
+    private enum Dot11BssType : uint
+    {
+        Infrastructure = 1,
+        Independent = 2,
+        Any = 3
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ListHeader
+    {
+        public uint Count;
+        public uint Index;
+    }
+
+    // WLAN_BSS_LIST uses TotalSize first and NumberOfItems second.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BssListHeader
+    {
+        public uint TotalSize;
+        public uint NumberOfItems;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct InterfaceInfo
+    {
+        public Guid Guid;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string Description;
+
+        public uint State;
+    }
+
+    // Complete WLAN_RATE_SET: ULONG length + 126 USHORT rates.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WlanRateSet
+    {
+        public uint RateSetLength;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 126)]
+        public ushort[] Rates;
+    }
+
+    // Complete WLAN_BSS_ENTRY layout. Field order and alignment matter:
+    // the native API returns an array of these structures.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BssEntry
+    {
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)]
+        public byte[] SsidHeader;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+        public byte[] Ssid;
+
+        public uint PhyId;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
+        public byte[] Bssid;
+
+        public uint BssType;
+        public uint PhyType;
+        public int Rssi;
+        public uint LinkQuality;
+        public byte InRegDomain;
+        public ushort BeaconPeriod;
+        public long Timestamp;
+        public long HostTimestamp;
+        public ushort Capability;
+        public uint CenterFrequency;
+        public WlanRateSet RateSet;
+        public uint IeOffset;
+        public uint IeSize;
+    }
+
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanOpenHandle(
+        uint version, IntPtr reserved, out uint negotiated, out IntPtr client);
+
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanCloseHandle(IntPtr client, IntPtr reserved);
+
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanEnumInterfaces(
+        IntPtr client, IntPtr reserved, out IntPtr list);
+
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanScan(
+        IntPtr client, ref Guid interfaceGuid,
+        IntPtr ssid, IntPtr ieData, IntPtr reserved);
+
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanGetNetworkBssList(
+        IntPtr client, ref Guid interfaceGuid, IntPtr ssid,
+        Dot11BssType bssType,
+        [MarshalAs(UnmanagedType.Bool)] bool securityEnabled,
+        IntPtr reserved, out IntPtr list);
+
+    [DllImport("wlanapi.dll")]
+    private static extern void WlanFreeMemory(IntPtr memory);
+}
+
+

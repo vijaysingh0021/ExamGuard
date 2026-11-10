@@ -1,0 +1,704 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import http from 'node:http';
+import { randomUUID } from 'node:crypto';
+import type { StorageInterface } from '../src/storage.js';
+import '../src/config.js';
+
+// Safety guard: refuse to run if database is not examguard_test
+const configuredDatabaseUrl = process.env.DATABASE_URL;
+if (!configuredDatabaseUrl) {
+  throw new Error('DATABASE_URL must be loaded from the root .env file.');
+}
+const testDatabaseUrl = new URL(configuredDatabaseUrl);
+if (
+  !['localhost', '127.0.0.1', '[::1]'].includes(testDatabaseUrl.hostname) ||
+  !['postgres:', 'postgresql:'].includes(testDatabaseUrl.protocol)
+) {
+  throw new Error('SAFETY VIOLATION: Tests require a local PostgreSQL database.');
+}
+testDatabaseUrl.pathname = '/examguard_test';
+const TEST_DATABASE_URL = testDatabaseUrl.toString();
+if (new URL(TEST_DATABASE_URL).pathname !== '/examguard_test') {
+  throw new Error('SAFETY VIOLATION: Test database must be examguard_test.');
+}
+if (!TEST_DATABASE_URL.includes('examguard_test')) {
+  throw new Error('SAFETY VIOLATION: Test database must be examguard_test');
+}
+
+Object.assign(process.env, {
+  DATABASE_URL: TEST_DATABASE_URL,
+  JWT_SECRET: 'x'.repeat(32)
+});
+
+let signToken: typeof import('../src/auth.js').signToken;
+let prisma: typeof import('../src/prisma.js').prisma;
+let createApp: typeof import('../src/app.js').createApp;
+
+const TEST_ORG_ID = '550e8400-e29b-41d4-a716-446655440000';
+const TEST_USER_ID = '550e8400-e29b-41d4-a716-446655440001';
+const TEST_CANDIDATE_ID = '550e8400-e29b-41d4-a716-446655440002';
+const TEST_EXAM_ID = '550e8400-e29b-41d4-a716-446655440003';
+const TEST_ATTEMPT_ID = '550e8400-e29b-41d4-a716-446655440004';
+
+const SECOND_USER_ID = '550e8400-e29b-41d4-a716-446655440008';
+const SECOND_CANDIDATE_ID = '550e8400-e29b-41d4-a716-446655440007';
+const SECOND_ATTEMPT_ID = '550e8400-e29b-41d4-a716-446655440009';
+
+const OTHER_ORG_ID = '550e8400-e29b-41d4-a716-446655440010';
+const OTHER_USER_ID = '550e8400-e29b-41d4-a716-446655440011';
+const OTHER_CANDIDATE_ID = '550e8400-e29b-41d4-a716-446655440012';
+const OTHER_EXAM_ID = '550e8400-e29b-41d4-a716-446655440013';
+const OTHER_ATTEMPT_ID = '550e8400-e29b-41d4-a716-446655440014';
+
+const EXPIRED_ATTEMPT_ID = '550e8400-e29b-41d4-a716-446655440018';
+const EXPIRED_EXAM_ID = '550e8400-e29b-41d4-a716-446655440017';
+
+const SUBMITTED_ATTEMPT_ID = '550e8400-e29b-41d4-a716-446655440020';
+const SUBMITTED_EXAM_ID = '550e8400-e29b-41d4-a716-446655440019';
+
+const previousEnv = { ...process.env };
+const VALID_JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]);
+const INVALID_JPEG = Buffer.from([0x00, 0x00, 0x00, 0x00]);
+const INVALID_MIME_PNG_WITH_JPEG_HEADER = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+const LARGE_FILE = Buffer.alloc(6 * 1024 * 1024); // 6MB - over 5MB limit
+
+// Storage mock - track calls to verify rejected requests never reach storage
+let storageCalls: Array<{ key: string; contentType: string }> = [];
+
+// Test storage implementation
+const testStorage: StorageInterface = {
+  putPrivateDocument: async (key: string, body: Buffer, contentType: string) => {
+    storageCalls.push({ key, contentType });
+    return `mocked://${key}`;
+  },
+  privateDocumentUrl: async (key: string) => `mocked://${key}`,
+  storageConfigured: () => true
+};
+
+async function cleanup() {
+  storageCalls = [];
+
+  // Delete all exam attempts first (including for other exams)
+  await prisma.examAttempt.deleteMany({
+    where: {
+      OR: [
+        { id: TEST_ATTEMPT_ID },
+        { examId: TEST_EXAM_ID },
+        { id: SECOND_ATTEMPT_ID },
+        { id: OTHER_ATTEMPT_ID },
+        { id: EXPIRED_ATTEMPT_ID },
+        { id: SUBMITTED_ATTEMPT_ID }
+      ]
+    }
+  });
+
+  await prisma.attemptAnswer.deleteMany({ where: { attemptId: TEST_ATTEMPT_ID } });
+  await prisma.question.deleteMany({ where: { examId: TEST_EXAM_ID } });
+  await prisma.membership.deleteMany({ where: { userId: TEST_USER_ID } });
+
+  // Delete ALL exams before deleting users
+  await prisma.exam.deleteMany({
+    where: {
+      OR: [
+        { id: TEST_EXAM_ID },
+        { id: OTHER_EXAM_ID },
+        { id: EXPIRED_EXAM_ID },
+        { id: SUBMITTED_EXAM_ID }
+      ]
+    }
+  });
+
+  await prisma.candidate.deleteMany({ where: { organizationId: TEST_ORG_ID } });
+  await prisma.user.deleteMany({ where: { id: TEST_USER_ID } });
+  await prisma.organization.deleteMany({ where: { id: TEST_ORG_ID } });
+
+  // Clean up second candidate and organization
+  await prisma.examAttempt.deleteMany({ where: { OR: [{ id: SECOND_ATTEMPT_ID }, { id: OTHER_ATTEMPT_ID }, { id: EXPIRED_ATTEMPT_ID }, { id: SUBMITTED_ATTEMPT_ID }] } });
+  await prisma.exam.deleteMany({ where: { OR: [{ id: OTHER_EXAM_ID }, { id: EXPIRED_EXAM_ID }, { id: SUBMITTED_EXAM_ID }] } });
+  await prisma.membership.deleteMany({ where: { OR: [{ userId: SECOND_USER_ID }, { userId: OTHER_USER_ID }] } });
+  await prisma.user.deleteMany({ where: { OR: [{ id: SECOND_USER_ID }, { id: OTHER_USER_ID }] } });
+  await prisma.candidate.deleteMany({ where: { OR: [{ id: SECOND_CANDIDATE_ID }, { id: OTHER_CANDIDATE_ID }] } });
+  await prisma.organization.deleteMany({ where: { OR: [{ id: TEST_ORG_ID }, { id: OTHER_ORG_ID }] } });
+}
+
+async function setupTestData() {
+  const passwordHash = await bcrypt.hash('TestPass123', 12);
+
+  await prisma.organization.create({ data: { id: TEST_ORG_ID, name: 'Test Org', slug: 'test-org' } });
+  await prisma.user.create({ data: { id: TEST_USER_ID, name: 'Test User', email: 'test@example.com', passwordHash } });
+  await prisma.membership.create({ data: { userId: TEST_USER_ID, organizationId: TEST_ORG_ID, role: 'institute_admin', active: true } });
+  await prisma.candidate.create({ data: { id: TEST_CANDIDATE_ID, organizationId: TEST_ORG_ID, userId: TEST_USER_ID, name: 'Test Candidate', email: 'candidate@example.com' } });
+
+  const exam = await prisma.exam.create({ data: {
+    id: TEST_EXAM_ID,
+    organizationId: TEST_ORG_ID,
+    title: 'Test Exam',
+    durationMinutes: 60,
+    status: 'published',
+    createdById: TEST_USER_ID
+  }});
+
+  const TEST_Q1_ID = '550e8400-e29b-41d4-a716-446655440005';
+  const TEST_Q2_ID = '550e8400-e29b-41d4-a716-446655440006';
+
+  await prisma.question.createMany({ data: [
+    { id: TEST_Q1_ID, organizationId: TEST_ORG_ID, examId: TEST_EXAM_ID, type: 'mcq', prompt: 'Q1', options: [{id:'a',text:'A'},{id:'b',text:'B'}], correctAnswer: 'a', marks: 1, negativeMarks: 0, position: 0 },
+    { id: TEST_Q2_ID, organizationId: TEST_ORG_ID, examId: TEST_EXAM_ID, type: 'mcq', prompt: 'Q2', options: [{id:'a',text:'A'},{id:'b',text:'B'}], correctAnswer: 'b', marks: 1, negativeMarks: 0, position: 1 },
+  ]});
+
+  // Create active attempt for TEST_CANDIDATE_ID
+  await prisma.examAttempt.create({
+    data: {
+      id: TEST_ATTEMPT_ID,
+      organizationId: TEST_ORG_ID,
+      examId: TEST_EXAM_ID,
+      candidateId: TEST_CANDIDATE_ID,
+      userId: TEST_USER_ID,
+      status: 'in_progress',
+      startedAt: new Date(),
+      deadlineAt: new Date(Date.now() + 60 * 60 * 1000),
+      questionOrder: [TEST_Q1_ID, TEST_Q2_ID]
+    }
+  });
+
+  // Create second candidate and their attempt for cross-candidate tests
+  await prisma.user.create({ data: { id: SECOND_USER_ID, name: 'Second User', email: 'second@example.com', passwordHash } });
+  await prisma.membership.create({ data: { userId: SECOND_USER_ID, organizationId: TEST_ORG_ID, role: 'student', active: true } });
+  await prisma.candidate.create({ data: { id: SECOND_CANDIDATE_ID, organizationId: TEST_ORG_ID, userId: SECOND_USER_ID, name: 'Second Candidate', email: 'second-candidate@example.com' } });
+
+  // Create attempt for second candidate
+  await prisma.examAttempt.create({
+    data: {
+      id: SECOND_ATTEMPT_ID,
+      organizationId: TEST_ORG_ID,
+      examId: TEST_EXAM_ID,
+      candidateId: SECOND_CANDIDATE_ID,
+      userId: SECOND_USER_ID,
+      status: 'in_progress',
+      startedAt: new Date(),
+      deadlineAt: new Date(Date.now() + 60 * 60 * 1000),
+      questionOrder: [TEST_Q1_ID, TEST_Q2_ID]
+    }
+  });
+
+  // Create second organization for cross-organization test
+  await prisma.organization.create({ data: { id: OTHER_ORG_ID, name: 'Other Org', slug: 'other-org' } });
+  await prisma.user.create({ data: { id: OTHER_USER_ID, name: 'Other User', email: 'other@example.com', passwordHash } });
+  await prisma.membership.create({ data: { userId: OTHER_USER_ID, organizationId: OTHER_ORG_ID, role: 'student', active: true } });
+  await prisma.candidate.create({ data: { id: OTHER_CANDIDATE_ID, organizationId: OTHER_ORG_ID, userId: OTHER_USER_ID, name: 'Other Candidate', email: 'other-candidate@example.com' } });
+
+  await prisma.exam.create({ data: { id: OTHER_EXAM_ID, organizationId: OTHER_ORG_ID, title: 'Other Exam', durationMinutes: 60, status: 'published', createdById: OTHER_USER_ID } });
+  await prisma.examAttempt.create({
+    data: { id: OTHER_ATTEMPT_ID, organizationId: OTHER_ORG_ID, examId: OTHER_EXAM_ID, candidateId: OTHER_CANDIDATE_ID, userId: OTHER_USER_ID, status: 'in_progress', startedAt: new Date(), deadlineAt: new Date(Date.now() + 60 * 60 * 1000), questionOrder: [] }
+  });
+
+  // Create expired attempt - use a different exam to avoid unique constraint
+  await prisma.exam.create({ data: { id: EXPIRED_EXAM_ID, organizationId: TEST_ORG_ID, title: 'Expired Exam', durationMinutes: 60, status: 'published', createdById: TEST_USER_ID } });
+  await prisma.examAttempt.create({
+    data: { id: EXPIRED_ATTEMPT_ID, organizationId: TEST_ORG_ID, examId: EXPIRED_EXAM_ID, candidateId: TEST_CANDIDATE_ID, userId: TEST_USER_ID, status: 'expired', startedAt: new Date(Date.now() - 7200000), deadlineAt: new Date(Date.now() - 3600000), questionOrder: [] }
+  });
+
+  // Create submitted attempt - use a different exam to avoid unique constraint
+  await prisma.exam.create({ data: { id: SUBMITTED_EXAM_ID, organizationId: TEST_ORG_ID, title: 'Submitted Exam', durationMinutes: 60, status: 'published', createdById: TEST_USER_ID } });
+  await prisma.examAttempt.create({
+    data: { id: SUBMITTED_ATTEMPT_ID, organizationId: TEST_ORG_ID, examId: SUBMITTED_EXAM_ID, candidateId: TEST_CANDIDATE_ID, userId: TEST_USER_ID, status: 'submitted', startedAt: new Date(Date.now() - 3600000), deadlineAt: new Date(Date.now() + 3600000), submittedAt: new Date(Date.now() - 1800000), questionOrder: [] }
+  });
+}
+
+let testServer: http.Server | null = null;
+const TEST_PORT = 4002;
+
+async function startTestServer(app: http.Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const server = app.listen(TEST_PORT, (err?: Error) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+async function stopTestServer(server: http.Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+function createMultipartBody(fields: Record<string, string>, file: { name: string; filename: string; contentType: string; buffer: Buffer }): { body: Buffer; contentType: string } {
+  const boundary = `----WebKitFormBoundary${randomUUID().replace(/-/g, '')}`;
+  const parts: Buffer[] = [];
+
+  for (const [key, value] of Object.entries(fields)) {
+    parts.push(Buffer.from(`--${boundary}\r\n`));
+    parts.push(Buffer.from(`Content-Disposition: form-data; name="${key}"\r\n\r\n`));
+    parts.push(Buffer.from(`${value}\r\n`));
+  }
+
+  parts.push(Buffer.from(`--${boundary}\r\n`));
+  parts.push(Buffer.from(`Content-Disposition: form-data; name="${file.name}"; filename="${file.filename}"\r\n`));
+  parts.push(Buffer.from(`Content-Type: ${file.contentType}\r\n\r\n`));
+  parts.push(file.buffer);
+  parts.push(Buffer.from(`\r\n`));
+  parts.push(Buffer.from(`--${boundary}--\r\n`));
+
+  return {
+    body: Buffer.concat(parts),
+    contentType: `multipart/form-data; boundary=${boundary}`
+  };
+}
+
+async function makeRequest(
+  path: string,
+  method: string,
+  headers: Record<string, string>,
+  body?: Buffer
+): Promise<{ status: number; body: unknown }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: 'localhost',
+      port: TEST_PORT,
+      path,
+      method,
+      headers
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = data ? JSON.parse(data) : {};
+          resolve({ status: res.statusCode ?? 0, body: parsed });
+        } catch {
+          resolve({ status: res.statusCode ?? 0, body: data });
+        }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+test.before(async () => {
+  // ESM static imports run before this module body. Load Prisma-dependent modules
+  // only after the test environment is established above.
+  const [authModule, prismaModule, appModule] = await Promise.all([
+    import('../src/auth.js'),
+    import('../src/prisma.js'),
+    import('../src/app.js')
+  ]);
+  signToken = authModule.signToken;
+  prisma = prismaModule.prisma;
+  createApp = appModule.createApp;
+
+  const connection = await prisma.$queryRaw<Array<{ databaseName: string }>>`
+    SELECT current_database() AS "databaseName"
+  `;
+  if (connection[0]?.databaseName !== 'examguard_test') {
+    await prisma.$disconnect();
+    throw new Error('SAFETY VIOLATION: Evidence-upload tests require the examguard_test database');
+  }
+
+  await cleanup();
+  await setupTestData();
+});
+
+test.after(async () => {
+  await cleanup();
+  await prisma.$disconnect();
+  process.env = previousEnv;
+});
+
+// Test 1: Candidate uploads evidence to their own active attempt - should succeed (returns 201 with mocked storage)
+test('evidence upload - candidate own active attempt succeeds with mocked storage', async () => {
+  // Create app with test storage
+  const testStorage: StorageInterface = {
+    putPrivateDocument: async (key: string, body: Buffer, contentType: string) => { storageCalls.push({ key, contentType }); return `mocked://${key}`; },
+    privateDocumentUrl: async (key: string) => `mocked://${key}`,
+    storageConfigured: () => true
+  };
+
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const token = signToken(TEST_USER_ID);
+    const { body: requestBody, contentType } = createMultipartBody({}, {
+      name: 'file',
+      filename: 'evidence.jpg',
+      contentType: 'image/jpeg',
+      buffer: VALID_JPEG
+    });
+
+    const { status, body: responseBody } = await makeRequest(
+      `/api/student/attempts/${TEST_ATTEMPT_ID}/evidence`,
+      'POST',
+      { authorization: `Bearer ${token}`, 'Content-Type': contentType },
+      requestBody
+    );
+
+    // Should succeed with mocked storage
+    assert.equal(status, 201, `Expected 201, got ${status}`);
+    assert.ok(responseBody && typeof responseBody === 'object' && 'evidenceKey' in responseBody, 'Response should contain evidenceKey');
+    const evidenceKey = (responseBody as { evidenceKey: string }).evidenceKey;
+    assert.equal(storageCalls.length, 1, 'Successful uploads must invoke private storage exactly once');
+    assert.deepEqual(storageCalls[0], { key: evidenceKey, contentType: 'image/jpeg' }, 'Storage must receive the exact key returned by the API');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+// Test 2: Candidate uploads evidence to another candidate's attempt - should be rejected with 403/404
+test('evidence upload - another candidate attempt rejected', async () => {
+  storageCalls = [];
+  const testStorage: StorageInterface = {
+    putPrivateDocument: async (key: string, body: Buffer, contentType: string) => { storageCalls.push({ key, contentType }); return `mocked://${key}`; },
+    privateDocumentUrl: async (key: string) => `mocked://${key}`,
+    storageConfigured: () => true
+  };
+
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const token = signToken(SECOND_USER_ID);
+    const { body, contentType } = createMultipartBody({}, {
+      name: 'file',
+      filename: 'evidence.jpg',
+      contentType: 'image/jpeg',
+      buffer: VALID_JPEG
+    });
+
+    const { status } = await makeRequest(
+      `/api/student/attempts/${TEST_ATTEMPT_ID}/evidence`,
+      'POST',
+      { authorization: `Bearer ${token}`, 'Content-Type': contentType },
+      body
+    );
+
+    // Should be rejected (403 or 404) - ownership check fails
+    assert.ok(status === 403 || status === 404, `Expected 403 or 404, got ${status}`);
+    assert.equal(storageCalls.length, 0, 'Rejected uploads must never invoke private storage');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+// Test 3: Cross-organization attempt - should be rejected with 403/404
+test('evidence upload - cross-organization rejection', async () => {
+  storageCalls = [];
+  const testStorage: StorageInterface = {
+    putPrivateDocument: async (key: string, body: Buffer, contentType: string) => { storageCalls.push({ key, contentType }); return `mocked://${key}`; },
+    privateDocumentUrl: async (key: string) => `mocked://${key}`,
+    storageConfigured: () => true
+  };
+
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const token = signToken(OTHER_USER_ID);
+    const { body, contentType } = createMultipartBody({}, {
+      name: 'file',
+      filename: 'evidence.jpg',
+      contentType: 'image/jpeg',
+      buffer: VALID_JPEG
+    });
+
+    const { status } = await makeRequest(
+      `/api/student/attempts/${TEST_ATTEMPT_ID}/evidence`,
+      'POST',
+      { authorization: `Bearer ${token}`, 'Content-Type': contentType },
+      body
+    );
+
+    // Should be rejected (403 or 404) - organization isolation
+    assert.ok(status === 403 || status === 404, `Expected 403 or 404, got ${status}`);
+    assert.equal(storageCalls.length, 0, 'Rejected uploads must never invoke private storage');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+// Test 4: Unauthenticated upload - should be rejected with 401
+test('evidence upload - unauthenticated rejection', async () => {
+  storageCalls = [];
+  const testStorage: StorageInterface = {
+    putPrivateDocument: async (key: string, body: Buffer, contentType: string) => { storageCalls.push({ key, contentType }); return `mocked://${key}`; },
+    privateDocumentUrl: async (key: string) => `mocked://${key}`,
+    storageConfigured: () => true
+  };
+
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const { body, contentType } = createMultipartBody({}, {
+      name: 'file',
+      filename: 'evidence.jpg',
+      contentType: 'image/jpeg',
+      buffer: VALID_JPEG
+    });
+
+    const { status } = await makeRequest(
+      `/api/student/attempts/${TEST_ATTEMPT_ID}/evidence`,
+      'POST',
+      { 'Content-Type': contentType },
+      body
+    );
+
+    // Should be rejected with 401 - authentication middleware runs first
+    assert.equal(status, 401, `Expected 401, got ${status}`);
+    assert.equal(storageCalls.length, 0, 'Rejected uploads must never invoke private storage');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+// Test 5: Expired attempt - should be rejected with 403/404
+test('evidence upload - expired attempt rejection', async () => {
+  storageCalls = [];
+  const testStorage: StorageInterface = {
+    putPrivateDocument: async (key: string, body: Buffer, contentType: string) => { storageCalls.push({ key, contentType }); return `mocked://${key}`; },
+    privateDocumentUrl: async (key: string) => `mocked://${key}`,
+    storageConfigured: () => true
+  };
+
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const token = signToken(TEST_USER_ID);
+    const { body, contentType } = createMultipartBody({}, {
+      name: 'file',
+      filename: 'evidence.jpg',
+      contentType: 'image/jpeg',
+      buffer: VALID_JPEG
+    });
+
+    const { status } = await makeRequest(
+      `/api/student/attempts/${EXPIRED_ATTEMPT_ID}/evidence`,
+      'POST',
+      { authorization: `Bearer ${token}`, 'Content-Type': contentType },
+      body
+    );
+
+    // Should be rejected (403 or 404) - deadline check fails
+    assert.ok(status === 403 || status === 404, `Expected 403 or 404, got ${status}`);
+    assert.equal(storageCalls.length, 0, 'Rejected uploads must never invoke private storage');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+// Test 6: Submitted attempt - should be rejected with 403/404
+test('evidence upload - submitted attempt rejection', async () => {
+  storageCalls = [];
+  const testStorage: StorageInterface = {
+    putPrivateDocument: async (key: string, body: Buffer, contentType: string) => { storageCalls.push({ key, contentType }); return `mocked://${key}`; },
+    privateDocumentUrl: async (key: string) => `mocked://${key}`,
+    storageConfigured: () => true
+  };
+
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const token = signToken(TEST_USER_ID);
+    const { body, contentType } = createMultipartBody({}, {
+      name: 'file',
+      filename: 'evidence.jpg',
+      contentType: 'image/jpeg',
+      buffer: VALID_JPEG
+    });
+
+    const { status } = await makeRequest(
+      `/api/student/attempts/${SUBMITTED_ATTEMPT_ID}/evidence`,
+      'POST',
+      { authorization: `Bearer ${token}`, 'Content-Type': contentType },
+      body
+    );
+
+    // Should be rejected (403 or 404) - status check fails
+    assert.ok(status === 403 || status === 404, `Expected 403 or 404, got ${status}`);
+    assert.equal(storageCalls.length, 0, 'Rejected uploads must never invoke private storage');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+// Test 7: Invalid MIME type - should be rejected with 415
+test('evidence upload - invalid MIME type rejection', async () => {
+  storageCalls = [];
+  const testStorage: StorageInterface = {
+    putPrivateDocument: async (key: string, body: Buffer, contentType: string) => { storageCalls.push({ key, contentType }); return `mocked://${key}`; },
+    privateDocumentUrl: async (key: string) => `mocked://${key}`,
+    storageConfigured: () => true
+  };
+
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const token = signToken(TEST_USER_ID);
+    const { body, contentType } = createMultipartBody({}, {
+      name: 'file',
+      filename: 'evidence.gif',
+      contentType: 'image/gif',
+      buffer: VALID_JPEG
+    });
+
+    const { status } = await makeRequest(
+      `/api/student/attempts/${TEST_ATTEMPT_ID}/evidence`,
+      'POST',
+      { authorization: `Bearer ${token}`, 'Content-Type': contentType },
+      body
+    );
+
+    // Should be rejected with 415 - MIME type validation
+    assert.equal(status, 415, `Expected 415, got ${status}`);
+    assert.equal(storageCalls.length, 0, 'Rejected uploads must never invoke private storage');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+// Test 8: Invalid file signature (JPEG header with PNG MIME) - should be rejected with 422
+test('evidence upload - invalid signature rejection', async () => {
+  storageCalls = [];
+  const testStorage: StorageInterface = {
+    putPrivateDocument: async (key: string, body: Buffer, contentType: string) => { storageCalls.push({ key, contentType }); return `mocked://${key}`; },
+    privateDocumentUrl: async (key: string) => `mocked://${key}`,
+    storageConfigured: () => true
+  };
+
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const token = signToken(TEST_USER_ID);
+    const { body, contentType } = createMultipartBody({}, {
+      name: 'file',
+      filename: 'evidence.png',
+      contentType: 'image/png',
+      buffer: INVALID_MIME_PNG_WITH_JPEG_HEADER
+    });
+
+    const { status } = await makeRequest(
+      `/api/student/attempts/${TEST_ATTEMPT_ID}/evidence`,
+      'POST',
+      { authorization: `Bearer ${token}`, 'Content-Type': contentType },
+      body
+    );
+
+    // Should be rejected with 422 - file signature validation
+    assert.equal(status, 422, `Expected 422, got ${status}`);
+    assert.equal(storageCalls.length, 0, 'Rejected uploads must never invoke private storage');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+// Test 9: File exceeding 5 MB - should be rejected by Multer with 413 or 400
+test('evidence upload - oversized file rejection', async () => {
+  storageCalls = [];
+  const testStorage: StorageInterface = {
+    putPrivateDocument: async (key: string, body: Buffer, contentType: string) => { storageCalls.push({ key, contentType }); return `mocked://${key}`; },
+    privateDocumentUrl: async (key: string) => `mocked://${key}`,
+    storageConfigured: () => true
+  };
+
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const token = signToken(TEST_USER_ID);
+    const { body, contentType } = createMultipartBody({}, {
+      name: 'file',
+      filename: 'evidence.jpg',
+      contentType: 'image/jpeg',
+      buffer: LARGE_FILE
+    });
+
+    const { status } = await makeRequest(
+      `/api/student/attempts/${TEST_ATTEMPT_ID}/evidence`,
+      'POST',
+      { authorization: `Bearer ${token}`, 'Content-Type': contentType },
+      body
+    );
+
+    // Multer should reject oversized files with 413 (Payload Too Large) or 400
+    assert.ok(status === 413 || status === 400, `Expected 413 or 400, got ${status}`);
+    assert.equal(storageCalls.length, 0, 'Rejected uploads must never invoke private storage');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+// Test 10: Malformed multipart request - should be rejected
+test('evidence upload - malformed multipart rejection', async () => {
+  storageCalls = [];
+  const testStorage: StorageInterface = {
+    putPrivateDocument: async (key: string, body: Buffer, contentType: string) => { storageCalls.push({ key, contentType }); return `mocked://${key}`; },
+    privateDocumentUrl: async (key: string) => `mocked://${key}`,
+    storageConfigured: () => true
+  };
+
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const token = signToken(TEST_USER_ID);
+    const { status } = await makeRequest(
+      `/api/student/attempts/${TEST_ATTEMPT_ID}/evidence`,
+      'POST',
+      {
+        authorization: `Bearer ${token}`,
+        'Content-Type': 'multipart/form-data; boundary=invalid-boundary'
+      },
+      Buffer.from('not a valid multipart body')
+    );
+
+    // Should be rejected (400 or 415) - malformed request
+    assert.ok(status === 400 || status === 415, `Expected 400 or 415, got ${status}`);
+    assert.equal(storageCalls.length, 0, 'Rejected uploads must never invoke private storage');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+

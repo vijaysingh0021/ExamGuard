@@ -1,0 +1,16 @@
+node_modules
+dist
+.env
+.env.local
+coverage
+.cache/
+*.log
+bin/
+obj/
+.venv/
+__pycache__/
+server/src/generated
+
+# Local-only private proctoring evidence (never commit captured frames)
+.local-evidence/
+data/private-evidence/
