@@ -677,18 +677,33 @@ app.get('/api/organizations/:organizationId/verifications', authenticate, author
   res.json(rows.map(({ candidate, ...row }) => ({ ...row, candidateId: candidate })));
 } catch (error) { next(error); } });
 app.post('/api/organizations/:organizationId/verifications/:id/review', authenticate, authorize('institute_admin', 'proctor'), async (req: AuthRequest, res, next) => { try {
-  const data = z.object({ approved: z.boolean(), reason: z.string().max(1000).optional() }).parse(req.body);
-  if (!data.approved && !data.reason) return res.status(400).json({ error: 'A rejection reason is required' });
+  const data = z.object({ approved: z.boolean().optional(), action: z.enum(['approve', 'reject', 'request_more_information']).optional(), reason: z.string().trim().min(3).max(1000).optional() }).refine(value => value.approved !== undefined || value.action !== undefined, { message: 'A review action is required' }).parse(req.body);
+  const action = data.action ?? (data.approved ? 'approve' : 'reject');
+  if (action !== 'approve' && !data.reason) return res.status(400).json({ error: 'A reason is required for this review action' });
   const organizationId = req.auth!.organizationId!;
   const id = String(req.params.id);
   const reviewed = await prisma.verificationRequest.updateMany({
     where: { id, organizationId, status: { in: ['submitted', 'resubmission_required'] } },
-    data: { status: data.approved ? 'approved' : 'rejected', rejectionReason: data.approved ? null : data.reason, reviewedAt: new Date(), reviewedById: req.auth!.userId }
+    data: { status: action === 'approve' ? 'approved' : action === 'request_more_information' ? 'resubmission_required' : 'rejected', rejectionReason: action === 'approve' ? null : data.reason, reviewedAt: new Date(), reviewedById: req.auth!.userId }
   });
   if (reviewed.count === 0) return res.status(404).json({ error: 'Verification not found' });
   const verification = await prisma.verificationRequest.findUniqueOrThrow({ where: { id } });
-  await audit(organizationId, req.auth!.userId, data.approved ? 'verification.approved' : 'verification.rejected', 'VerificationRequest', verification.id, { reason: data.reason });
+  await audit(organizationId, req.auth!.userId, `verification.${action}`, 'VerificationRequest', verification.id, { reason: data.reason });
+  const candidate = await prisma.candidate.findUnique({ where: { id: verification.candidateId }, select: { userId: true } });
+  if (candidate?.userId) await notify(organizationId, candidate.userId, `verification_${action}`, action === 'approve' ? 'Identity verification approved' : action === 'request_more_information' ? 'More identity information is required' : 'Identity verification rejected', action === 'approve' ? 'Your identity verification was approved.' : `Your identity verification needs attention: ${data.reason}`);
   res.json(verification);
+} catch (error) { next(error); } });
+app.get('/api/organizations/:organizationId/verifications/:id/document/:kind', authenticate, authorize('institute_admin', 'proctor'), async (req: AuthRequest, res, next) => { try {
+  const kind = z.enum(['photo', 'idDocument']).parse(req.params.kind);
+  const verification = await prisma.verificationRequest.findFirst({ where: { id: String(req.params.id), organizationId: req.auth!.organizationId! }, select: { profilePhoto: true, idDocument: true } });
+  const key = kind === 'photo' ? verification?.profilePhoto : verification?.idDocument;
+  if (!key) return res.status(404).end();
+  const storage = req.app.get('storage') as StorageInterface;
+  if (!storage.getPrivateDocument) return res.status(404).end();
+  const bytes = await storage.getPrivateDocument(key);
+  if (!bytes) return res.status(404).end();
+  res.set({ 'Content-Type': kind === 'photo' ? 'image/jpeg' : 'application/octet-stream', 'Content-Length': String(bytes.length), 'Cache-Control': 'private, no-store', 'Content-Disposition': `inline; filename="${kind}"` });
+  return res.status(200).send(bytes);
 } catch (error) { next(error); } });
 app.post('/api/student/organizations/:organizationId/exams/:examId/start', authenticate, async (req: AuthRequest, res, next) => { try {
   const organizationId = String(req.params.organizationId);
@@ -806,6 +821,8 @@ app.post('/api/student/attempts/:attemptId/evidence', authenticate, upload.singl
   await storage.putPrivateDocument(key, req.file.buffer, req.file.mimetype);
   // Best effort: a failed bookkeeping write must not discard evidence that is already stored.
   await prisma.evidenceObject.create({ data: { organizationId: attempt.organizationId, attemptId: attempt.id, objectKey: key, sizeBytes: req.file.size, mimeType: req.file.mimetype } }).catch(error => console.error('Evidence size bookkeeping failed', error instanceof Error ? error.message : error));
+  const source = req.body?.source === 'screen' ? 'screen' : 'camera';
+  await audit(attempt.organizationId, req.auth!.userId, `evidence.${source}_captured`, 'ExamAttempt', attempt.id, { evidenceKey: key, capturedAt: new Date().toISOString() });
   res.status(201).json({ evidenceKey: key });
 } catch (error) { next(error); } });
 app.post('/api/student/attempts/:attemptId/ai-frame', authenticate, aiFrameLimiter, upload.single('frame'), validateFileContent, async (req: AuthRequest, res, next) => { try {

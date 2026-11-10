@@ -648,6 +648,8 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
   const [level, setLevel] = useState(0);
   const [acknowledged, setAcknowledged] = useState(false);
   const [practiceCompleted, setPracticeCompleted] = useState(false);
+  const [screen, setScreen] = useState("Not enabled");
+  const screenStream = useRef<MediaStream | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [companionStatus, setCompanionStatus] = useState("Checking local Windows Companion…");
   const [companionReady, setCompanionReady] = useState(false);
@@ -673,7 +675,12 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
     setLevel(0);
     setMicrophone("Not checked");
   };
-  useEffect(() => () => { stopMicrophone(); }, []);
+  const stopScreen = () => {
+    screenStream.current?.getTracks().forEach((track) => track.stop());
+    screenStream.current = null;
+    setScreen("Not enabled");
+  };
+  useEffect(() => () => { stopMicrophone(); stopScreen(); }, []);
   useEffect(() => { const update = () => setFullscreen(Boolean(document.fullscreenElement)); document.addEventListener("fullscreenchange", update); return () => document.removeEventListener("fullscreenchange", update); }, []);
   useEffect(() => {
     let active = true;
@@ -738,6 +745,19 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
         setLevel(Math.min(100, Math.round(average * 4)));
         meterFrame.current = requestAnimationFrame(updateLevel);
       };
+      const enableScreen = async () => {
+        if (!navigator.mediaDevices?.getDisplayMedia) return setScreen("Screen sharing is not supported by this browser.");
+        stopScreen();
+        try {
+          const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+          screenStream.current = stream;
+          (window as any).__examguardScreenStream = stream;
+          stream.getVideoTracks()[0]?.addEventListener("ended", () => { screenStream.current = null; delete (window as any).__examguardScreenStream; setScreen("Screen sharing stopped — enable it again before starting."); });
+          setScreen("Screen sharing ready");
+        } catch (e) {
+          setScreen(e instanceof DOMException && e.name === "NotAllowedError" ? "Screen sharing was not allowed." : "Screen sharing could not start.");
+        }
+      };
       updateLevel();
       setMicrophone("Microphone ready — audio is not recorded or sent.");
     } catch (e) {
@@ -751,12 +771,13 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
       <section className="rounded-xl border border-slate-200 p-4"><b>Camera</b><p className="mt-1 text-sm text-slate-500">{camera}</p><video ref={videoRef} autoPlay muted playsInline className="mt-3 aspect-video w-full rounded-lg bg-slate-100 object-cover" aria-label="Camera preview" /> <div className="mt-3 flex gap-2"><button type="button" onClick={checkCamera} className="button">Check camera</button><button type="button" onClick={stopCamera} className="text-sm font-semibold text-slate-700">Stop camera</button></div></section>
       <section className="rounded-xl border border-slate-200 p-4"><b>Microphone</b><p className="mt-1 text-sm text-slate-500">{microphone}</p><div className="mt-4 h-3 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-teal-600 transition-[width]" style={{ width: `${level}%` }} /></div><div className="mt-5 flex gap-2"><button type="button" onClick={checkMicrophone} className="button">Check microphone</button><button type="button" onClick={stopMicrophone} className="text-sm font-semibold text-slate-700">Stop test</button></div></section>
     </div>
-    <dl className="mt-5 grid gap-2 rounded-xl bg-slate-50 p-4 text-sm sm:grid-cols-2"><div><dt className="text-slate-500">Browser</dt><dd>{supported ? "Compatible" : "Limited device support"}</dd></div><div><dt className="text-slate-500">Network</dt><dd>{online ? "Connected" : "Offline — reconnect before starting"}</dd></div><div><dt className="text-slate-500">Instructions</dt><dd>{acknowledged ? "Acknowledged" : "Awaiting acknowledgement"}</dd></div><div><dt className="text-slate-500">Windows Companion — required</dt><dd className={companionReady ? "text-emerald-700" : "text-red-700"}>{companionStatus}</dd></div><div className="sm:col-span-2"><dt className="text-slate-500">Local AI service — required</dt><dd className={aiReady ? "text-emerald-700" : "text-red-700"}>{aiStatus}</dd></div></dl>
+    <dl className="mt-5 grid gap-2 rounded-xl bg-slate-50 p-4 text-sm sm:grid-cols-2"><div><dt className="text-slate-500">Browser</dt><dd>{supported ? "Compatible" : "Limited device support"}</dd></div><div><dt className="text-slate-500">Network</dt><dd>{online ? "Connected" : "Offline — reconnect before starting"}</dd></div><div><dt className="text-slate-500">Instructions</dt><dd>{acknowledged ? "Acknowledged" : "Awaiting acknowledgement"}</dd></div><div><dt className="text-slate-500">Screen sharing</dt><dd className={screen === "Screen sharing ready" ? "text-emerald-700" : "text-red-700"}>{screen}</dd></div><div><dt className="text-slate-500">Windows Companion — required</dt><dd className={companionReady ? "text-emerald-700" : "text-red-700"}>{companionStatus}</dd></div><div className="sm:col-span-2"><dt className="text-slate-500">Local AI service — required</dt><dd className={aiReady ? "text-emerald-700" : "text-red-700"}>{aiStatus}</dd></div></dl>
+    <button type="button" onClick={() => void enableScreen()} className="button mt-4">Enable screen sharing</button>
     <label className="mt-5 flex gap-2 text-sm"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /> I have read the instructions and understand the examination rules.</label>
     <label className="mt-4 flex items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm leading-6"><input type="checkbox" className="mt-1" checked={practiceCompleted} onChange={(event) => setPracticeCompleted(event.target.checked)} /><span><b>Practice check complete.</b> I have used the answer controls, checked my camera and microphone, and understand how to submit. This short readiness exercise does not submit exam answers.</span></label>
     <label className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-950"><input type="checkbox" className="mt-1" checked={monitoringConsent} onChange={(event) => setMonitoringConsent(event.target.checked)} /><span><b>Required monitoring consent.</b> I consent to camera-frame AI analysis and to capturing still images when a repeated review signal is recorded. I also consent to Bluetooth and Wi-Fi access-point observations by the required Windows Companion. Images are stored in ExamGuard’s private evidence storage for authorized review. This local prototype does not automatically purge image files; my institution must publish and apply its retention schedule. Automated signals are review aids, not proof of misconduct; audio is not recorded or uploaded.</span></label>
     {error && <p role="alert" className="mt-4 text-sm text-red-600">{error}</p>}
-    <button onClick={async () => { try { await document.documentElement.requestFullscreen?.(); } catch {} onStart(); }} disabled={!acknowledged || !practiceCompleted || !monitoringConsent || !online || !companionReady || !aiReady || camera !== "Camera ready" || !microphone.startsWith("Microphone ready")} className="button mt-6 disabled:cursor-not-allowed disabled:opacity-50">Start secure exam</button>
+    <button onClick={async () => { try { await document.documentElement.requestFullscreen?.(); } catch {} onStart(); }} disabled={!acknowledged || !practiceCompleted || !monitoringConsent || !online || !companionReady || !aiReady || camera !== "Camera ready" || !microphone.startsWith("Microphone ready") || screen !== "Screen sharing ready"} className="button mt-6 disabled:cursor-not-allowed disabled:opacity-50">Start secure exam</button>
   </div>;
 }
 function StudentExam({ session }: { session: Session }) {
@@ -805,6 +826,21 @@ function StudentExam({ session }: { session: Session }) {
     canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
     video.pause(); video.srcObject = null;
     return await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.72));
+  };
+  const captureScreenBlob = async () => {
+    const stream = (window as any).__examguardScreenStream as MediaStream | undefined;
+    if (!stream?.active) return null;
+    const video = document.createElement("video");
+    video.srcObject = stream; video.muted = true; video.playsInline = true;
+    await video.play();
+    const canvas = document.createElement("canvas");
+    const sourceWidth = video.videoWidth || 1280;
+    const scale = Math.min(1, 1600 / sourceWidth);
+    canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+    canvas.height = Math.max(1, Math.round((video.videoHeight || 900) * scale));
+    canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
+    video.pause(); video.srcObject = null;
+    return await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.65));
   };
   const captureEvidence = async () => {
     const blob = await captureFrameBlob();
@@ -964,6 +1000,9 @@ function StudentExam({ session }: { session: Session }) {
       const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
       stream?.getTracks().forEach((track) => track.stop());
       delete (window as any).__examguardCameraStream;
+      const screenStream = (window as any).__examguardScreenStream as MediaStream | undefined;
+      screenStream?.getTracks().forEach((track) => track.stop());
+      delete (window as any).__examguardScreenStream;
     } else if (outcome.kind === "blocked_unsaved") setError("Some answers couldn't be saved yet. Check your connection and try again. Nothing has been lost.");
     else if (outcome.kind === "error") setError(outcome.message);
   };
@@ -1025,6 +1064,27 @@ function StudentExam({ session }: { session: Session }) {
     };
     void analyzeFrame();
     const interval = window.setInterval(() => void analyzeFrame(), 6000);
+    return () => { stopped = true; window.clearInterval(interval); };
+  }, [payload?.attempt?.id, receipt]);
+  useEffect(() => {
+    const activeAttemptId = payload?.attempt?.id;
+    if (!activeAttemptId || receipt) return;
+    let stopped = false;
+    const capture = async () => {
+      if (stopped || document.visibilityState !== "visible") return;
+      try {
+        const blob = await captureScreenBlob();
+        if (!blob || stopped) return;
+        const form = new FormData();
+        form.append("file", blob, "screen-frame.jpg");
+        form.append("source", "screen");
+        await api.post(`/api/student/attempts/${activeAttemptId}/evidence`, form, { timeout: 16_000 });
+      } catch {
+        // Screen capture is a consented technical signal; the exam remains usable if storage is unavailable.
+      }
+    };
+    void capture();
+    const interval = window.setInterval(() => void capture(), 15_000);
     return () => { stopped = true; window.clearInterval(interval); };
   }, [payload?.attempt?.id, receipt]);
   useEffect(() => {
@@ -1524,7 +1584,7 @@ function Candidates({ session }: { session: Session }) {
     if (!verificationId) return false;
     setError("");
     try {
-      await api.post(`/api/organizations/${session.organization.id}/verifications/${verificationId}/review`, { approved, reason });
+      await api.post(`/api/organizations/${session.organization.id}/verifications/${verificationId}/review`, { action: approved ? "approve" : "reject", reason });
       setNotice(approved ? "Identity verification approved." : "Identity verification rejected with the supplied reason.");
       await refetchCandidateDetails();
       return true;
@@ -1631,14 +1691,14 @@ function Verification({ session }: { session: Session }) {
   const [reviewError, setReviewError] = useState("");
   const [reviewingId, setReviewingId] = useState("");
   const [rejectionTarget, setRejectionTarget] = useState<string | null>(null);
-  const review = async (id: string, approved: boolean, reason: string): Promise<boolean> => {
+  const review = async (id: string, action: "approve" | "reject" | "request_more_information", reason: string): Promise<boolean> => {
     if (!canReview) return false;
     setReviewError("");
     setReviewingId(id);
     try {
       await api.post(
         `/api/organizations/${session.organization.id}/verifications/${id}/review`,
-        { approved, reason },
+        { action, reason },
       );
       await refetch();
       return true;
@@ -1680,6 +1740,10 @@ function Verification({ session }: { session: Session }) {
                 </td>
                 <td>{v.status}</td>
                 <td className="space-x-2">
+                  {(v.profilePhoto || v.idDocument) && <span className="mr-2 inline-flex gap-2">
+                    {v.profilePhoto && <button type="button" className="text-blue-700 underline" onClick={async () => { const response = await api.get(`/api/organizations/${session.organization.id}/verifications/${v.id}/document/photo`, { responseType: "blob" }); const url = URL.createObjectURL(response.data); window.open(url, "_blank", "noopener,noreferrer"); }}>View selfie</button>}
+                    {v.idDocument && <button type="button" className="text-blue-700 underline" onClick={async () => { const response = await api.get(`/api/organizations/${session.organization.id}/verifications/${v.id}/document/idDocument`, { responseType: "blob" }); const url = URL.createObjectURL(response.data); window.open(url, "_blank", "noopener,noreferrer"); }}>View document</button>}
+                  </span>}
                   {canReview && ["submitted", "resubmission_required"].includes(
                     v.status,
                   ) && (
@@ -1687,7 +1751,7 @@ function Verification({ session }: { session: Session }) {
                       <button
                         type="button"
                         disabled={reviewingId === v.id}
-                        onClick={() => void review(v.id, true, "Approved after review")}
+                        onClick={() => void review(v.id, "approve", "Approved after review")}
                         className="text-emerald-700 disabled:opacity-50"
                       >
                         Approve
@@ -1700,6 +1764,7 @@ function Verification({ session }: { session: Session }) {
                       >
                         Reject
                       </button>
+                      <button type="button" disabled={reviewingId === v.id} onClick={() => void review(v.id, "request_more_information", "Please upload clearer or additional identity evidence.")} className="text-amber-700 disabled:opacity-50">Request more information</button>
                     </>
                   )}
                 </td>

@@ -19,11 +19,17 @@ namespace ExamGuard.DeviceMonitor;
 
 internal static class Program
 {
+    private static Mutex? singleInstance;
+
     [STAThread]
     static void Main()
     {
+        singleInstance = new Mutex(true, "ExamGuard.DeviceMonitor.SingleInstance", out var ownsMutex);
+        if (!ownsMutex)
+            return;
         ApplicationConfiguration.Initialize();
-        Application.Run(new MonitorForm());
+        try { Application.Run(new MonitorForm()); }
+        finally { singleInstance.ReleaseMutex(); singleInstance.Dispose(); }
     }
 }
 
@@ -105,6 +111,7 @@ internal sealed class MonitorForm : Form
 
     private const string BridgePrefix = "http://127.0.0.1:43117/";
     private readonly HttpListener bridge = new();
+    private readonly NotifyIcon trayIcon;
     private readonly CancellationTokenSource bridgeCancellation = new();
     private Task? bridgeTask;
     private System.Threading.Timer? heartbeatTimer;
@@ -116,6 +123,16 @@ internal sealed class MonitorForm : Form
         Height = 620;
         MinimumSize = new Size(600, 500);
         StartPosition = FormStartPosition.CenterScreen;
+        trayIcon = new NotifyIcon
+        {
+            Icon = SystemIcons.Application,
+            Text = "ExamGuard Companion",
+            Visible = true,
+            ContextMenuStrip = new ContextMenuStrip()
+        };
+        trayIcon.ContextMenuStrip.Items.Add("Show monitor", null, (_, _) => RestoreFromTray());
+        trayIcon.ContextMenuStrip.Items.Add("Exit", null, async (_, _) => await CloseFromTrayAsync());
+        trayIcon.DoubleClick += (_, _) => RestoreFromTray();
 
         var fields = new TableLayoutPanel
         {
@@ -234,6 +251,27 @@ internal sealed class MonitorForm : Form
                 Close();
             }
         };
+        Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) HideToTray(); };
+    }
+
+    private void HideToTray()
+    {
+        Hide();
+        trayIcon.ShowBalloonTip(1500, "ExamGuard Companion", scanning ? "Monitoring is active." : "Companion is ready for an authorized exam.", ToolTipIcon.Info);
+    }
+
+    private void RestoreFromTray()
+    {
+        Show();
+        WindowState = FormWindowState.Normal;
+        Activate();
+    }
+
+    private async Task CloseFromTrayAsync()
+    {
+        if (scanning) await StopAsync();
+        closing = true;
+        Close();
     }
 
     private async Task<bool> StartAsync()
@@ -905,6 +943,8 @@ internal sealed class MonitorForm : Form
             if (bluetooth.Status == BluetoothLEAdvertisementWatcherStatus.Started)
                 bluetooth.Stop();
             http.Dispose();
+            trayIcon.Visible = false;
+            trayIcon.Dispose();
             bridgeCancellation.Dispose();
         }
 
@@ -925,5 +965,4 @@ internal sealed class PairingContext
     public string CandidateId { get; set; } = "";
     public string AttemptId { get; set; } = "";
 }
-
 
