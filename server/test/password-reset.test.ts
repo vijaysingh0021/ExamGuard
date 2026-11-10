@@ -1,0 +1,6 @@
+import test from 'node:test'; import assert from 'node:assert/strict';
+import { createOtp, createResetToken, hashResetToken, otpConfig, passwordPolicy } from '../src/password-reset.js';
+test('password reset tokens are high-entropy, hashable, and never need persistence in plaintext', () => { const token = createResetToken(); assert.ok(token.length >= 40); assert.equal(hashResetToken(token), hashResetToken(token)); assert.notEqual(hashResetToken(token), token); });
+test('password reset policy rejects weak passwords and accepts a compliant password', () => { assert.equal(passwordPolicy('short'), false); assert.equal(passwordPolicy('alllowercase123'), false); assert.equal(passwordPolicy('NoNumbersHere'), false); assert.equal(passwordPolicy('ExamGuard2026'), true); });
+test('password reset OTPs are six digits and never stored in plaintext', () => { const otp = createOtp(); assert.match(otp, /^\d{6}$/); assert.notEqual(hashResetToken(otp), otp); });
+test('password reset OTP controls are configurable with safe minimums', () => { const previous = { ...process.env }; Object.assign(process.env, { PASSWORD_RESET_OTP_TTL_MINUTES: '10', PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS: '60', PASSWORD_RESET_OTP_MAX_ATTEMPTS: '5' }); const config = otpConfig(); assert.deepEqual(config, { ttlMs: 600_000, resendCooldownMs: 60_000, maxAttempts: 5 }); process.env = previous; });
