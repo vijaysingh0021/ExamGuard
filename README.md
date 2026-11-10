@@ -65,3 +65,10 @@ npm ci; npm run typecheck; npm test; npm test -w client; npm run build
 node server/scripts/check-imports.mjs; node server/scripts/check-api-contract.mjs; node server/scripts/check-migrations.mjs
 ```
 Background jobs stay off (`BACKGROUND_JOBS_ENABLED=false`) until the migrations are applied to an isolated development database.
+
+If port `4000` is already in use, run the API on another port and point Vite at it:
+```powershell
+$env:PORT="4001"
+$env:VITE_API_PROXY_TARGET="http://localhost:4001"
+npm run dev
+```

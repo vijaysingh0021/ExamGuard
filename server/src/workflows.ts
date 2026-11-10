@@ -10,7 +10,7 @@ import { fanoutNotificationEmails, sendQueuedEmails, type EmailDeps, type Outbox
 type Delegate = Record<string, (args?: any) => Promise<any>>;
 export interface WorkflowDb {
   examAttempt: Delegate; exam: Delegate; examAssignment: Delegate; notification: Delegate; auditLog: Delegate;
-  membership: Delegate; incident: Delegate; proctoringEvent: Delegate; backgroundJob: Delegate; emailOutbox?: Delegate; emailPreference?: Delegate;
+  membership: Delegate; incident: Delegate; studentExplanation: Delegate; proctoringEvent: Delegate; backgroundJob: Delegate; emailOutbox?: Delegate; emailPreference?: Delegate;
   $transaction<T>(fn: (tx: WorkflowDb) => Promise<T>): Promise<T>;
   $queryRaw(strings: TemplateStringsArray, ...values: unknown[]): Promise<any[]>;
 }
@@ -103,7 +103,31 @@ export async function remindStaleIncidents({ db, now = () => new Date() }: Workf
       summary.organizations++;
     } catch { summary.failed++; }
   }
+
   return finish('remindStaleIncidents', summary);
+}
+
+/** Remind students about open explanation requests without exposing incident details in the notification. */
+export async function sendExplanationDeadlineReminders({ db, now = () => new Date() }: WorkflowDeps) {
+  const at = now();
+  const summary = { notified: 0, failed: 0 };
+  const requests: Array<{ id: string; organizationId: string; deadlineAt: Date; candidate: { userId: string | null } }> = await db.studentExplanation.findMany({
+    where: { status: { in: ['requested', 'follow_up'] }, deadlineAt: { gt: at, lte: new Date(at.getTime() + DAY) }, candidate: { userId: { not: null } } },
+    select: { id: true, organizationId: true, deadlineAt: true, candidate: { select: { userId: true } } },
+    take: BATCH,
+  });
+  for (const request of requests) {
+    try {
+      const hours = Math.max(1, Math.ceil((request.deadlineAt.getTime() - at.getTime()) / HOUR));
+      const window = hours <= 1 ? '1h' : '24h';
+      const dedupeKey = `explanation_deadline:${request.id}:${window}`;
+      const existing = await db.notification.findFirst({ where: { organizationId: request.organizationId, userId: request.candidate.userId, type: 'explanation_deadline', metadata: { path: ['dedupeKey'], equals: dedupeKey } }, select: { id: true } });
+      if (existing || !request.candidate.userId) continue;
+      await db.notification.create({ data: { organizationId: request.organizationId, userId: request.candidate.userId, type: 'explanation_deadline', title: 'Explanation response deadline approaching', body: hours <= 1 ? 'Your explanation response is due within the hour.' : 'Your explanation response is due within 24 hours.', delivery: 'email_unconfigured', metadata: { dedupeKey, explanationId: request.id, deadlineAt: request.deadlineAt } } });
+      summary.notified++;
+    } catch { summary.failed++; }
+  }
+  return finish('sendExplanationDeadlineReminders', summary);
 }
 
 /**
@@ -138,6 +162,7 @@ export const SWEEPS = {
   'sweep.exam_lifecycle': { everyMs: 60_000, run: advanceExamLifecycle },
   'sweep.exam_reminders': { everyMs: 5 * 60_000, run: sendExamReminders },
   'sweep.review_reminders': { everyMs: 6 * HOUR, run: remindStaleIncidents },
+  'sweep.explanation_deadlines': { everyMs: 60 * 60_000, run: sendExplanationDeadlineReminders },
   'sweep.email_fanout': { everyMs: 60_000, run: (d: WorkflowDeps) => fanoutNotificationEmails(emailDeps(d)) },
   'sweep.email_send': { everyMs: 60_000, run: (d: WorkflowDeps) => sendQueuedEmails(emailDeps(d)) },
   'sweep.retention': { everyMs: DAY, run: runRetention },

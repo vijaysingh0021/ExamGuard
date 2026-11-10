@@ -108,7 +108,7 @@ const questionFields = (data: z.infer<typeof questionInput>, clearMissing = fals
 });
 const orgConfig = (organizationId: string) => prisma.proctoringConfig.upsert({ where: { organizationId }, update: {}, create: { organizationId } });
 const shuffle = <T>(items: T[]) => { const copy = [...items]; for (let i = copy.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [copy[i], copy[j]] = [copy[j], copy[i]]; } return copy; };
-const proctorEventInput = z.object({ examId: z.string().uuid(), candidateId: z.string().uuid(), sessionId: z.string().uuid().optional(), attemptId: z.string().uuid(), type: z.enum(['face_missing', 'multiple_faces', 'looking_away', 'phone_detected', 'visibility_hidden', 'fullscreen_exit', 'network_interruption', 'camera_permission_lost']), occurredAt: z.string().datetime(), source: z.literal('browser'), details: z.record(z.unknown()).optional(), evidenceKey: z.string().max(512).optional() });
+const proctorEventInput = z.object({ examId: z.string().uuid(), candidateId: z.string().uuid(), sessionId: z.string().uuid().optional(), attemptId: z.string().uuid(), type: z.enum(['face_missing', 'multiple_faces', 'looking_away', 'phone_detected', 'visibility_hidden', 'fullscreen_exit', 'window_blur', 'focus_regain', 'multiple_window_hint', 'network_interruption', 'camera_permission_lost']), occurredAt: z.string().datetime(), source: z.literal('browser'), details: z.record(z.unknown()).optional(), evidenceKey: z.string().max(512).optional() });
 const radioObservationInput = z.object({ organizationId: z.string().uuid(), examId: z.string().uuid(), candidateId: z.string().uuid(), attemptId: z.string().uuid(), source: z.enum(['bluetooth_le', 'wifi', 'scanner_health']), kind: z.enum(['advertisement', 'access_point', 'heartbeat', 'scan_unavailable', 'permission_denied', 'scan_error', 'scan_stopped']), rssi: z.number().int().min(-127).max(0).optional(), pseudonym: z.string().min(16).max(128).optional(), scannerStatus: z.enum(['active', 'unavailable', 'permission_denied', 'stopped', 'error']), errorCode: z.string().max(120).optional() }).superRefine((data, ctx) => { if (data.kind === 'advertisement' || data.kind === 'access_point') { if (!data.pseudonym) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'A session-scoped pseudonym is required for a radio observation' }); if (data.scannerStatus !== 'active') ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Radio observations require an active scanner status' }); } });
 
 const aiFrameSchema = z.object({
@@ -1364,6 +1364,21 @@ app.post('/api/student/explanation-requests/:requestId/response', authenticate, 
   await audit(request.incident.organizationId, req.auth!.userId, 'incident.explanation_submitted', 'StudentExplanation', request.id);
   if (request.requestedBy?.id) await notifyOnce(request.incident.organizationId, request.requestedBy.id, 'explanation_response_received', 'Student response received', 'A student submitted an explanation for an incident you requested.', { explanationId: request.id });
   res.json(await prisma.studentExplanation.findUniqueOrThrow({ where: { id: request.id } }));
+} catch (error) { next(error); } });
+
+app.get('/api/student/explanation-requests/:requestId/attachment', authenticate, async (req: AuthRequest, res, next) => { try {
+  const request = await prisma.studentExplanation.findUnique({
+    where: { id: String(req.params.requestId) },
+    select: { evidenceKey: true, organizationId: true, candidate: { select: { userId: true } } },
+  });
+  if (!request || request.candidate.userId !== req.auth!.userId || request.organizationId !== req.auth!.organizationId) return res.status(404).end();
+  if (!request.evidenceKey) return res.status(404).end();
+  const storage = req.app.get('storage') as StorageInterface;
+  if (!storage.getPrivateDocument) return res.status(404).end();
+  const bytes = await storage.getPrivateDocument(request.evidenceKey);
+  if (!bytes) return res.status(404).end();
+  res.set({ 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length), 'Cache-Control': 'private, no-store', 'Content-Disposition': 'attachment; filename="explanation-attachment"' });
+  return res.status(200).send(bytes);
 } catch (error) { next(error); } });
 
 app.post('/api/student/incidents/:incidentId/explanation', authenticate, async (req: AuthRequest, res, next) => { try {
