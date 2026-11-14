@@ -2,6 +2,9 @@
 
 import os
 import hmac
+import logging
+import sys
+import time
 
 import cv2
 import mediapipe as mp
@@ -15,6 +18,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 
 app = FastAPI(title="ExamGuard AI service")
+logger = logging.getLogger("examguard.ai")
 
 
 def require_service_auth(authorization: str | None = Header(default=None)):
@@ -31,47 +35,219 @@ def require_service_auth(authorization: str | None = Header(default=None)):
 MODEL_PATH = os.getenv("YOLO_MODEL_PATH")
 
 # Head-pose thresholds in degrees. These are initial configurable values.
-YAW_THRESHOLD = float(os.getenv("HEAD_YAW_THRESHOLD", "25"))
-PITCH_THRESHOLD = float(os.getenv("HEAD_PITCH_THRESHOLD", "20"))
+YAW_THRESHOLD = float(os.getenv("HEAD_YAW_THRESHOLD", "30"))
+PITCH_THRESHOLD = float(os.getenv("HEAD_PITCH_THRESHOLD", "25"))
+HEAD_POSE_MARGIN = float(os.getenv("HEAD_POSE_MARGIN", "5"))
+PHONE_CONFIDENCE_THRESHOLD = float(os.getenv("PHONE_CONFIDENCE_THRESHOLD", "0.35"))
+FACE_CONFIDENCE_THRESHOLD = float(os.getenv("FACE_CONFIDENCE_THRESHOLD", "0.5"))
+
+MODEL_LOAD_ERROR = None
+MODEL_CLASSES = {}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+
+def class_names_by_id(names):
+    if isinstance(names, dict):
+        return {int(class_id): str(name) for class_id, name in names.items()}
+    if isinstance(names, (list, tuple)):
+        return {class_id: str(name) for class_id, name in enumerate(names)}
+    return {}
+
+
+def device_kind_for_class(class_name):
+    normalized = " ".join(class_name.lower().replace("_", " ").replace("-", " ").split())
+    if normalized in {
+        "phone",
+        "cell phone",
+        "cellphone",
+        "mobile",
+        "mobile phone",
+        "smartphone",
+        "smart phone",
+        "cellular phone",
+        "cellular telephone",
+        "telephone",
+    }:
+        return "phone"
+    if "tablet" in normalized:
+        return "tablet"
+    if "laptop" in normalized or "notebook computer" in normalized:
+        return "laptop"
+    if any(label in normalized for label in ("monitor", "television", "tv", "display", "screen")):
+        return "screen"
+    return None
+
+
+def phone_class_ids(names):
+    return {
+        class_id
+        for class_id, name in class_names_by_id(names).items()
+        if device_kind_for_class(name) == "phone"
+    }
+
+
+def image_signature_matches(content, content_type):
+    signatures = {
+        "image/jpeg": content.startswith(b"\xff\xd8\xff"),
+        "image/png": content.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/webp": (
+            len(content) >= 12
+            and content.startswith(b"RIFF")
+            and content[8:12] == b"WEBP"
+        ),
+    }
+    if content_type:
+        return content_type in signatures and signatures[content_type]
+    return any(signatures.values())
+
+
+def face_box_from_detection(detection, frame_width, frame_height, region_width, region_height, offset_x=0, offset_y=0):
+    relative = detection.location_data.relative_bounding_box
+    x1 = min(1.0, max(0.0, (offset_x + float(relative.xmin) * region_width) / frame_width))
+    y1 = min(1.0, max(0.0, (offset_y + float(relative.ymin) * region_height) / frame_height))
+    x2 = min(1.0, max(x1, (offset_x + float(relative.xmin + relative.width) * region_width) / frame_width))
+    y2 = min(1.0, max(y1, (offset_y + float(relative.ymin + relative.height) * region_height) / frame_height))
+    return {
+        "x": x1,
+        "y": y1,
+        "width": x2 - x1,
+        "height": y2 - y1,
+        "confidence": float(detection.score[0]) if detection.score else None,
+    }
+
+
+def face_box_iou(first, second):
+    x1 = max(first["x"], second["x"])
+    y1 = max(first["y"], second["y"])
+    x2 = min(first["x"] + first["width"], second["x"] + second["width"])
+    y2 = min(first["y"] + first["height"], second["y"] + second["height"])
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    union = first["width"] * first["height"] + second["width"] * second["height"] - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def merge_face_boxes(face_boxes, overlap_threshold=0.35):
+    merged = []
+    for box in sorted(face_boxes, key=lambda item: item["confidence"] or 0.0, reverse=True):
+        if all(face_box_iou(box, kept) <= overlap_threshold for kept in merged):
+            merged.append(box)
+    return merged
+
+
+def face_detection_regions(width, height):
+    grid_size = 3
+    overlap = 0.1
+    tile_width = min(width, int(np.ceil(width / (grid_size - (grid_size - 1) * overlap))))
+    tile_height = min(height, int(np.ceil(height / (grid_size - (grid_size - 1) * overlap))))
+    if tile_width < 32 or tile_height < 32:
+        return []
+
+    x_offsets = [round(index * (width - tile_width) / (grid_size - 1)) for index in range(grid_size)]
+    y_offsets = [round(index * (height - tile_height) / (grid_size - 1)) for index in range(grid_size)]
+    return [
+        (x, y, tile_width, tile_height)
+        for y in y_offsets
+        for x in x_offsets
+    ]
+
+
+def detect_face_boxes(image, detector, frame_width=None, frame_height=None, offset_x=0, offset_y=0):
+    height, width = image.shape[:2]
+    frame_width = frame_width or width
+    frame_height = frame_height or height
+    result = detector.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    return [
+        face_box_from_detection(
+            detection,
+            frame_width,
+            frame_height,
+            width,
+            height,
+            offset_x,
+            offset_y,
+        )
+        for detection in (result.detections or [])
+    ]
+
+
+def detect_face_boxes_with_tiles(image, detector):
+    height, width = image.shape[:2]
+    face_boxes = detect_face_boxes(image, detector)
+    if len(face_boxes) < 2:
+        return face_boxes
+
+    for x, y, tile_width, tile_height in face_detection_regions(width, height):
+        tile = image[y:y + tile_height, x:x + tile_width]
+        face_boxes.extend(
+            detect_face_boxes(tile, detector, width, height, x, y)
+        )
+    return merge_face_boxes(face_boxes)
+
 
 try:
     from ultralytics import YOLO
     yolo = YOLO(MODEL_PATH) if MODEL_PATH and os.path.isfile(MODEL_PATH) else None
-except Exception:
+    if yolo is not None:
+        MODEL_CLASSES = class_names_by_id(yolo.names)
+except Exception as exc:
     yolo = None
+    MODEL_LOAD_ERROR = type(exc).__name__
+    logger.error("YOLO model could not be loaded (%s)", MODEL_LOAD_ERROR)
+
+logger.info(
+    "AI service startup python=%s mediapipe=ready opencv=%s numpy=%s "
+    "phone_model=%s model_path_available=%s model_classes=%d cuda=unmanaged",
+    sys.version.split()[0],
+    cv2.__version__,
+    np.__version__,
+    "ready" if yolo is not None else "unavailable",
+    bool(MODEL_PATH and os.path.isfile(MODEL_PATH)),
+    len(MODEL_CLASSES),
+)
 
 
 @app.get("/health")
 def health():
+    supported_phone_classes = phone_class_ids(MODEL_CLASSES)
     return {
+        "python_version": sys.version.split()[0],
+        "dependencies": {
+            "opencv": cv2.__version__,
+            "mediapipe": getattr(mp, "__version__", "unknown"),
+            "numpy": np.__version__,
+            "fastapi": "ready"
+        },
         "mediapipe": "ready",
-        "phone_model": "ready" if yolo is not None else "unavailable",
+        "phone_model": "ready" if yolo is not None and supported_phone_classes else "unavailable",
+        "model_path_available": bool(MODEL_PATH and os.path.isfile(MODEL_PATH)),
+        "model_load_error": MODEL_LOAD_ERROR,
+        "phone_classes": [MODEL_CLASSES[class_id] for class_id in sorted(supported_phone_classes)],
+        "visible_device_classes": sorted({kind for name in MODEL_CLASSES.values() if (kind := device_kind_for_class(str(name))) is not None}),
         "looking_away": "ready",
         "multiple_faces": "ready",
         "head_pose_thresholds": {
             "yaw_degrees": YAW_THRESHOLD,
-            "pitch_degrees": PITCH_THRESHOLD
+            "pitch_degrees": PITCH_THRESHOLD,
+            "margin_degrees": HEAD_POSE_MARGIN
+        },
+        "confidence_thresholds": {
+            "phone": PHONE_CONFIDENCE_THRESHOLD,
+            "face": FACE_CONFIDENCE_THRESHOLD
         },
         "note": "Head orientation is an approximate review signal, not proof of misconduct."
     }
 
 
-def estimate_head_pose(image, face_mesh):
-    """Estimate head orientation from one face using six facial landmarks."""
+@app.get("/health/ready", dependencies=[Depends(require_service_auth)])
+def authenticated_health():
+    """Backend-only readiness probe; proves both processes share the bearer token."""
+    return health()
 
+
+def head_pose_from_landmarks(image, landmarks):
     height, width = image.shape[:2]
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    result = face_mesh.process(rgb)
-
-    if not result.multi_face_landmarks:
-        return None
-
-    # Do not estimate head pose when multiple faces make the candidate ambiguous.
-    if len(result.multi_face_landmarks) != 1:
-        return None
-
-    landmarks = result.multi_face_landmarks[0].landmark
-
     # Nose, chin, left/right eye corners, left/right mouth corners.
     landmark_ids = [1, 152, 33, 263, 61, 291]
 
@@ -122,7 +298,7 @@ def estimate_head_pose(image, face_mesh):
     rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
     angles = cv2.RQDecomp3x3(rotation_matrix)[0]
 
-    pitch = float(angles[0])
+    pitch = normalize_pitch_degrees(float(angles[0]))
     yaw = float(angles[1])
     roll = float(angles[2])
 
@@ -133,113 +309,298 @@ def estimate_head_pose(image, face_mesh):
     }
 
 
+def estimate_head_pose(image, face_mesh):
+    """Estimate head orientation only when one face is unambiguous in the frame."""
+    result = face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    if not result.multi_face_landmarks or len(result.multi_face_landmarks) != 1:
+        return None
+    return head_pose_from_landmarks(image, result.multi_face_landmarks[0].landmark)
+
+
+def estimate_head_pose_for_face(image, face_box, face_mesh):
+    frame_height, frame_width = image.shape[:2]
+    center_x = face_box["x"] + face_box["width"] / 2
+    center_y = face_box["y"] + face_box["height"] / 2
+    left = max(0, int((face_box["x"] - face_box["width"] * 0.1) * frame_width))
+    top = max(0, int((face_box["y"] - face_box["height"] * 0.1) * frame_height))
+    right = min(frame_width, int((face_box["x"] + face_box["width"] * 1.1) * frame_width))
+    bottom = min(frame_height, int((face_box["y"] + face_box["height"] * 1.1) * frame_height))
+    crop = image[top:bottom, left:right]
+    if crop.size == 0:
+        return None
+
+    result = face_mesh.process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+    faces = result.multi_face_landmarks or []
+    if len(faces) != 1:
+        return None
+
+    landmarks = faces[0].landmark
+    mesh_center_x = sum(landmark.x for landmark in landmarks) / len(landmarks)
+    mesh_center_y = sum(landmark.y for landmark in landmarks) / len(landmarks)
+    matched_center_x = (left + mesh_center_x * crop.shape[1]) / frame_width
+    matched_center_y = (top + mesh_center_y * crop.shape[0]) / frame_height
+    if (
+        abs(matched_center_x - center_x) > face_box["width"] * 0.35
+        or abs(matched_center_y - center_y) > face_box["height"] * 0.35
+    ):
+        return None
+
+    return head_pose_from_landmarks(crop, landmarks)
+
+
+def normalize_pitch_degrees(pitch: float) -> float:
+    # PnP can express an upright face using an equivalent rotation near 180°.
+    if pitch < -90:
+        pitch = -180 - pitch
+    elif pitch > 90:
+        pitch = 180 - pitch
+    return pitch
+
+
+def assess_visual_readability(visible_devices, face_count, face_boxes, head_pose, image_shape, camera_health):
+    height, width = image_shape[:2]
+    face = face_boxes[0] if face_count == 1 and face_boxes else None
+    assessments = []
+
+    for device in visible_devices:
+        x1, y1, x2, y2 = device["box"]
+        box_width = max(0.0, x2 - x1)
+        box_height = max(0.0, y2 - y1)
+        screen_center_x = (x1 + x2) / 2
+        face_center_x = ((face["x"] + face["width"] / 2) * width) if face else None
+        bearing = ((screen_center_x - face_center_x) / width) * 60 if face else None
+        text_height = round(box_height * 0.02, 1)
+        apparent_height = box_height / max(height, 1)
+        distance_band = "near" if apparent_height >= 0.3 else "medium" if apparent_height >= 0.15 else "far"
+        visible = camera_health == "ok" and device["confidence"] >= PHONE_CONFIDENCE_THRESHOLD and box_width >= 100 and box_height >= 70
+        roughly_in_view = bearing is not None and abs(bearing) <= 25 and abs(head_pose["yaw_degrees"]) <= YAW_THRESHOLD if head_pose else False
+        potentially_readable = visible and text_height >= 8 and roughly_in_view
+        assessments.append({
+            "kind": device["kind"],
+            "label": device["label"],
+            "confidence": device["confidence"],
+            "box": device["box"],
+            "visible": visible,
+            "estimated_distance_band": distance_band,
+            "screen_bearing_from_face_degrees": round(bearing, 1) if bearing is not None else None,
+            "view_alignment": "roughly_aligned" if roughly_in_view else "unavailable" if face is None or head_pose is None else "not_indicated",
+            "estimated_text_height_px": text_height,
+            "potentially_readable": potentially_readable,
+        })
+
+    return {
+        "status": "potentially_readable" if any(item["potentially_readable"] for item in assessments) else "not_indicated",
+        "confidence": "low",
+        "basis": "YOLO object confidence, apparent screen pixel size, and rough face-relative camera bearing; no OCR or physical distance measurement.",
+        "devices": assessments,
+        "limitations": "This is an approximate visual review signal, not proof that text was present, readable, or used. Screen viewing angle and physical distance cannot be measured reliably from this single uncalibrated frame.",
+    }
+
+
+def classify_looking_away(head_pose):
+    if head_pose is None:
+        return "unavailable"
+    turned_sideways = abs(head_pose["yaw_degrees"]) > YAW_THRESHOLD + HEAD_POSE_MARGIN
+    tilted_up_or_down = abs(head_pose["pitch_degrees"]) > PITCH_THRESHOLD + HEAD_POSE_MARGIN
+    return "looking_away" if turned_sideways or tilted_up_or_down else "looking_forward"
+
+
 @app.post("/analyze", dependencies=[Depends(require_service_auth)])
 async def analyze(frame: UploadFile):
-    if frame.content_type and not frame.content_type.startswith("image/"):
+    started_at = time.perf_counter()
+    if frame.content_type and frame.content_type not in SUPPORTED_IMAGE_TYPES:
         raise HTTPException(415, "Upload an image file")
 
-    content = await frame.read()
+    content = await frame.read(MAX_IMAGE_BYTES + 1)
 
     if not content:
         raise HTTPException(400, "Uploaded image is empty")
 
-    if len(content) > 5 * 1024 * 1024:
+    if len(content) > MAX_IMAGE_BYTES:
         raise HTTPException(413, "Image exceeds the 5 MB limit")
 
-    image = cv2.imdecode(
-        np.frombuffer(content, dtype=np.uint8),
-        cv2.IMREAD_COLOR
-    )
+    if not image_signature_matches(content, frame.content_type):
+        raise HTTPException(415, "Image content does not match a supported JPEG, PNG, or WebP format")
 
-    if image is None:
+    try:
+        image = cv2.imdecode(
+            np.frombuffer(content, dtype=np.uint8),
+            cv2.IMREAD_COLOR
+        )
+    except cv2.error as exc:
+        logger.info("Rejected an image that OpenCV could not decode (%s)", type(exc).__name__)
+        image = None
+
+    if image is None or image.ndim != 3 or image.shape[2] != 3:
         raise HTTPException(400, "Invalid image")
+    height, width = image.shape[:2]
+    if height < 32 or width < 32 or height * width > MAX_IMAGE_PIXELS:
+        raise HTTPException(422, "Image dimensions must be at least 32x32 and no larger than 40 megapixels")
 
     # Detect and count faces.
-    with mp.solutions.face_detection.FaceDetection(
-        model_selection=0,
-        min_detection_confidence=0.5
-    ) as detector:
-        face_result = detector.process(
-            cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        )
+    try:
+        with mp.solutions.face_detection.FaceDetection(
+            model_selection=1,
+            min_detection_confidence=FACE_CONFIDENCE_THRESHOLD
+        ) as detector:
+            face_boxes = detect_face_boxes_with_tiles(image, detector)
+    except Exception as exc:
+        logger.error("Face-detection inference failed (%s)", type(exc).__name__)
+        raise HTTPException(503, "Face-detection inference is unavailable") from exc
 
-    face_count = len(face_result.detections or [])
+    face_count = len(face_boxes)
     multiple_faces = face_count > 1
+    face_boxes = [
+        {
+            **box,
+            "x": round(box["x"], 4),
+            "y": round(box["y"], 4),
+            "width": round(box["width"], 4),
+            "height": round(box["height"], 4),
+            "confidence": round(box["confidence"], 3) if box["confidence"] is not None else None,
+        }
+        for box in face_boxes
+    ]
 
-    # Estimate head pose only when exactly one face is present.
+    # Keep the aggregate signal unavailable for multiple people; per-box poses
+    # are diagnostic only and are not attributed to the candidate.
     head_pose = None
     looking_away = "unavailable"
+    face_pose_estimates = []
+    if face_count:
+        try:
+            with mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True,
+                max_num_faces=1,
+                refine_landmarks=False,
+                min_detection_confidence=0.5
+            ) as face_mesh:
+                for index, face_box in enumerate(face_boxes):
+                    try:
+                        pose = (
+                            estimate_head_pose(image, face_mesh)
+                            if face_count == 1
+                            else estimate_head_pose_for_face(image, face_box, face_mesh)
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Head-pose inference unavailable for detected face %d (%s)",
+                            index + 1,
+                            type(exc).__name__,
+                        )
+                        pose = None
+                    face_pose_estimates.append({
+                        "face_box": face_box,
+                        "head_pose": pose,
+                        "looking_away": classify_looking_away(pose),
+                    })
+                    if face_count == 1:
+                        head_pose = pose
+        except Exception as exc:
+            logger.warning("Head-pose inference unavailable (%s)", type(exc).__name__)
 
-    if face_count == 1:
-        with mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=2,
-            refine_landmarks=False,
-            min_detection_confidence=0.5
-        ) as face_mesh:
-            head_pose = estimate_head_pose(image, face_mesh)
-
-        if head_pose is not None:
-            turned_sideways = abs(head_pose["yaw_degrees"]) > YAW_THRESHOLD
-            tilted_up_or_down = abs(head_pose["pitch_degrees"]) > PITCH_THRESHOLD
-
-            looking_away = (
-                "looking_away"
-                if turned_sideways or tilted_up_or_down
-                else "looking_forward"
-            )
+        if face_count == 1:
+            looking_away = classify_looking_away(head_pose)
 
     # Run YOLO phone detection if a compatible model is configured.
     phone_detection = "unavailable"
     phone_confidence = None
+    phone_boxes = []
+    visible_devices = []
+    phone_model_ready = False
 
     if yolo is not None:
         try:
             predictions = yolo.predict(
                 source=image,
-                conf=0.35,
+                conf=PHONE_CONFIDENCE_THRESHOLD,
                 verbose=False
             )
         except Exception as exc:
+            logger.error("Phone-detection inference failed (%s)", type(exc).__name__)
             raise HTTPException(
                 503,
                 "Phone-detection model inference is unavailable"
             ) from exc
 
+        if not predictions:
+            logger.error("Phone-detection model returned no prediction result")
+            raise HTTPException(503, "Phone-detection model returned no result")
+
         names = predictions[0].names
+        names_by_id = class_names_by_id(names)
         boxes = predictions[0].boxes
+        supported_phone_classes = phone_class_ids(names_by_id)
+        phone_model_ready = bool(supported_phone_classes)
         phone_scores = []
 
-        if boxes is not None:
+        if supported_phone_classes and boxes is not None:
             for box in boxes:
                 class_id = int(box.cls.item())
-                class_name = str(names[class_id]).lower().replace("_", " ")
+                class_name = names_by_id.get(class_id)
+                if class_name is None:
+                    continue
+                device_kind = device_kind_for_class(class_name)
 
-                if any(label in class_name for label in (
-                    "cell phone",
-                    "cellphone",
-                    "mobile phone",
-                    "mobile",
-                    "smartphone",
-                    "smart phone"
-                )):
-                    phone_scores.append(float(box.conf.item()))
+                confidence = float(box.conf.item())
+                coordinates = box.xyxy[0].tolist()
+                if device_kind and confidence >= PHONE_CONFIDENCE_THRESHOLD:
+                    if len(visible_devices) < 30:
+                        visible_devices.append({
+                            "kind": device_kind,
+                            "label": class_name,
+                            "confidence": round(confidence, 3),
+                            "box": [round(float(value), 2) for value in coordinates],
+                        })
+                if class_id in supported_phone_classes and confidence >= PHONE_CONFIDENCE_THRESHOLD:
+                    phone_scores.append(confidence)
+                    phone_boxes.append({
+                        "x1": round(float(coordinates[0]), 2),
+                        "y1": round(float(coordinates[1]), 2),
+                        "x2": round(float(coordinates[2]), 2),
+                        "y2": round(float(coordinates[3]), 2),
+                        "confidence": round(confidence, 3),
+                        "label": class_name
+                    })
 
-        phone_detection = "detected" if phone_scores else "not_detected"
+        if supported_phone_classes:
+            phone_detection = "detected" if phone_scores else "not_detected"
+            if phone_scores:
+                phone_confidence = round(max(phone_scores), 3)
 
-        if phone_scores:
-            phone_confidence = round(max(phone_scores), 3)
-
+    frame_mean = float(np.mean(image))
+    frame_stddev = float(np.std(image))
+    obstruction = frame_stddev < 8 or frame_mean < 8
+    camera_health = "obstructed" if obstruction else "ok"
+    readability = assess_visual_readability(
+        visible_devices,
+        face_count,
+        face_boxes,
+        head_pose,
+        image.shape,
+        camera_health,
+    )
     return {
         "face_presence": face_count > 0,
         "face_count": face_count,
+        "face_boxes": face_boxes,
         "multiple_faces": multiple_faces,
         "looking_away": looking_away,
         "head_pose": head_pose,
+        "face_pose_estimates": face_pose_estimates,
         "phone_detection": phone_detection,
         "phone_confidence": phone_confidence,
+        "phone_boxes": phone_boxes[:20],
+        "camera_health": camera_health,
+        "visible_devices": visible_devices,
+        "readability_assessment": readability,
+        "frame_quality": {
+            "mean_luminance": round(frame_mean, 2),
+            "luminance_stddev": round(frame_stddev, 2)
+        },
+        "inference_ms": round((time.perf_counter() - started_at) * 1000, 2),
         "service_version": "examguard-ai-local-v1",
-        "phone_model": "configured" if yolo is not None else "unavailable",
+        "phone_model": "configured" if phone_model_ready else "unavailable",
         "disclosure": (
             "One uploaded frame was processed in memory. "
             "This endpoint does not save images or create incidents. "

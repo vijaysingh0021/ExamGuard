@@ -24,7 +24,7 @@ const session = { token: 'token', user: { name: 'Candidate', email: 'candidate@e
 const response = <T,>(data: T, headers: Record<string, string> = {}) => Promise.resolve({ data, headers });
 const apiError = (error: string) => () => Promise.reject({ isAxiosError: true, response: { data: { error } } });
 
-function AtLocation() { return <output data-testid="location">{useLocation().pathname}</output>; }
+function AtLocation() { const location = useLocation(); return <output data-testid="location" data-fullscreen-required={String(location.state?.fullscreenRequired)}>{location.pathname}</output>; }
 function withQuery(ui: React.ReactNode) {
   return render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter>{ui}</MemoryRouter></QueryClientProvider>);
 }
@@ -79,36 +79,74 @@ describe('authentication forms', () => {
   it('reports password-recovery API failures', async () => {
     http.post.mockImplementation(apiError('Service temporarily unavailable'));
     render(<MemoryRouter><ForgotPasswordPage /></MemoryRouter>);
-    await userEvent.type(screen.getByLabelText('Email'), 'candidate@example.edu');
-    await userEvent.click(screen.getByRole('button', { name: 'Send recovery instructions' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('Unable to request recovery.');
+    await userEvent.type(screen.getByLabelText('Work or school email'), 'candidate@example.edu');
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('We could not process that request.');
     expect(http.post).toHaveBeenCalledWith('/api/auth/password-reset/request', { email: 'candidate@example.edu' });
   });
 
   it('verifies the six-digit recovery code before opening password reset', async () => {
     http.post.mockImplementation((url: string) => url.endsWith('/request')
-      ? response({ message: 'If an account exists, a verification code will be sent.' })
+      ? response({ message: 'If an account exists and email delivery is working, a verification code will be sent.' })
       : response({ resetToken: 'opaque-reset-session-token' }));
     render(<MemoryRouter><ForgotPasswordPage /></MemoryRouter>);
-    await userEvent.type(screen.getByLabelText('Email'), 'candidate@example.edu');
-    await userEvent.click(screen.getByRole('button', { name: 'Send recovery instructions' }));
-    expect(await screen.findByLabelText('Six-digit code')).toBeInTheDocument();
-    await userEvent.type(screen.getByLabelText('Six-digit code'), '123456');
+    await userEvent.type(screen.getByLabelText('Work or school email'), 'candidate@example.edu');
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    expect(await screen.findByLabelText('Six-digit verification code')).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText('Six-digit verification code'), '123456');
     await userEvent.click(screen.getByRole('button', { name: 'Verify code' }));
     await waitFor(() => expect(http.post).toHaveBeenLastCalledWith('/api/auth/password-reset/verify', { email: 'candidate@example.edu', otp: '123456' }));
+  });
+
+  it('does not claim a recovery email was sent and lets the user retry safely', async () => {
+    http.post.mockReturnValue(response({ message: 'If an account exists and email delivery is working, a verification code will be sent.' }));
+    render(<MemoryRouter><ForgotPasswordPage /></MemoryRouter>);
+    await userEvent.type(screen.getByLabelText('Work or school email'), 'candidate@example.edu');
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+
+    expect(await screen.findByRole('status')).toHaveTextContent('If an account matches this address and email delivery is working, a six-digit code will be sent.');
+    expect(screen.getByRole('status')).toHaveTextContent('we can’t confirm whether an account is registered');
+    expect(screen.getByText(/Check your spam folder/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Request another code' }));
+    expect(http.post).toHaveBeenNthCalledWith(2, '/api/auth/password-reset/request', { email: 'candidate@example.edu' });
   });
 });
 
 describe('candidate and teacher workflows', () => {
+  it('shows assigned exam dates in the student calendar', async () => {
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(14, 30, 0, 0);
+    const startsAt = tomorrow.toISOString();
+    http.get.mockImplementation((url: string) => {
+      if (url === '/api/student/dashboard') return response({
+        candidate: { id: 'candidate-1', name: 'Candidate' },
+        verification: { status: 'approved' },
+        assignments: [{ id: 'assignment-calendar', exam: { id: 'exam-calendar', title: 'Calendar Physics', durationMinutes: 45, status: 'scheduled', startsAt, endsAt: new Date(tomorrow.getTime() + 3_600_000).toISOString() } }],
+      });
+      if (url === '/api/notifications') return response({ notifications: [], emailConfigured: false, emailStatus: 'unavailable' });
+      return response([]);
+    });
+    withQuery(<CandidateDashboard session={session} />);
+
+    expect(await screen.findByText('Exam calendar')).toBeInTheDocument();
+    const dateButton = await screen.findByRole('button', { name: new RegExp('1 assigned exam') });
+    await userEvent.click(dateButton);
+    expect((await screen.findAllByText('Calendar Physics')).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(/45\s+minutes/)).toHaveLength(2);
+  });
+
   it('shows a loading state, then routes an available candidate to readiness', async () => {
     let resolveDashboard!: (value: { data: unknown }) => void;
     http.get.mockReturnValue(new Promise(resolve => { resolveDashboard = resolve; }));
     withQuery(<><CandidateDashboard session={session} /><AtLocation /></>);
     expect(document.querySelector('.animate-pulse')).toBeInTheDocument();
-    resolveDashboard({ data: { candidate: { id: 'candidate-1', name: 'Candidate' }, verification: { status: 'approved' }, assignments: [{ id: 'assignment-1', exam: { id: 'exam-1', title: 'Physics', durationMinutes: 45, status: 'published', startsAt: '2020-01-01T00:00:00.000Z', endsAt: '2099-01-01T00:00:00.000Z' } }] } });
+    resolveDashboard({ data: { candidate: { id: 'candidate-1', name: 'Candidate' }, verification: { status: 'approved' }, assignments: [{ id: 'assignment-1', exam: { id: 'exam-1', title: 'Physics', durationMinutes: 45, status: 'published', startsAt: '2020-01-01T00:00:00.000Z', endsAt: '2099-01-01T00:00:00.000Z', policyFullscreenRequired: true } }] } });
     expect(await screen.findByText('Physics')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Start readiness' }));
     expect(screen.getByTestId('location')).toHaveTextContent('/app/take/exam-1');
+    expect(screen.getByTestId('location')).toHaveAttribute('data-fullscreen-required', 'true');
   });
 
   it('surfaces candidate dashboard API errors', async () => {

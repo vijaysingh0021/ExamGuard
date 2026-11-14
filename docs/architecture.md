@@ -35,8 +35,8 @@ ExamGuard is a multi-tenant examination platform designed for universities and e
 - **Computer Vision**: 
   - **Face Detection**: MediaPipe.
   - **Phone Detection**: YOLO (Ultralytics).
-  - **Head Pose Estimation**: (Planned) MediaPipe landmarks.
-- **Integration**: The client captures frames and sends them to the backend, which forwards them to the AI service or the client calls the AI service directly (context-dependent).
+  - **Head Pose Estimation**: Approximate orientation from MediaPipe face landmarks.
+- **Integration**: The client captures disclosed, sampled frames and sends them to the authenticated backend, which forwards them to the AI service. The browser never calls the AI service directly.
 
 ### 4. Windows Companion (Device Monitor)
 - **Framework**: .NET 8, C#.
@@ -51,7 +51,10 @@ ExamGuard is a multi-tenant examination platform designed for universities and e
 - **User**: Authentication entity.
 - **Membership**: Links User to Organization with a Role.
 - **Exam**: Assessment configuration, schedule, and rules.
+- **ExamTemplate**: Organization-scoped snapshots of draft exam settings, questions, answer keys, and coding test cases for authorized staff to reuse.
 - **Question**: Questions linked to exams or banks.
+- **QuestionBank**: Organization-scoped reusable question collections.
+- **ExamAssignment**: Candidate assignments that drive the student exam calendar and availability view.
 - **Candidate**: Organization-specific student profile.
 - **ExamAttempt**: A specific instance of a candidate taking an exam.
 - **ProctoringEvent**: Automated signals (face missing, phone detected, etc.).
@@ -65,4 +68,4 @@ ExamGuard is a multi-tenant examination platform designed for universities and e
 - **Audit Logging**: Every administrative action is recorded.
 
 ---
-*Last updated: 2026-11-06*
+*Last updated: 2026-11-12*

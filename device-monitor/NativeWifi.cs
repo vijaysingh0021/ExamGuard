@@ -6,6 +6,8 @@ namespace ExamGuard.DeviceMonitor;
 // Uses the documented Windows WLAN API. Does not enter monitor mode or inspect traffic.
 internal static class NativeWifi
 {
+    private const int ScanTimeoutMilliseconds = 4000;
+
     internal record AccessPoint(string Bssid, int Rssi);
 
     private static readonly ConcurrentQueue<string> DiagnosticQueue = new();
@@ -35,6 +37,8 @@ internal static class NativeWifi
                 var header = Marshal.PtrToStructure<ListHeader>(interfaces);
                 var interfaceSize = Marshal.SizeOf<InterfaceInfo>();
                 var result = new List<AccessPoint>();
+                if (header.Count == 0)
+                    throw new InvalidOperationException("Windows reports no wireless LAN interfaces.");
 
                 for (var i = 0; i < header.Count; i++)
                 {
@@ -43,7 +47,9 @@ internal static class NativeWifi
 
                     code = WlanScan(client, ref item.Guid, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
                     DiagnosticQueue.Enqueue($"WlanScan return code: {code}");
-                    Thread.Sleep(750);
+                    if (code != 0)
+                        throw new InvalidOperationException($"WlanScan failed: {code}");
+                    Thread.Sleep(ScanTimeoutMilliseconds);
 
                     foreach (var securityEnabled in new[] { false, true })
                     {

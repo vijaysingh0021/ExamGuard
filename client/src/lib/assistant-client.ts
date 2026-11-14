@@ -12,9 +12,9 @@ export const trimHistory = (turns: ChatTurn[]): ChatTurn[] =>
 export const canSend = (text: string, busy: boolean) => !busy && text.trim().length > 0 && text.length <= MAX_MESSAGE_CHARS;
 
 export const suggestionsFor = (role: string): string[] => {
-  if (role === "student") return ["My camera permission is blocked", "How does autosave work?", "How do I pair the Windows Companion?"];
-  if (role === "institute_admin") return ["Summarize our exam analytics", "How do automation and retention work?", "How do I reset my password?"];
-  return ["Summarize our exam analytics", "Draft a rubric for an essay question", "How do I review an incident?"];
+  if (role === "student") return ["My camera permission is blocked", "Make me a device-readiness checklist", "What does full-display sharing capture?", "How do I use the Windows Companion?"];
+  if (role === "institute_admin") return ["Summarize our exam analytics", "Make me an exam-launch checklist", "How do I review pending student applications?"];
+  return ["Summarize our exam analytics", "Draft a rubric for an essay question", "Make me an evidence-review checklist"];
 };
 
 /** Human-readable text for failed requests; never echoes server internals. */

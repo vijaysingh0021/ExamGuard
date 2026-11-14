@@ -8,7 +8,7 @@ const bad = (res: { status(c: number): { json(b: unknown): unknown } }, error: s
 
 /** Teacher/administrator read APIs that the existing grading endpoints need: who submitted, what they answered, and what happened. */
 export function registerReviewRoutes(app: Express) {
-  const examInOrg = (organizationId: string, examId: string) => prisma.exam.findFirst({ where: { id: examId, organizationId }, select: { id: true, title: true } });
+  const examInOrg = (organizationId: string, examId: string) => prisma.exam.findFirst({ where: { id: examId, organizationId }, select: { id: true, title: true, isPractice: true } });
 
   app.get('/api/organizations/:organizationId/exams/:examId/submissions', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
     const organizationId = req.auth!.organizationId!; const examId = String(req.params.examId);
@@ -28,14 +28,15 @@ export function registerReviewRoutes(app: Express) {
   app.get('/api/organizations/:organizationId/exams/:examId/submissions/summary', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
     const organizationId = req.auth!.organizationId!; const examId = String(req.params.examId);
     if (!isUuidValue(examId)) return bad(res, 'Invalid examId');
-    if (!(await examInOrg(organizationId, examId))) return res.status(404).json({ error: 'Exam not found' });
+    const exam = await examInOrg(organizationId, examId);
+    if (!exam) return res.status(404).json({ error: 'Exam not found' });
     const [assigned, byStatus, byGrade, ungraded] = await Promise.all([
       prisma.examAssignment.count({ where: { organizationId, examId } }),
       prisma.examAttempt.groupBy({ by: ['status'], where: { organizationId, examId }, _count: { _all: true } }),
       prisma.grade.groupBy({ by: ['status'], where: { organizationId, examId }, _count: { _all: true } }),
       prisma.examAttempt.count({ where: { organizationId, examId, status: { in: ['submitted', 'expired'] }, grade: { is: null } } }),
     ]);
-    res.json({ assigned, attempts: Object.fromEntries(byStatus.map(r => [r.status, r._count._all])), grades: Object.fromEntries(byGrade.map(r => [r.status, r._count._all])), awaitingEvaluation: ungraded });
+    res.json({ assigned, attempts: Object.fromEntries(byStatus.map(r => [r.status, r._count._all])), grades: Object.fromEntries(byGrade.map(r => [r.status, r._count._all])), awaitingEvaluation: exam.isPractice ? 0 : ungraded, isPractice: exam.isPractice });
   } catch (error) { next(error); } });
 
   // Viewing a candidate's answers is sensitive, so each view is audited.

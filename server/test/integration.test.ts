@@ -50,6 +50,7 @@ async function cleanup() {
   await prisma.exam.deleteMany({ where: { id: TEST_EXAM_ID } });
   // Delete ALL candidates for this organization first (handles any orphaned test data)
   await prisma.candidate.deleteMany({ where: { organizationId: TEST_ORG_ID } });
+  await prisma.auditLog.deleteMany({ where: { organizationId: TEST_ORG_ID } });
   await prisma.user.deleteMany({ where: { id: TEST_USER_ID } });
   await prisma.organization.deleteMany({ where: { id: TEST_ORG_ID } });
 }
@@ -126,6 +127,14 @@ test('isUuid validates UUIDs correctly', () => {
   assert.equal(isUuid(invalidUuid), false);
 });
 
+test('Prisma PostgreSQL adapter accepts a text-cast transaction advisory lock result', async () => {
+  const result = await prisma.$transaction(tx =>
+    tx.$queryRaw<Array<{ lock: string }>>`SELECT pg_advisory_xact_lock(hashtext(${TEST_USER_ID})::bigint)::text AS lock`,
+  );
+  assert.equal(result.length, 1);
+  assert.equal(typeof result[0].lock, 'string');
+});
+
 test('bcrypt password hashing and verification', async () => {
   const password = 'TestPassword123';
   const hash = await bcrypt.hash(password, 12);
@@ -152,4 +161,3 @@ test('organization tenant isolation filter', () => {
   assert.deepEqual(filter2, { organizationId: 'org-2' });
   assert.notDeepEqual(filter1, filter2);
 });
-

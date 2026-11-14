@@ -5,12 +5,11 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { AlertTriangle, CheckCircle2, CircleAlert, CircleHelp } from "lucide-react";
 import { api } from "./lib/api";
 import { Alert, Badge, Button, Skeleton, Textarea } from "./components/ui";
-import { PHASE_LABEL, formatStartsIn, readinessItems, resultText, sections, submissionStatusText, type Assignment, type Perm, type ReadinessEnv } from "./lib/candidate-rules";
+import { PHASE_LABEL, assignmentsOnDay, calendarDayKey, calendarGrid, formatStartsIn, phaseOf, readinessItems, resultText, sections, submissionStatusText, type Assignment, type Perm, type ReadinessEnv } from "./lib/candidate-rules";
 import type { NotificationsPayload } from "./notifications";
 
 type Session = { user: { name: string; email: string }; organization: { id: string; name: string } };
-type Verification = { status: string; rejectionReason?: string | null; profilePhoto?: string | null; idDocument?: string | null };
-type Payload = { candidate: { id: string; name: string }; verification: Verification; assignments: Assignment[] };
+type Payload = { candidate: { id: string; name: string }; assignments: Assignment[] };
 type ExplanationRequest = { id: string; question: string; body: string; evidenceKey?: string | null; status: string; deadlineAt?: string | null; respondedAt?: string | null; decision?: string | null; decisionReason?: string | null; decisionAt?: string | null; incident: { exam?: { title: string } | null; type: string; createdAt: string } };
 const when = (v?: string | null) => (v ? new Date(v).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "");
 const windowText = (a: Assignment) => (a.exam?.startsAt || a.exam?.endsAt ? `${a.exam?.startsAt ? when(a.exam.startsAt) : "Any time"} – ${a.exam?.endsAt ? when(a.exam.endsAt) : "no end"}` : "No fixed window");
@@ -34,7 +33,7 @@ function DeviceReadiness() {
       <div className="flex items-center justify-between gap-3"><h3 id="readiness-title" className="font-semibold">Device readiness</h3><Button size="sm" variant="outline" onClick={() => void check()}>Check again</Button></div>
       <p className="mt-1 text-sm text-stone-500">Your browser only reports what it already allows. Checking never turns on your camera or microphone.</p>
       {!env ? <Skeleton className="mt-3 h-24" /> : <ul className="mt-3 divide-y divide-stone-100">{items.map((i) => { const I = Icon[i.status]; return <li key={i.id} className="flex gap-3 py-2 text-sm"><I size={16} aria-hidden="true" className={`mt-0.5 shrink-0 ${tone[i.status]}`} /><div><p className="font-medium text-stone-900">{i.label}<span className="sr-only">: {i.status === "ok" ? "ready" : i.status === "warn" ? "needs attention" : "problem"}</span></p><p className="text-stone-600">{i.hint}</p></div></li>; })}</ul>}
-      <p className="mt-3 text-xs text-stone-500">If your organization requires the Windows Companion, you'll pair it from the exam page after you start. Its status appears there.</p>
+      <p className="mt-3 text-xs text-stone-500">Before exam day, install the Windows Companion using the download instructions from your institution. You will pair it from the exam readiness page.</p>
     </section>
   );
 }
@@ -43,14 +42,17 @@ function DeviceReadiness() {
 export function CandidateDashboard({ session }: { session: Session }) {
   const navigate = useNavigate();
   const [now, setNow] = useState(() => Date.now());
+  const [calendarMonth, setCalendarMonth] = useState(() => {
+    const date = new Date();
+    return new Date(date.getFullYear(), date.getMonth(), 1);
+  });
+  const [selectedCalendarDay, setSelectedCalendarDay] = useState(() => calendarDayKey(new Date()));
   useEffect(() => { const id = window.setInterval(() => setNow(Date.now()), 30_000); return () => window.clearInterval(id); }, []);
   const { data, isLoading, isError, refetch } = useQuery({ queryKey: ["candidate-dashboard", session.user.email], queryFn: async () => (await api.get<Payload>("/api/student/dashboard")).data });
   const notes = useQuery({ queryKey: ["notifications"], queryFn: async () => (await api.get<NotificationsPayload>("/api/notifications")).data, refetchInterval: 60_000 });
   const explanations = useQuery({ queryKey: ["explanation-requests"], queryFn: async () => (await api.get<ExplanationRequest[]>("/api/student/explanation-requests")).data, refetchInterval: 60_000 });
-  const [notice, setNotice] = useState(""); const [error, setError] = useState(""); const [submitting, setSubmitting] = useState(false);
   const [responses, setResponses] = useState<Record<string, string>>({});
   const [responseFiles, setResponseFiles] = useState<Record<string, File | undefined>>({});
-  const [verificationFiles, setVerificationFiles] = useState<{ photo?: File; idDocument?: File }>({});
   const responseMutation = useMutation({
     mutationFn: async ({ requestId, body, file }: { requestId: string; body: string; file?: File }) => {
       const form = new FormData();
@@ -65,25 +67,9 @@ export function CandidateDashboard({ session }: { session: Session }) {
   if (isError || !data) return <div className="mx-auto max-w-xl rounded-xl border border-stone-200 bg-white p-8 text-center"><AlertTriangle className="mx-auto text-red-500" aria-hidden="true" /><h2 className="mt-3 font-semibold">Your assessments could not be loaded</h2><p className="mt-1 text-sm text-stone-500">Check your connection and try again. If this keeps happening, contact your examination administrator.</p><Button className="mt-4" variant="outline" onClick={() => void refetch()}>Try again</Button></div>;
 
   const assignments = data.assignments ?? [];
-  const verification = data.verification ?? { status: "not_submitted" };
-  const verificationRequired = assignments.some((a) => a.exam?.requireVerification);
+  const calendarDays = calendarGrid(calendarMonth.getFullYear(), calendarMonth.getMonth());
+  const selectedDayAssignments = assignmentsOnDay(assignments, selectedCalendarDay);
   const sec = sections(assignments, now);
-  const submitVerification = async () => {
-    setSubmitting(true); setError(""); setNotice("");
-    try {
-      if (!verificationFiles.photo || !verificationFiles.idDocument) throw new Error("Add both a selfie and an identity document before submitting.");
-      for (const [kind, file] of [["photo", verificationFiles.photo], ["idDocument", verificationFiles.idDocument] as const]) {
-        const form = new FormData();
-        form.append("file", file);
-        await api.post(`/api/organizations/${session.organization.id}/candidates/${data.candidate.id}/documents/${kind}`, form);
-      }
-      await api.post(`/api/organizations/${session.organization.id}/candidates/${data.candidate.id}/verification`);
-      setNotice("Identity verification submitted. Your institute must approve it before you can start this assessment.");
-      await refetch();
-    }
-    catch (e) { setError(axios.isAxiosError(e) ? (e.response?.data?.error ?? "Could not submit identity verification.") : "Could not submit identity verification."); }
-    finally { setSubmitting(false); }
-  };
   const unread = (notes.data?.notifications ?? []).filter((n) => !n.readAt).slice(0, 3);
 
   return (
@@ -107,27 +93,14 @@ export function CandidateDashboard({ session }: { session: Session }) {
         })}</div>
       </section>}
 
-      {verificationRequired && (
-        <section className="rounded-xl border border-amber-200 bg-amber-50/60 p-5" aria-labelledby="verify-title"><h3 id="verify-title" className="font-semibold">Identity verification</h3>
-          <p className="mt-1 text-sm text-stone-600">Status: <b className="capitalize">{String(verification.status).replaceAll("_", " ")}</b>{verification.rejectionReason ? ` — ${verification.rejectionReason}` : ""}</p>
-          {verification.status === "approved" ? <p className="mt-3 text-sm text-emerald-700">Approved. You can start protected assessments during their availability window.</p>
-            : verification.status === "submitted" ? <p className="mt-3 text-sm text-amber-800">Your request is awaiting review by your institute.</p>
-            : <div className="mt-4 space-y-3">
-              <label className="block text-sm font-medium text-stone-700">Live selfie<input className="input mt-1 w-full" type="file" accept="image/jpeg,image/png,image/webp" capture="user" onChange={event => setVerificationFiles(existing => ({ ...existing, photo: event.target.files?.[0] }))} /></label>
-              <label className="block text-sm font-medium text-stone-700">Identity document<input className="input mt-1 w-full" type="file" accept="image/jpeg,image/png,image/webp,application/pdf" onChange={event => setVerificationFiles(existing => ({ ...existing, idDocument: event.target.files?.[0] }))} /></label>
-              <Button disabled={submitting || !verificationFiles.photo || !verificationFiles.idDocument} onClick={() => void submitVerification()}>{submitting ? "Submitting…" : verification.status === "resubmission_required" ? "Resubmit identity verification" : "Submit identity verification"}</Button>
-            </div>}
-          {notice && <p role="status" className="mt-3 text-sm text-emerald-700">{notice}</p>}{error && <p role="alert" className="mt-3 text-sm text-red-700">{error}</p>}
-        </section>)}
-
       <section aria-labelledby="now-title"><h3 id="now-title" className="mb-3 font-semibold">Available now</h3>
         {sec.active.length === 0 ? <p className="rounded-xl border border-dashed border-stone-300 p-8 text-center text-sm text-stone-500">{assignments.length === 0 ? "No assessments have been assigned to you yet. Your organizer will assign them." : "Nothing to take right now."}</p> : (
           <div className="space-y-3">{sec.active.map(({ a, phase }) => (
             <article key={a.id} className="rounded-xl border border-stone-200 bg-white p-5">
               <div className="flex flex-wrap items-start justify-between gap-3">
-                <div><p className="text-lg font-medium">{a.exam?.title}</p><p className="mt-1 text-sm text-stone-500">{a.exam?.durationMinutes ?? "—"} minutes · {windowText(a)}</p></div>
+                <div><p className="text-lg font-medium">{a.exam?.title} {a.exam?.isPractice && <Badge variant="outline">Practice · ungraded</Badge>}</p><p className="mt-1 text-sm text-stone-500">{a.exam?.durationMinutes ?? "—"} minutes · {windowText(a)}{a.exam?.isPractice ? " · excluded from official results" : ""}</p></div>
                 <div className="flex items-center gap-3"><Badge variant={phase === "closing" ? "warning" : "success"}>{PHASE_LABEL[phase]}</Badge>
-                  {phase === "closing" ? <span className="max-w-56 text-xs text-stone-500">This exam's window has ended. Your saved answers are being submitted automatically.</span> : <Button onClick={() => navigate(`/app/take/${a.exam!.id}`)}>{phase === "in_progress" ? "Resume assessment" : "Start readiness"}</Button>}</div>
+                  {phase === "closing" ? <span className="max-w-56 text-xs text-stone-500">This exam's window has ended. Your saved answers are being submitted automatically.</span> : <Button onClick={() => navigate(`/app/take/${a.exam!.id}`, { state: { fullscreenRequired: a.exam?.policyFullscreenRequired !== false } })}>{phase === "in_progress" ? "Resume assessment" : "Start readiness"}</Button>}</div>
               </div>
               {a.exam?.instructions && <details className="mt-3 text-sm"><summary className="cursor-pointer font-medium text-stone-700">Instructions</summary><p className="mt-2 whitespace-pre-wrap text-stone-600">{a.exam.instructions}</p></details>}
             </article>))}</div>)}
@@ -136,9 +109,34 @@ export function CandidateDashboard({ session }: { session: Session }) {
       {sec.upcoming.length > 0 && (
         <section aria-labelledby="up-title"><h3 id="up-title" className="mb-3 font-semibold">Upcoming</h3>
           <ul className="divide-y divide-stone-100 rounded-xl border border-stone-200 bg-white">{sec.upcoming.map(({ a }) => (
-            <li key={a.id} className="flex flex-wrap items-center justify-between gap-2 px-5 py-4"><div><p className="font-medium">{a.exam?.title}</p><p className="text-sm text-stone-500">{windowText(a)} · {a.exam?.durationMinutes ?? "—"} minutes</p></div><Badge variant="outline">Starts {formatStartsIn(new Date(a.exam!.startsAt!).getTime() - now)}</Badge></li>))}</ul></section>)}
+            <li key={a.id} className="flex flex-wrap items-center justify-between gap-2 px-5 py-4"><div><p className="font-medium">{a.exam?.title} {a.exam?.isPractice && <Badge variant="outline">Practice · ungraded</Badge>}</p><p className="text-sm text-stone-500">{windowText(a)} · {a.exam?.durationMinutes ?? "—"} minutes</p></div><Badge variant="outline">Starts {formatStartsIn(new Date(a.exam!.startsAt!).getTime() - now)}</Badge></li>))}</ul></section>)}
 
-      <div className="grid gap-5 lg:grid-cols-2">
+            <section aria-labelledby="calendar-title" className="rounded-xl border border-stone-200 bg-white p-5">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div><h3 id="calendar-title" className="font-semibold">Exam calendar</h3><p className="mt-1 text-sm text-stone-500">Your assigned scheduled exams, shown in your local time zone.</p></div>
+                <div className="flex items-center gap-2"><button type="button" className="button-secondary min-h-9 px-3 py-1.5 text-sm" aria-label="Previous month" onClick={() => setCalendarMonth(month => new Date(month.getFullYear(), month.getMonth() - 1, 1))}>←</button><b className="min-w-32 text-center text-sm">{calendarMonth.toLocaleDateString(undefined, { month: "long", year: "numeric" })}</b><button type="button" className="button-secondary min-h-9 px-3 py-1.5 text-sm" aria-label="Next month" onClick={() => setCalendarMonth(month => new Date(month.getFullYear(), month.getMonth() + 1, 1))}>→</button><button type="button" className="button-secondary min-h-9 px-3 py-1.5 text-sm" onClick={() => { const today = new Date(); setCalendarMonth(new Date(today.getFullYear(), today.getMonth(), 1)); setSelectedCalendarDay(calendarDayKey(today)); }}>Today</button></div>
+              </div>
+              <div className="mt-4 grid grid-cols-7 gap-1 text-center text-[11px] font-semibold uppercase tracking-wide text-stone-500">{["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map(day => <span key={day} className="py-2">{day}</span>)}</div>
+              <div className="grid grid-cols-7 gap-1">{calendarDays.map(day => {
+                const key = calendarDayKey(day);
+                const events = assignmentsOnDay(assignments, key);
+                const inMonth = day.getMonth() === calendarMonth.getMonth();
+                return <button key={key} type="button" onClick={() => setSelectedCalendarDay(key)} aria-pressed={selectedCalendarDay === key} aria-label={`${day.toLocaleDateString()}${events.length ? `, ${events.length} assigned exam${events.length === 1 ? "" : "s"}` : ""}`} className={`min-h-14 rounded-lg border p-1 text-left transition sm:min-h-20 ${selectedCalendarDay === key ? "border-blue-600 bg-blue-50 ring-1 ring-blue-600" : "border-transparent hover:border-stone-200 hover:bg-stone-50"} ${inMonth ? "text-stone-900" : "text-stone-300"}`}>
+                  <span className="text-xs font-medium">{day.getDate()}</span>
+                  {events.slice(0, 2).map(event => <span key={event.id} title={event.exam?.title} className="mt-1 block truncate rounded bg-emerald-100 px-1 py-0.5 text-[9px] font-medium text-emerald-900">{event.exam?.title}</span>)}
+                  {events.length > 2 && <span className="block text-[9px] text-stone-500">+{events.length - 2} more</span>}
+                </button>;
+              })}</div>
+              <div className="mt-4 border-t border-stone-100 pt-4">
+                <p className="text-sm font-semibold">{new Date(`${selectedCalendarDay}T12:00:00`).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</p>
+                {selectedDayAssignments.length ? <ul className="mt-2 divide-y divide-stone-100">{selectedDayAssignments.map(assignment => {
+                  const phase = phaseOf(assignment, now);
+                  return <li key={assignment.id} className="flex flex-wrap items-center justify-between gap-2 py-3"><div><p className="text-sm font-medium">{assignment.exam?.title} {assignment.exam?.isPractice && <Badge variant="outline">Practice · ungraded</Badge>}</p><p className="text-xs text-stone-500">{windowText(assignment)} · {assignment.exam?.durationMinutes ?? "—"} minutes</p></div><div className="flex items-center gap-2"><Badge variant={phase === "available" || phase === "in_progress" ? "success" : phase === "upcoming" ? "outline" : "muted"}>{PHASE_LABEL[phase]}</Badge>{(phase === "available" || phase === "in_progress") && <Button size="sm" onClick={() => navigate(`/app/take/${assignment.exam!.id}`, { state: { fullscreenRequired: assignment.exam?.policyFullscreenRequired !== false } })}>{phase === "in_progress" ? "Resume" : "Start readiness"}</Button>}</div></li>;
+                })}</ul> : <p className="mt-2 text-sm text-stone-500">No assigned exam is scheduled for this date.</p>}
+              </div>
+            </section>
+
+            <div className="grid gap-5 lg:grid-cols-2">
         <DeviceReadiness />
         <section aria-labelledby="notes-title" className="rounded-xl border border-stone-200 bg-white p-5"><h3 id="notes-title" className="font-semibold">Notifications</h3>
           {notes.isError ? <p className="mt-2 text-sm text-red-700" role="alert">Notifications couldn't be loaded.</p> : unread.length === 0 ? <p className="mt-2 text-sm text-stone-500">You're all caught up. Reminders and results appear here and in the bell above.</p> : <ul className="mt-3 space-y-3">{unread.map((n) => <li key={n.id}><p className="text-sm font-medium">{n.title}</p><p className="text-sm text-stone-600">{n.body}</p><p className="text-[11px] text-stone-400">{when(n.createdAt)}</p></li>)}</ul>}
@@ -151,9 +149,9 @@ export function CandidateDashboard({ session }: { session: Session }) {
           <ul className="divide-y divide-stone-100 rounded-xl border border-stone-200 bg-white">{sec.history.map(({ a, phase }) => (
             <li key={a.id} className="px-5 py-4">
               <div className="flex flex-wrap items-start justify-between gap-3">
-                <div><p className="font-medium">{a.exam?.title ?? "Assessment unavailable"}</p>
+                <div><p className="font-medium">{a.exam?.title ?? "Assessment unavailable"} {a.exam?.isPractice && <Badge variant="outline">Practice · ungraded</Badge>}</p>
                   <p className="text-sm text-stone-500">{phase === "completed" ? `${submissionStatusText(a)}${a.attempt?.submittedAt ? ` · ${when(a.attempt.submittedAt)}` : ""}` : PHASE_LABEL[phase]}{a.attempt?.receiptCode ? ` · Receipt ${a.attempt.receiptCode}` : ""}</p></div>
-                {phase === "completed" && (a.grade ? <div className="text-right"><p className="text-lg font-semibold">{resultText(a.grade)}</p><p className="text-xs text-stone-500">Released {when(a.grade.publishedAt)}</p></div> : <Badge variant="outline">Result not released yet</Badge>)}
+                {phase === "completed" && (a.exam?.isPractice ? <Badge variant="outline">Not graded · not in official results</Badge> : a.grade ? <div className="text-right"><p className="text-lg font-semibold">{resultText(a.grade)}</p><p className="text-xs text-stone-500">Released {when(a.grade.publishedAt)}</p></div> : <Badge variant="outline">Result not released yet</Badge>)}
               </div>
               {a.grade?.feedback && <p className="mt-2 whitespace-pre-wrap rounded-lg bg-stone-50 p-3 text-sm text-stone-700"><span className="block text-xs font-medium uppercase tracking-wide text-stone-400">Feedback from your examiner</span>{a.grade.feedback}</p>}
             </li>))}</ul>)}

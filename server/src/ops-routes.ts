@@ -20,10 +20,10 @@ const AUDITED_REFUSALS = new Set(['bypass', 'hidden_tests', 'exam_answer']);
 
 async function organizationFacts(organizationId: string, includeJobs: boolean) {
   const [exams, attempts, grades, openIncidents, failedJobs] = await Promise.all([
-    prisma.exam.groupBy({ by: ['status'], where: { organizationId }, _count: { _all: true } }),
-    prisma.examAttempt.groupBy({ by: ['status'], where: { organizationId }, _count: { _all: true } }),
-    prisma.grade.groupBy({ by: ['status'], where: { organizationId }, _count: { _all: true } }),
-    prisma.incident.count({ where: { organizationId, status: { in: ['open', 'awaiting_student'] } } }),
+    prisma.exam.groupBy({ by: ['status'], where: { organizationId, isPractice: false }, _count: { _all: true } }),
+    prisma.examAttempt.groupBy({ by: ['status'], where: { organizationId, exam: { isPractice: false } }, _count: { _all: true } }),
+    prisma.grade.groupBy({ by: ['status'], where: { organizationId, exam: { isPractice: false } }, _count: { _all: true } }),
+    prisma.incident.count({ where: { organizationId, exam: { isPractice: false }, status: { in: ['open', 'awaiting_student'] } } }),
     includeJobs ? prisma.backgroundJob.count({ where: { status: 'dead' } }) : Promise.resolve(0),
   ]);
   const line = (label: string, rows: Array<{ status: string; _count: { _all: number } }>) => `${label}: ${rows.length ? rows.map(r => `${r._count._all} ${r.status}`).join(', ') : 'none'}`;

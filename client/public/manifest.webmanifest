@@ -1,0 +1,21 @@
+{
+  "id": "/",
+  "name": "ExamGuard",
+  "short_name": "ExamGuard",
+  "description": "Secure examination and integrity operations.",
+  "lang": "en",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f8fafc",
+  "theme_color": "#091426",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

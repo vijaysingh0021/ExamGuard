@@ -18,6 +18,7 @@ import {
   useQuery,
 } from "@tanstack/react-query";
 import axios from "axios";
+import { io } from "socket.io-client";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -31,37 +32,45 @@ import {
   ChevronRight,
   ClipboardCheck,
   Eye,
+  EyeOff,
   FileText,
   FileSearch,
   GraduationCap,
   LayoutDashboard,
   LogOut,
-  Monitor,
   Plus,
   Settings,
   UserCog,
   CircleUser,
   ScrollText,
   Gauge,
+  ArrowLeft,
+  BriefcaseBusiness,
+  CheckCircle2,
+  LockKeyhole,
   ShieldCheck,
   MapPin,
   Search,
   RefreshCw,
   Users,
+  LifeBuoy,
   Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
   X,
 } from "lucide-react";
-import { ForgotPasswordPage, ResetPasswordPage } from "./auth-pages";
+import { CoordinatorApplicationPage, ForgotPasswordPage, InstitutionApplicationPage, ResetPasswordPage, StudentApplicationPage } from "./auth-pages";
 import { Landing } from "./marketing";
-import { CodingExamWorkspace } from "./coding-exam";
-import { Badge, Button } from "./components/ui";
+import { CodingExamWorkspace, type CodingExecutionResult } from "./coding-exam";
+import { Badge, Button, CopyableId } from "./components/ui";
 import { Checkbox, Input, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./components/ui";
 import { Dialog, DialogContent } from "./components/ui/dialog";
 import { ReasonDialog } from "./components/shared";
 import { api, publicApi } from "./lib/api";
 import { dateTimeLocalValue, readPagination } from "./lib/pagination";
-import { canAccessExamBuilder, canDecideIncidents, canEditOrganization, canExportReports, canManageCandidates, canManageExams, canReviewVerifications } from "./lib/permissions";
+import { canAccessExamBuilder, canDecideIncidents, canEditOrganization, canExportReports, canManageCandidates, canManageExams } from "./lib/permissions";
 import "./index.css";
+import "./register-pwa";
 type Session = {
   token: string;
   user: { name: string; email: string };
@@ -76,6 +85,9 @@ import { OperationsPage } from "./operations";
 import { AnalyticsPanel } from "./analytics";
 import { SubmissionsPage } from "./grading";
 import { PeoplePage } from "./people";
+import { StudentInvitationPage } from "./student-invitation";
+import { SupportPage } from "./support";
+import { SystemAdminPage } from "./system-admin";
 import { AuditPage } from "./audit";
 import { CandidateDashboard } from "./candidate-dashboard";
 // Kept exported from here: existing tests and callers import it from "./main".
@@ -93,18 +105,13 @@ const nav = [
   { label: "Overview", icon: LayoutDashboard, path: "/app" },
   { label: "Examinations", icon: BookOpen, path: "/app/exams" },
   { label: "Candidates", icon: Users, path: "/app/candidates" },
-  {
-    label: "Verification center",
-    icon: ShieldCheck,
-    path: "/app/verification",
-  },
-  { label: "Live monitoring", icon: Monitor, path: "/app/monitoring" },
   { label: "Incident review", icon: AlertTriangle, path: "/app/incidents" },
   { label: "Evidence Center", icon: FileSearch, path: "/app/evidence" },
   { label: "Results & reports", icon: BarChart3, path: "/app/reports" },
   { label: "People & roles", icon: UserCog, path: "/app/people" },
   { label: "Audit log", icon: ScrollText, path: "/app/audit" },
   { label: "Operations", icon: Gauge, path: "/app/operations" },
+  { label: "Help & support", icon: LifeBuoy, path: "/app/support" },
   { label: "Organization settings", icon: Settings, path: "/app/settings" },
 ];
 function useSession() {
@@ -494,11 +501,17 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
   const navigate = useNavigate();
   const location = useLocation();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [highContrast, setHighContrast] = useState(() => {
+    try { return window.localStorage.getItem("examguard-high-contrast") === "true"; } catch { return false; }
+  });
   const sidebarRef = useRef<HTMLElement>(null);
   const mobileMenuButtonRef = useRef<HTMLButtonElement>(null);
   const workspaceNav = session.role === "student"
-    ? [{ label: "My assessments", icon: BookOpen, path: "/app" }, { label: "Account", icon: UserCog, path: "/app/account" }]
-    : ["institute_admin", "teacher", "proctor"].includes(session.role)
+    ? [{ label: "My assessments", icon: BookOpen, path: "/app" }, { label: "Help & support", icon: LifeBuoy, path: "/app/support" }, { label: "Account", icon: UserCog, path: "/app/account" }]
+    : session.role === "platform_admin"
+      ? [{ label: "System administration", icon: ShieldCheck, path: "/app" }, { label: "Help & support", icon: LifeBuoy, path: "/app/support" }, { label: "Account", icon: CircleUser, path: "/app/account" }]
+      : ["institute_admin", "teacher", "proctor"].includes(session.role)
       ? [...nav.filter((item) => (canEditOrganization(session.role) || item.path !== "/app/settings") && (session.role === "institute_admin" || !["/app/operations", "/app/people", "/app/audit"].includes(item.path))), { label: "Account", icon: CircleUser, path: "/app/account" }]
       : [];
   const activeItem = workspaceNav.find((item) =>
@@ -513,6 +526,10 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
     navigate(path);
     setMobileNavOpen(false);
   };
+  useEffect(() => {
+    document.documentElement.dataset.contrast = highContrast ? "high" : "standard";
+    try { window.localStorage.setItem("examguard-high-contrast", String(highContrast)); } catch { /* The preference remains active for this session when storage is unavailable. */ }
+  }, [highContrast]);
   useEffect(() => {
     if (!mobileNavOpen) return;
     const sidebar = sidebarRef.current;
@@ -542,7 +559,7 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
     };
   }, [mobileNavOpen]);
   return (
-    <div className={`eg-shell ${session.role === "student" ? "eg-shell-candidate" : ""}`}>
+    <div className={`eg-shell ${session.role === "student" ? "eg-shell-candidate" : ""} ${sidebarCollapsed ? "eg-sidebar-collapsed" : ""}`}>
       <a className="skip-link" href="#workspace-content">Skip to workspace content</a>
       {mobileNavOpen && <button className="eg-mobile-scrim" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
       <aside ref={sidebarRef} className={`eg-sidebar ${mobileNavOpen ? "eg-sidebar-open" : ""}`} aria-label="Primary navigation" role={mobileNavOpen ? "dialog" : undefined} aria-modal={mobileNavOpen ? true : undefined}>
@@ -564,6 +581,8 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
             return (
               <button key={item.path} type="button" onClick={() => go(item.path)}
                 className={`eg-nav-item ${active ? "eg-nav-item-active" : ""}`}
+                title={sidebarCollapsed ? item.label : undefined}
+                aria-label={sidebarCollapsed ? item.label : undefined}
                 aria-current={active ? "page" : undefined}>
                 <Icon size={17} strokeWidth={1.8} />
                 <span>{item.label}</span>
@@ -587,12 +606,14 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
       </aside>
       <div className="eg-main-column">
         <header className="eg-topbar">
+          {session.role === "platform_admin" && <button type="button" className="eg-desktop-sidebar-toggle" aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} aria-pressed={sidebarCollapsed} onClick={() => setSidebarCollapsed(value => !value)}>{sidebarCollapsed ? <PanelLeftOpen size={18}/> : <PanelLeftClose size={18}/>}</button>}
           <button ref={mobileMenuButtonRef} type="button" className="eg-mobile-menu" aria-label={mobileNavOpen ? "Close navigation" : "Open navigation"} aria-expanded={mobileNavOpen} onClick={() => setMobileNavOpen((open) => !open)}>
             {mobileNavOpen ? <X size={20}/> : <Menu size={20}/>}
           </button>
           <div className="eg-breadcrumb"><span>Workspace</span><ChevronRight size={14}/><b>{pageTitle}</b></div>
           <div className="eg-topbar-actions">
             <span className="eg-environment"><i/> SECURE WORKSPACE</span>
+            <button type="button" className="button-secondary min-h-9 px-2 py-1 text-xs" aria-pressed={highContrast} onClick={() => setHighContrast(value => !value)}>{highContrast ? "Standard contrast" : "High contrast"}</button>
             <NotificationBell />
             <details className="eg-account-menu">
               <summary className="eg-user-chip" aria-label="Open account menu">
@@ -614,16 +635,16 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
             <div className="eg-live-status"><span/> Signed-in workspace</div>
           </div>
           <Routes>
-            <Route index element={<Dashboard session={session} />} />
+            <Route index element={session.role === "platform_admin" ? <SystemAdminPage /> : <Dashboard session={session} />} />
             <Route path="exams/:examId/submissions" element={["institute_admin", "teacher"].includes(session.role) ? <SubmissionsPage session={session} /> : <Navigate to="/app" replace />} />
             <Route path="exams" element={session.role === "student" ? <CandidateDashboard session={session} /> : <Exams session={session} />} />
             <Route path="candidates" element={<Candidates session={session} />} />
-            <Route path="verification" element={<Verification session={session} />} />
-            <Route path="monitoring" element={<Monitoring session={session} />} />
+            <Route path="monitoring" element={<Navigate to="/app" replace />} />
             <Route path="incidents" element={<Incidents session={session} />} />
             <Route path="evidence" element={(["institute_admin", "teacher", "proctor"].includes(session.role)) ? <EvidenceCenter session={session} /> : <Navigate to="/app" replace />} />
             <Route path="reports" element={<Reports session={session} />} />
             <Route path="account" element={<AccountPage session={session} onSignOut={() => { clear(); navigate("/login", { replace: true }); }} />} />
+            <Route path="support" element={<SupportPage session={session} />} />
             <Route path="people" element={session.role === "institute_admin" ? <PeoplePage session={session} /> : <Navigate to="/app" replace />} />
             <Route path="audit" element={session.role === "institute_admin" ? <AuditPage organizationId={session.organization.id} /> : <Navigate to="/app" replace />} />
             <Route path="operations" element={session.role === "institute_admin" ? <OperationsPage organizationId={session.organization.id} /> : <Navigate to="/app" replace />} />
@@ -637,7 +658,7 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
     </div>
   );
 }
-function ReadinessChecks({ onStart, error }: { onStart: () => void; error: string }) {
+function ReadinessChecks({ onStart, error, fullscreenRequired }: { onStart: () => void; error: string; fullscreenRequired: boolean }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const cameraStream = useRef<MediaStream | null>(null);
   const microphoneStream = useRef<MediaStream | null>(null);
@@ -653,8 +674,10 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
   const [fullscreen, setFullscreen] = useState(false);
   const [companionStatus, setCompanionStatus] = useState("Checking local Windows Companion…");
   const [companionReady, setCompanionReady] = useState(false);
-  const [aiStatus, setAiStatus] = useState("Checking local AI service…");
+  const [aiStatus, setAiStatus] = useState("Checking AI proctoring service…");
   const [aiReady, setAiReady] = useState(false);
+  const [evidenceStorageReady, setEvidenceStorageReady] = useState(false);
+  const [evidenceStorageStatus, setEvidenceStorageStatus] = useState("Checking private evidence storage…");
   const [monitoringConsent, setMonitoringConsent] = useState(false);
   const supported = typeof navigator !== "undefined" && !!navigator.mediaDevices?.getUserMedia;
   const online = typeof navigator !== "undefined" && navigator.onLine;
@@ -701,11 +724,21 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
         const response = await api.get("/api/student/monitoring-readiness", { timeout: 3500 });
         if (!active) return;
         setAiReady(response.data?.ready === true);
-        setAiStatus(response.data?.ready ? "All local AI models ready" : "AI models are unavailable");
+        setAiStatus(response.data?.ready ? "Connected — all required AI models are ready" : (response.data?.error ?? "The AI service is running, but its models are unavailable."));
+        const storageReady = response.data?.evidenceStorageReady === true;
+        setEvidenceStorageReady(storageReady);
+        setEvidenceStorageStatus(storageReady
+          ? "Ready — captured images can be stored privately"
+          : "Not configured — set LOCAL_EVIDENCE_DIR for local development or S3-compatible storage on the server");
       } catch (serviceError) {
         if (!active) return;
         setAiReady(false);
-        setAiStatus(axios.isAxiosError(serviceError) ? (serviceError.response?.data?.error ?? "Start the local AI service") : "Start the local AI service");
+        setAiStatus(axios.isAxiosError(serviceError) ? (serviceError.response?.data?.error ?? "The AI proctoring service is starting or unavailable. Contact your organizer if this continues.") : "The AI proctoring service is starting or unavailable. Contact your organizer if this continues.");
+        const storageReady = axios.isAxiosError(serviceError) && serviceError.response?.data?.evidenceStorageReady === true;
+        setEvidenceStorageReady(storageReady);
+        setEvidenceStorageStatus(storageReady
+          ? "Ready — captured images can be stored privately"
+          : "Could not verify — start the server and configure private evidence storage");
       }
     };
     void checkServices();
@@ -724,6 +757,31 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
       setCamera("Camera ready");
     } catch (e) {
       setCamera(e instanceof DOMException && e.name === "NotAllowedError" ? "Permission denied — allow camera access in your browser settings, then try again." : "Camera unavailable — check that no other application is using it.");
+    }
+  };
+  const enableScreen = async () => {
+    if (!navigator.mediaDevices?.getDisplayMedia) return setScreen("Screen sharing is not supported by this browser.");
+    stopScreen();
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: "monitor" },
+        audio: false,
+        selfBrowserSurface: "exclude",
+        surfaceSwitching: "exclude",
+        monitorTypeSurfaces: "include",
+      });
+      const track = stream.getVideoTracks()[0];
+      if (!track || track.getSettings().displaySurface !== "monitor") {
+        stream.getTracks().forEach((item) => item.stop());
+        setScreen("Choose Entire screen / Monitor in the browser picker. Window or tab sharing is not accepted.");
+        return;
+      }
+      screenStream.current = stream;
+      (window as any).__examguardScreenStream = stream;
+      track.addEventListener("ended", () => { screenStream.current = null; delete (window as any).__examguardScreenStream; setScreen("Full-display sharing stopped — enable it again before starting."); });
+      setScreen("Full display selected — periodic still capture ready");
+    } catch (e) {
+      setScreen(e instanceof DOMException && e.name === "NotAllowedError" ? "Screen sharing was not allowed." : "Screen sharing could not start.");
     }
   };
   const checkMicrophone = async () => {
@@ -745,19 +803,6 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
         setLevel(Math.min(100, Math.round(average * 4)));
         meterFrame.current = requestAnimationFrame(updateLevel);
       };
-      const enableScreen = async () => {
-        if (!navigator.mediaDevices?.getDisplayMedia) return setScreen("Screen sharing is not supported by this browser.");
-        stopScreen();
-        try {
-          const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-          screenStream.current = stream;
-          (window as any).__examguardScreenStream = stream;
-          stream.getVideoTracks()[0]?.addEventListener("ended", () => { screenStream.current = null; delete (window as any).__examguardScreenStream; setScreen("Screen sharing stopped — enable it again before starting."); });
-          setScreen("Screen sharing ready");
-        } catch (e) {
-          setScreen(e instanceof DOMException && e.name === "NotAllowedError" ? "Screen sharing was not allowed." : "Screen sharing could not start.");
-        }
-      };
       updateLevel();
       setMicrophone("Microphone ready — audio is not recorded or sent.");
     } catch (e) {
@@ -767,21 +812,42 @@ function ReadinessChecks({ onStart, error }: { onStart: () => void; error: strin
   return <div className="card max-w-2xl">
     <h2 className="text-xl font-semibold">Exam readiness check</h2>
     <p className="mt-2 text-sm text-slate-500">Camera and microphone permission must be granted before starting. The browser always asks for your consent; this readiness check does not record or upload media.</p>
+    <ol className="mt-4 list-decimal space-y-1 rounded-xl border border-blue-100 bg-blue-50/50 p-4 pl-9 text-sm leading-6 text-slate-700">
+      <li>Use a supported Windows computer and install the Companion provided by your institution before exam day.</li>
+      <li>Open the Companion and leave it running. Select <b>Open Windows Companion</b> if prompted by your browser.</li>
+      <li>Allow camera and microphone access, then choose <b>Entire screen</b> or <b>Monitor</b> when asked to share your screen.</li>
+      <li>Read and accept the monitoring notice. Start only when every required check below says it is ready.</li>
+    </ol>
+    <p className="mt-2 text-xs leading-5 text-slate-500">Fullscreen is {fullscreenRequired ? "required" : "not required"} for this exam. Websites cannot lock Windows or stop app switching; your institution must provide a managed kiosk computer for that level of lockdown.</p>
     <div className="mt-5 grid gap-3 sm:grid-cols-2">
       <section className="rounded-xl border border-slate-200 p-4"><b>Camera</b><p className="mt-1 text-sm text-slate-500">{camera}</p><video ref={videoRef} autoPlay muted playsInline className="mt-3 aspect-video w-full rounded-lg bg-slate-100 object-cover" aria-label="Camera preview" /> <div className="mt-3 flex gap-2"><button type="button" onClick={checkCamera} className="button">Check camera</button><button type="button" onClick={stopCamera} className="text-sm font-semibold text-slate-700">Stop camera</button></div></section>
       <section className="rounded-xl border border-slate-200 p-4"><b>Microphone</b><p className="mt-1 text-sm text-slate-500">{microphone}</p><div className="mt-4 h-3 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-teal-600 transition-[width]" style={{ width: `${level}%` }} /></div><div className="mt-5 flex gap-2"><button type="button" onClick={checkMicrophone} className="button">Check microphone</button><button type="button" onClick={stopMicrophone} className="text-sm font-semibold text-slate-700">Stop test</button></div></section>
     </div>
-    <dl className="mt-5 grid gap-2 rounded-xl bg-slate-50 p-4 text-sm sm:grid-cols-2"><div><dt className="text-slate-500">Browser</dt><dd>{supported ? "Compatible" : "Limited device support"}</dd></div><div><dt className="text-slate-500">Network</dt><dd>{online ? "Connected" : "Offline — reconnect before starting"}</dd></div><div><dt className="text-slate-500">Instructions</dt><dd>{acknowledged ? "Acknowledged" : "Awaiting acknowledgement"}</dd></div><div><dt className="text-slate-500">Screen sharing</dt><dd className={screen === "Screen sharing ready" ? "text-emerald-700" : "text-red-700"}>{screen}</dd></div><div><dt className="text-slate-500">Windows Companion — required</dt><dd className={companionReady ? "text-emerald-700" : "text-red-700"}>{companionStatus}</dd></div><div className="sm:col-span-2"><dt className="text-slate-500">Local AI service — required</dt><dd className={aiReady ? "text-emerald-700" : "text-red-700"}>{aiStatus}</dd></div></dl>
-    <button type="button" onClick={() => void enableScreen()} className="button mt-4">Enable screen sharing</button>
+    <dl className="mt-5 grid gap-2 rounded-xl bg-slate-50 p-4 text-sm sm:grid-cols-2"><div><dt className="text-slate-500">Browser</dt><dd>{supported ? "Compatible" : "Limited device support"}</dd></div><div><dt className="text-slate-500">Network</dt><dd>{online ? "Connected" : "Offline — reconnect before starting"}</dd></div><div><dt className="text-slate-500">Instructions</dt><dd>{acknowledged ? "Acknowledged" : "Awaiting acknowledgement"}</dd></div><div><dt className="text-slate-500">Full-display sharing</dt><dd className={screen.startsWith("Full display selected") ? "text-emerald-700" : "text-red-700"}>{screen}</dd></div><div className="sm:col-span-2"><dt className="text-slate-500">Windows Companion — required</dt><dd className={companionReady ? "text-emerald-700" : "text-red-700"}>{companionStatus}</dd>{!companionReady && <p className="mt-2 text-xs leading-5 text-slate-500">If installed, open the Companion now. It starts automatically at Windows sign-in after one-time registration. The app shows scanner status and has a stop button. Browser security may ask you to confirm launching it.</p>}<a className="mt-2 inline-flex text-sm font-semibold text-blue-700 underline" href="examguard-companion://start" target="_blank" rel="noreferrer">Open Windows Companion</a></div><div className="sm:col-span-2"><dt className="text-slate-500">AI proctoring — required</dt><dd className={aiReady ? "text-emerald-700" : "text-red-700"}>{aiStatus}</dd><p className="mt-1 text-xs text-slate-500">The service runs on the institution's host and is checked automatically. Students do not install the AI service.</p></div><div className="sm:col-span-2"><dt className="text-slate-500">Private evidence storage — required for incident images</dt><dd className={evidenceStorageReady ? "text-emerald-700" : "text-red-700"}>{evidenceStorageStatus}</dd></div></dl>
+    <button type="button" onClick={() => void enableScreen()} className="button mt-4">Share entire display</button>
     <label className="mt-5 flex gap-2 text-sm"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /> I have read the instructions and understand the examination rules.</label>
     <label className="mt-4 flex items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm leading-6"><input type="checkbox" className="mt-1" checked={practiceCompleted} onChange={(event) => setPracticeCompleted(event.target.checked)} /><span><b>Practice check complete.</b> I have used the answer controls, checked my camera and microphone, and understand how to submit. This short readiness exercise does not submit exam answers.</span></label>
-    <label className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-950"><input type="checkbox" className="mt-1" checked={monitoringConsent} onChange={(event) => setMonitoringConsent(event.target.checked)} /><span><b>Required monitoring consent.</b> I consent to camera-frame AI analysis and to capturing still images when a repeated review signal is recorded. I also consent to Bluetooth and Wi-Fi access-point observations by the required Windows Companion. Images are stored in ExamGuard’s private evidence storage for authorized review. This local prototype does not automatically purge image files; my institution must publish and apply its retention schedule. Automated signals are review aids, not proof of misconduct; audio is not recorded or uploaded.</span></label>
+    <label className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-950"><input type="checkbox" className="mt-1" checked={monitoringConsent} onChange={(event) => setMonitoringConsent(event.target.checked)} /><span><b>Required monitoring consent.</b> I consent to camera-frame AI analysis, full-display still images at up to 15-second intervals while the exam tab is visible, and camera snapshots when tab/window changes or AI review signals are recorded. This is not continuous video and background browser behavior may affect capture timing. I also consent to Bluetooth and Wi-Fi access-point observations by the required Windows Companion. The browser will show its screen-sharing indicator; I can stop sharing, but monitoring will be interrupted. Images are stored in private evidence storage for authorized review. This prototype does not automatically purge evidence; my institution must publish and apply its retention schedule. Automated signals are review aids, not proof of misconduct. Audio is not recorded or uploaded. ExamGuard locks the active attempt to one ExamGuard exam tab in this browser profile and records tab/window changes, but a normal browser cannot close unrelated tabs or prevent switching apps. Use a managed kiosk browser/device if those restrictions are required.</span></label>
     {error && <p role="alert" className="mt-4 text-sm text-red-600">{error}</p>}
-    <button onClick={async () => { try { await document.documentElement.requestFullscreen?.(); } catch {} onStart(); }} disabled={!acknowledged || !practiceCompleted || !monitoringConsent || !online || !companionReady || !aiReady || camera !== "Camera ready" || !microphone.startsWith("Microphone ready") || screen !== "Screen sharing ready"} className="button mt-6 disabled:cursor-not-allowed disabled:opacity-50">Start secure exam</button>
+    <button onClick={async () => { if (fullscreenRequired) { try { await document.documentElement.requestFullscreen?.(); } catch {} if (!document.fullscreenElement) { setError("Fullscreen could not be enabled. Use a supported browser and allow fullscreen before starting."); return; } } onStart(); }} disabled={!acknowledged || !practiceCompleted || !monitoringConsent || !online || !companionReady || !aiReady || !evidenceStorageReady || camera !== "Camera ready" || !microphone.startsWith("Microphone ready") || screen !== "Full display selected — periodic still capture ready"} className="button mt-6 disabled:cursor-not-allowed disabled:opacity-50">Start secure exam</button>
+  </div>;
+}
+function FullscreenLock({ onRestore }: { onRestore: () => void }) {
+  return <div role="alertdialog" aria-modal="true" aria-labelledby="fullscreen-lock-title" className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/80 p-6">
+    <div className="max-w-md rounded-2xl bg-white p-6 text-center shadow-2xl">
+      <ShieldCheck className="mx-auto text-amber-600" size={32} />
+      <h2 id="fullscreen-lock-title" className="mt-4 text-xl font-semibold">Return to exam fullscreen</h2>
+      <p className="mt-2 text-sm leading-6 text-slate-600">This exam requires fullscreen. The exam screen is blocked until you return to fullscreen. Your organizer can help if your browser will not restore it.</p>
+      <button type="button" className="button mt-5" onClick={onRestore}>Return to fullscreen</button>
+      <p className="mt-3 text-xs leading-5 text-slate-500">Fullscreen detects leaving this page; it cannot prevent switching to other apps. Managed kiosk devices are required for enforced lockdown.</p>
+    </div>
   </div>;
 }
 function StudentExam({ session }: { session: Session }) {
   const { examId = "" } = useParams();
+  const location = useLocation();
+  const [fullscreenRequired, setFullscreenRequired] = useState(location.state?.fullscreenRequired !== false);
+  const [fullscreenLost, setFullscreenLost] = useState(false);
   const [payload, setPayload] = useState<any>();
   const [error, setError] = useState("");
   const [left, setLeft] = useState(0);
@@ -798,8 +864,18 @@ function StudentExam({ session }: { session: Session }) {
   const [reviewing, setReviewing] = useState(false);
   const [pairingError, setPairingError] = useState("");
   const [pairingLoading, setPairingLoading] = useState(false);
-  const [aiStatus, setAiStatus] = useState("Starting local AI monitoring…");
+  const [aiStatus, setAiStatus] = useState("Starting AI monitoring…");
   const [attentionWarning, setAttentionWarning] = useState("");
+  const [singleWindowBlocked, setSingleWindowBlocked] = useState(false);
+  const [singleWindowMessage, setSingleWindowMessage] = useState("");
+  const [lockAttemptId, setLockAttemptId] = useState<string | null>(null);
+  const [codingRunner, setCodingRunner] = useState({ available: false, unavailableReason: "Checking the isolated code runner…", history: [] as Array<{ id: string; kind: "run" | "submit"; status: string; createdAt: string }> });
+  const pendingAttemptRef = useRef<{ examId: string; candidateId: string; attemptId: string } | null>(null);
+  const lockWaiters = useRef(new Map<string, (acquired: boolean) => void>());
+  const startingAttempt = useRef(false);
+  const contextBuffer = useRef<Array<{ capturedAt: number; blob: Blob }>>([]);
+  const contextUploadEvents = useRef(new Set<string>());
+  const recentSignalEvidence = useRef<{ evidenceKey: string; capturedAt: number } | null>(null);
   const codingPersistence = useMemo(() => ({
     available: Boolean(payload?.attempt?.id),
     save: async ({ questionId, sourceCode }: { questionId: string; languageId: string; sourceCode: string }) => {
@@ -807,73 +883,197 @@ function StudentExam({ session }: { session: Session }) {
       await api.put(`/api/student/attempts/${payload.attempt.id}/answers/${questionId}`, { value: sourceCode });
     },
   }), [payload?.attempt?.id]);
+  useEffect(() => {
+    const activeAttemptId = payload?.attempt?.id;
+    if (!activeAttemptId || !payload.questions?.some((question: any) => question.type === "coding")) return;
+    let active = true;
+    api.get(`/api/student/attempts/${activeAttemptId}/coding-executions`)
+      .then(({ data }) => {
+        if (!active) return;
+        setCodingRunner({
+          available: data.available === true,
+          unavailableReason: data.unavailableReason ?? "",
+          history: Array.isArray(data.history) ? data.history : [],
+        });
+      })
+      .catch((error) => {
+        if (!active) return;
+        const message = axios.isAxiosError(error) ? error.response?.data?.error : undefined;
+        setCodingRunner({ available: false, unavailableReason: message ?? "Could not check the isolated code runner. Contact your exam organizer.", history: [] });
+      });
+    return () => { active = false; };
+  }, [payload?.attempt?.id, payload?.questions]);
+  const runCodingExecution = useCallback(async (kind: "run" | "submit", input: { questionId: string; languageId: string; sourceCode: string }): Promise<CodingExecutionResult> => {
+    const activeAttemptId = payload?.attempt?.id;
+    if (!activeAttemptId) throw new Error("The active attempt is unavailable.");
+    try {
+      const { data } = await api.post<CodingExecutionResult & { submissionId: string; createdAt: string }>(
+        `/api/student/attempts/${activeAttemptId}/coding-executions/${kind}`,
+        input,
+        { timeout: 110_000 },
+      );
+      setCodingRunner(current => ({
+        ...current,
+        history: [{ id: data.submissionId, kind, status: data.status, createdAt: data.createdAt }, ...current.history].slice(0, 20),
+      }));
+      return data;
+    } catch (error) {
+      const message = axios.isAxiosError(error) ? error.response?.data?.error : undefined;
+      throw new Error(message ?? "The secure code execution request failed. Check your connection and retry.");
+    }
+  }, [payload?.attempt?.id]);
+  const codingExecution = useMemo(() => payload?.attempt?.id ? ({
+    available: codingRunner.available,
+    unavailableReason: codingRunner.unavailableReason,
+    run: (input: { questionId: string; languageId: string; sourceCode: string }) => runCodingExecution("run", input),
+    submit: (input: { questionId: string; languageId: string; sourceCode: string }) => runCodingExecution("submit", input),
+    history: codingRunner.history,
+  }) : undefined, [payload?.attempt?.id, codingRunner, runCodingExecution]);
   useEffect(() => () => {
     const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
     stream?.getTracks().forEach((track) => track.stop());
     delete (window as any).__examguardCameraStream;
   }, []);
-  const captureFrameBlob = async () => {
-    const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
+  const captureStreamFrame = async (stream: MediaStream | undefined, maxWidth: number, quality: number) => {
     if (!stream?.active) return null;
     const video = document.createElement("video");
     video.srcObject = stream; video.muted = true; video.playsInline = true;
-    await video.play();
-    const canvas = document.createElement("canvas");
-    const sourceWidth = video.videoWidth || 640;
-    const scale = Math.min(1, 1280 / sourceWidth);
-    canvas.width = Math.max(1, Math.round(sourceWidth * scale));
-    canvas.height = Math.max(1, Math.round((video.videoHeight || 480) * scale));
-    canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
-    video.pause(); video.srcObject = null;
-    return await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.72));
+    try {
+      await video.play();
+      if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth || !video.videoHeight) return null;
+      const canvas = document.createElement("canvas");
+      const scale = Math.min(1, maxWidth / video.videoWidth);
+      canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+      canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+      const context = canvas.getContext("2d");
+      if (!context) return null;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      return await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+    } finally {
+      video.pause();
+      video.srcObject = null;
+    }
+  };
+  const captureFrameBlob = async () => {
+    const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
+    return captureStreamFrame(stream, 1280, 0.72);
+  };
+  const uploadContextFrame = async (eventId: string, contextType: "before" | "after", sequence: number, capturedAt: number, blob: Blob) => {
+    const form = new FormData();
+    form.append("frame", blob, `ai-context-${contextType}-${sequence}.jpg`);
+    form.append("parentEventId", eventId);
+    form.append("contextType", contextType);
+    form.append("sequence", String(sequence));
+    form.append("capturedAt", new Date(capturedAt).toISOString());
+    await api.post(`/api/student/attempts/${payload!.attempt.id}/ai-context-frame`, form, { timeout: 16_000 });
+  };
+  const captureIncidentContext = async (eventId: string, occurredAt: string) => {
+    if (contextUploadEvents.current.has(eventId)) return;
+    contextUploadEvents.current.add(eventId);
+    const incidentAt = Date.parse(occurredAt);
+    const before = contextBuffer.current
+      .filter(frame => frame.capturedAt <= incidentAt && frame.capturedAt >= incidentAt - 5_000)
+      .slice(-5);
+    for (const [sequence, frame] of before.entries()) {
+      try { await uploadContextFrame(eventId, "before", sequence, frame.capturedAt, frame.blob); }
+      catch { setAttentionWarning("Some camera images from just before the review signal could not be saved."); break; }
+    }
+    const afterFrames: Array<{ sequence: number; capturedAt: number; blob: Blob }> = [];
+    for (let sequence = 0; sequence < 5; sequence += 1) {
+      if (sequence > 0) await new Promise(resolve => window.setTimeout(resolve, 700));
+      try {
+        const blob = await captureFrameBlob();
+        if (!blob) throw new Error("No camera frame was available.");
+        afterFrames.push({ sequence, capturedAt: Date.now(), blob });
+      } catch {
+        setAttentionWarning("Some camera images around the review signal could not be captured.");
+        break;
+      }
+    }
+    for (const frame of afterFrames) {
+      try { await uploadContextFrame(eventId, "after", frame.sequence, frame.capturedAt, frame.blob); }
+      catch { setAttentionWarning("Some camera images around the review signal could not be saved."); break; }
+    }
   };
   const captureScreenBlob = async () => {
     const stream = (window as any).__examguardScreenStream as MediaStream | undefined;
-    if (!stream?.active) return null;
-    const video = document.createElement("video");
-    video.srcObject = stream; video.muted = true; video.playsInline = true;
-    await video.play();
-    const canvas = document.createElement("canvas");
-    const sourceWidth = video.videoWidth || 1280;
-    const scale = Math.min(1, 1600 / sourceWidth);
-    canvas.width = Math.max(1, Math.round(sourceWidth * scale));
-    canvas.height = Math.max(1, Math.round((video.videoHeight || 900) * scale));
-    canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
-    video.pause(); video.srcObject = null;
-    return await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.65));
+    return captureStreamFrame(stream, 1600, 0.65);
   };
   const captureEvidence = async () => {
-    const blob = await captureFrameBlob();
-    if (!blob) return undefined;
-    const form = new FormData(); form.append("file", blob, "browser-signal.jpg");
-    const { data } = await api.post(`/api/student/attempts/${payload.attempt.id}/evidence`, form);
+    const now = Date.now();
+    const recentFrame = [...contextBuffer.current].reverse().find((frame) => now - frame.capturedAt <= 5_000);
+    const blob = recentFrame?.blob ?? await captureFrameBlob();
+    if (!blob) throw new Error("No recent camera frame was available.");
+    const form = new FormData();
+    form.append("file", blob, "browser-signal.jpg");
+    form.append("source", "camera");
+    const { data } = await api.post(`/api/student/attempts/${payload.attempt.id}/evidence`, form, { timeout: 16_000 });
+    if (typeof data.evidenceKey !== "string" || !data.evidenceKey) {
+      throw new Error("The evidence service did not return a saved image reference.");
+    }
     return data.evidenceKey as string;
   };
   const start = async () => {
+    if (startingAttempt.current) return;
+    startingAttempt.current = true;
     try {
       const startUrl = `/api/student/organizations/${session.organization.id}/exams/${examId}/start`;
-      const startBody = { monitoringConsentAccepted: true, monitoringConsentVersion: "examguard-monitoring-v1" };
+      const startBody = { monitoringConsentAccepted: true, monitoringConsentVersion: "examguard-monitoring-v2" };
       let response = await api.post(startUrl, startBody);
       let data = response.data;
+      const attemptId = data?.attempt?.id;
+      if (!attemptId) throw new Error("The server did not return an active attempt. Retry or contact your exam organizer.");
+      const requiredFullscreen = data.exam?.fullscreenRequired !== false;
+      setFullscreenRequired(requiredFullscreen);
+      pendingAttemptRef.current = {
+        examId: data.attempt.examId,
+        candidateId: data.attempt.candidateId,
+        attemptId,
+      };
+      if (lockAttemptId !== attemptId) {
+        const acquiredLock = new Promise<boolean>((resolve) => lockWaiters.current.set(attemptId, resolve));
+        setLockAttemptId(attemptId);
+        const acquired = await acquiredLock;
+        lockWaiters.current.delete(attemptId);
+        if (!acquired) {
+          setLockAttemptId(null);
+          pendingAttemptRef.current = null;
+          throw new Error("This exam is already open in another browser tab or window. Close the other exam tab and retry here.");
+        }
+      }
       // Always renew a fresh attempt-scoped credential and complete the local
       // handshake before asking the API to release any exam questions.
-      const connected = await createCompanionPairing(data.attempt.id);
+      const connected = await createCompanionPairing(attemptId);
       if (!connected) throw new Error("The required Windows Companion could not connect. Open the Companion and retry; the exam questions remain locked until it reports successfully.");
       response = await api.post(startUrl, startBody);
       data = response.data;
       if (data.companionRequired || !Array.isArray(data.questions)) throw new Error("The Windows Companion has not confirmed its first heartbeat yet. Retry the automatic connection.");
       // Align the countdown with the server clock so a wrong device clock cannot add or remove time.
       clockOffset.current = clockOffsetMs(response.headers?.date as string | undefined, Date.now());
+      pendingAttemptRef.current = {
+        examId: data.attempt.examId,
+        candidateId: data.attempt.candidateId,
+        attemptId: data.attempt.id,
+      };
+      setLockAttemptId(data.attempt.id);
       setPayload(data);
+      setFullscreenLost(requiredFullscreen && !document.fullscreenElement);
       setAnswers(Object.fromEntries(data.answers.map((answer: any) => [String(answer.questionId), answer.value])));
       setMarked(loadMarks(typeof sessionStorage === "undefined" ? undefined : sessionStorage, data.attempt.id));
       setLeft(remainingMs(data.attempt.deadlineAt, Date.now(), clockOffset.current));
     } catch (e) {
-      setError(
-        axios.isAxiosError(e)
-          ? e.response?.data?.error ?? "Unable to start exam"
-          : e instanceof Error ? e.message : "Unable to start exam",
-      );
+      if (axios.isAxiosError(e) && e.response?.status === 500) {
+        const requestId = e.response.data?.requestId;
+        setError(`The exam server could not start this attempt. Your attempt may be resumable; retry once. If it still fails, contact your organizer${requestId ? ` and share reference ${requestId}` : ""}.`);
+      } else {
+        setError(
+          axios.isAxiosError(e)
+            ? e.response?.data?.error ?? "Unable to start exam"
+            : e instanceof Error ? e.message : "Unable to start exam",
+        );
+      }
+    } finally {
+      startingAttempt.current = false;
     }
   };
   useEffect(() => {
@@ -909,25 +1109,45 @@ function StudentExam({ session }: { session: Session }) {
     if (!payload) return;
     let hiddenAt: number | null = null;
     let blurredAt: number | null = null;
-    const report = (type: "visibility_hidden" | "fullscreen_exit", message: string) => {
+    const reportBrowserSignal = (
+      type: "visibility_hidden" | "window_blur" | "focus_regain" | "multiple_window_hint" | "fullscreen_exit",
+      message: string,
+      details: Record<string, unknown> = {},
+    ) => {
+      const occurredAt = new Date();
       setAttentionWarning(message);
-      void (async () => { let evidenceKey: string | undefined; try { evidenceKey = await captureEvidence(); } catch { /* Evidence is optional; the signal is still recorded. */ } return api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
-        examId: payload.attempt.examId,
-        candidateId: payload.attempt.candidateId,
-        attemptId: payload.attempt.id,
-        type,
-        occurredAt: new Date().toISOString(),
-        source: "browser",
-        evidenceKey,
-        details: { clientWarning: true },
-      }); })().catch(() => undefined);
-    };
-    const reportBrowserSignal = (type: "visibility_hidden" | "window_blur" | "focus_regain" | "multiple_window_hint", message: string, details: Record<string, unknown> = {}) => {
-      setAttentionWarning(message);
-      void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
-        examId: payload.attempt.examId, candidateId: payload.attempt.candidateId, attemptId: payload.attempt.id,
-        type, occurredAt: new Date().toISOString(), source: "browser", details: { clientWarning: true, ...details },
-      }).catch(() => undefined);
+      void (async () => {
+        let evidenceKey: string | undefined;
+        if (type !== "multiple_window_hint") {
+          try {
+            const previousEvidence = recentSignalEvidence.current;
+            evidenceKey = previousEvidence && Date.now() - previousEvidence.capturedAt <= 5_000
+              ? previousEvidence.evidenceKey
+              : await captureEvidence();
+            recentSignalEvidence.current = { evidenceKey, capturedAt: Date.now() };
+          } catch (captureError) {
+            const reason = captureError instanceof Error ? captureError.message : "The camera image could not be saved.";
+            setAttentionWarning(`${message} Camera evidence was unavailable: ${reason} The event will still be recorded.`);
+          }
+        }
+        try {
+          await api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+            examId: payload.attempt.examId,
+            candidateId: payload.attempt.candidateId,
+            attemptId: payload.attempt.id,
+            type,
+            occurredAt: occurredAt.toISOString(),
+            source: "browser",
+            ...(evidenceKey ? { evidenceKey } : {}),
+            details: { clientWarning: true, ...details },
+          });
+        } catch (recordError) {
+          const reason = axios.isAxiosError(recordError)
+            ? recordError.response?.data?.error ?? "The server could not save the review event."
+            : "The server could not save the review event.";
+          setAttentionWarning(`${message} The event could not be recorded: ${reason}`);
+        }
+      })();
     };
     const visibility = () => {
       if (document.visibilityState === "hidden") {
@@ -936,16 +1156,20 @@ function StudentExam({ session }: { session: Session }) {
       } else if (hiddenAt !== null) {
         const hiddenDurationMs = Date.now() - hiddenAt;
         hiddenAt = null;
-        reportBrowserSignal("focus_regain", "You returned to the examination tab.", { hiddenDurationMs });
+        reportBrowserSignal("focus_regain", `Your examination tab was hidden for ${Math.ceil(hiddenDurationMs / 1000)} second(s). This was recorded for review; keep the exam tab active.`, { hiddenDurationMs });
       }
     };
-    const fullscreen = () => { if (!document.fullscreenElement) report("fullscreen_exit", "Warning: fullscreen was exited. Return to fullscreen and remain on the examination screen."); };
+    const fullscreen = () => {
+      const exited = !document.fullscreenElement;
+      setFullscreenLost(exited && payload.exam.fullscreenRequired === true);
+      if (exited) reportBrowserSignal("fullscreen_exit", "Warning: fullscreen was exited. Return to fullscreen and remain on the examination screen.");
+    };
     const blur = () => { blurredAt = Date.now(); reportBrowserSignal("window_blur", "Warning: the examination window lost focus. Return immediately."); };
     const focus = () => {
       if (blurredAt !== null) {
         const blurDurationMs = Date.now() - blurredAt;
         blurredAt = null;
-        reportBrowserSignal("focus_regain", "The examination window regained focus.", { blurDurationMs });
+        reportBrowserSignal("focus_regain", `The examination window lost focus for ${Math.ceil(blurDurationMs / 1000)} second(s). This was recorded for review; keep the exam window active.`, { blurDurationMs });
       }
     };
     const resize = () => {
@@ -967,7 +1191,130 @@ function StudentExam({ session }: { session: Session }) {
       window.removeEventListener("beforeunload", unload);
     };
   }, [payload, session.organization.id]);
+  useEffect(() => {
+    const activeAttempt = pendingAttemptRef.current;
+    const activeAttemptId = lockAttemptId;
+    if (!activeAttemptId || receipt) return;
+    const owner = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const lockKey = "examguard:active-exam-window";
+    let stopped = false;
+    let reported = false;
+    let retryTimer: number | null = null;
+    let releaseWebLock: (() => void) | null = null;
+    let waiterSettled = false;
+    const settleWaiter = (acquired: boolean) => {
+      if (waiterSettled) return;
+      waiterSettled = true;
+      const resolve = lockWaiters.current.get(activeAttemptId);
+      if (resolve) {
+        lockWaiters.current.delete(activeAttemptId);
+        resolve(acquired);
+      }
+    };
+    const isFresh = (value: string | null) => {
+      if (!value) return false;
+      try {
+        const lock = JSON.parse(value) as { owner?: string; heartbeat?: number };
+        return lock.owner !== owner && typeof lock.heartbeat === "number" && Date.now() - lock.heartbeat < 4_000;
+      } catch {
+        return false;
+      }
+    };
+    const block = (message = "Another ExamGuard examination is already active in this browser profile. Close it and return here to continue.") => {
+      if (stopped) return;
+      setSingleWindowBlocked(true);
+      setSingleWindowMessage(message);
+      if (!reported && activeAttempt) {
+        reported = true;
+        void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+          examId: activeAttempt.examId,
+          candidateId: activeAttempt.candidateId,
+          attemptId: activeAttemptId,
+          type: "multiple_window_hint",
+          occurredAt: new Date().toISOString(),
+          source: "browser",
+          details: { clientWarning: true, enforcement: "single_window_lock" },
+        }).catch(() => undefined);
+      }
+    };
+    const lockManager = (navigator as any).locks;
+    if (lockManager?.request) {
+      const held = new Promise<void>((resolve) => { releaseWebLock = resolve; });
+      const requestLock = () => {
+        void lockManager.request(lockKey, { mode: "exclusive", ifAvailable: true }, async (lock: unknown) => {
+          if (stopped) return;
+          if (!lock) {
+            block();
+            settleWaiter(false);
+            retryTimer = window.setTimeout(requestLock, 1000);
+            return;
+          }
+          setSingleWindowBlocked(false);
+          setSingleWindowMessage("");
+          settleWaiter(true);
+          await held;
+        }).catch(() => {
+          if (stopped) return;
+          block("This browser could not establish the exam tab lock. Use a supported browser with site storage enabled, then retry.");
+          settleWaiter(false);
+        });
+      };
+      requestLock();
+      return () => {
+        stopped = true;
+        if (retryTimer !== null) window.clearTimeout(retryTimer);
+        releaseWebLock?.();
+        settleWaiter(false);
+      };
+    }
+
+    const channel = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel("examguard:active-exam-window");
+    const heartbeat = () => {
+      try {
+        const current = localStorage.getItem(lockKey);
+        if (isFresh(current)) {
+          block();
+          settleWaiter(false);
+          return;
+        }
+        setSingleWindowBlocked(false);
+        setSingleWindowMessage("");
+        localStorage.setItem(lockKey, JSON.stringify({ owner, heartbeat: Date.now() }));
+        channel?.postMessage({ type: "window_present", owner });
+        settleWaiter(true);
+      } catch {
+        block("Browser storage is unavailable, so ExamGuard cannot safely hold the single-tab lock. Enable site storage and retry.");
+        settleWaiter(false);
+      }
+    };
+    const storage = (event: StorageEvent) => {
+      if (event.key === lockKey && isFresh(event.newValue)) block();
+    };
+    const message = (event: MessageEvent<{ type?: string; owner?: string }>) => {
+      if (event.data?.owner !== owner && event.data?.type === "window_present") block();
+    };
+    window.addEventListener("storage", storage);
+    channel?.addEventListener("message", message);
+    heartbeat();
+    channel?.postMessage({ type: "window_present", owner });
+    const interval = window.setInterval(heartbeat, 1_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+      settleWaiter(false);
+      window.removeEventListener("storage", storage);
+      channel?.removeEventListener("message", message);
+      channel?.close();
+      try {
+        const current = JSON.parse(localStorage.getItem(lockKey) ?? "null") as { owner?: string } | null;
+        if (current?.owner === owner) localStorage.removeItem(lockKey);
+      } catch {
+        // A malformed lock is harmless and will expire on its own.
+      }
+    };
+  }, [lockAttemptId, receipt, session.organization.id]);
   const save = async (questionId: string, value: unknown) => {
+    if (singleWindowBlocked) return;
     // Keep what the candidate typed on screen immediately; the engine saves it (latest value only, in order, with retries).
     setAnswers((existing) => ({ ...existing, [questionId]: value }));
     setError("");
@@ -975,7 +1322,7 @@ function StudentExam({ session }: { session: Session }) {
   };
   const submitter = useRef<ReturnType<typeof createSubmitter> | null>(null);
   const submit = async (automatic = false) => {
-    if (!payload) return;
+    if (!payload || singleWindowBlocked) return;
     submitter.current ??= createSubmitter({
       flush: async () => (await sync.current?.flush()) ?? true,
       post: async () => {
@@ -997,6 +1344,8 @@ function StudentExam({ session }: { session: Session }) {
     if (outcome.kind === "submitted" || outcome.kind === "expired" || outcome.kind === "already_submitted") {
       sync.current?.clearPersisted();
       setCompletionStatus(outcome.kind === "expired" ? "expired" : "submitted"); setReceipt(outcome.receipt); setReviewing(false);
+      setLockAttemptId(null);
+      pendingAttemptRef.current = null;
       const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
       stream?.getTracks().forEach((track) => track.stop());
       delete (window as any).__examguardCameraStream;
@@ -1016,7 +1365,7 @@ function StudentExam({ session }: { session: Session }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
-        body: JSON.stringify({ apiUrl: window.location.origin, pairingToken: data.pairingToken, consentGranted: true }),
+        body: JSON.stringify({ apiUrl: new URL(api.defaults.baseURL || window.location.origin, window.location.origin).origin, pairingToken: data.pairingToken, consentGranted: true }),
       });
       const bridgeResult = await bridgeResponse.json().catch(() => ({}));
       if (!bridgeResponse.ok || bridgeResult.status !== "connected") throw new Error(bridgeResult.error ?? "The Windows Companion did not confirm the connection.");
@@ -1048,15 +1397,37 @@ function StudentExam({ session }: { session: Session }) {
       sending = true;
       try {
         const blob = await captureFrameBlob();
-        if (!blob || stopped) return;
+        if (stopped) return;
+        if (!blob) {
+          setAiStatus("Camera frame not ready — AI check will retry.");
+          return;
+        }
         const form = new FormData();
         form.append("frame", blob, "camera-frame.jpg");
-        await api.post(`/api/student/attempts/${activeAttemptId}/ai-frame`, form, { timeout: 16_000 });
-        if (!stopped) setAiStatus("Active — local AI frame checks are running");
+        const response = await api.post<{
+          analysis?: {
+            face_count: number;
+            multiple_faces: boolean;
+            phone_detection: "detected" | "not_detected" | "unavailable";
+            phone_confidence?: number | null;
+          };
+          recorded?: Array<{ type?: string; eventId?: string; occurredAt?: string }>;
+        }>(`/api/student/attempts/${activeAttemptId}/ai-frame`, form, { timeout: 16_000 });
+        for (const signal of response.data.recorded ?? []) {
+          if (signal.eventId && signal.occurredAt) void captureIncidentContext(signal.eventId, signal.occurredAt);
+        }
+        if (!stopped && import.meta.env.DEV && response.data.analysis) {
+          const { face_count, multiple_faces, phone_detection, phone_confidence } = response.data.analysis;
+          const confidence = typeof phone_confidence === "number" ? ` ${phone_confidence.toFixed(2)}` : "";
+          const recorded = response.data.recorded?.map((signal) => signal.type).filter(Boolean).join(", ") || "none";
+          setAiStatus(`Dev AI: ${face_count} faces; multiple ${multiple_faces ? "yes" : "no"}; phone ${phone_detection}${confidence}; event ${recorded}`);
+        } else if (!stopped) {
+          setAiStatus("Active — AI frame checks are running");
+        }
       } catch (analysisError) {
         if (!stopped) {
           const message = axios.isAxiosError(analysisError) ? analysisError.response?.data?.error : undefined;
-          setAiStatus(message ?? "AI monitoring temporarily unavailable — check the local service");
+          setAiStatus(message ?? "AI monitoring temporarily unavailable — contact your organizer");
         }
       } finally {
         sending = false;
@@ -1068,19 +1439,57 @@ function StudentExam({ session }: { session: Session }) {
   }, [payload?.attempt?.id, receipt]);
   useEffect(() => {
     const activeAttemptId = payload?.attempt?.id;
-    if (!activeAttemptId || receipt) return;
+    if (!activeAttemptId || receipt) {
+      contextBuffer.current = [];
+      return;
+    }
     let stopped = false;
     const capture = async () => {
       if (stopped || document.visibilityState !== "visible") return;
       try {
-        const blob = await captureScreenBlob();
+        const blob = await captureFrameBlob();
         if (!blob || stopped) return;
+        const capturedAt = Date.now();
+        contextBuffer.current = [...contextBuffer.current, { capturedAt, blob }]
+          .filter(frame => frame.capturedAt >= capturedAt - 5_000)
+          .slice(-6);
+      } catch { /* Camera failures are reported by the monitoring request. */ }
+    };
+    void capture();
+    const interval = window.setInterval(() => void capture(), 1_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+      contextBuffer.current = [];
+      contextUploadEvents.current.clear();
+    };
+  }, [payload?.attempt?.id, receipt]);
+  useEffect(() => {
+    const activeAttemptId = payload?.attempt?.id;
+    if (!activeAttemptId || receipt) return;
+    let stopped = false;
+    let captureInFlight = false;
+    const capture = async () => {
+      if (stopped || captureInFlight || document.visibilityState !== "visible") return;
+      captureInFlight = true;
+      try {
+        const blob = await captureScreenBlob();
+        if (stopped) return;
+        if (!blob) {
+          setAttentionWarning("A full-display still could not be captured. Keep screen sharing enabled and tell your organizer if this continues.");
+          return;
+        }
         const form = new FormData();
-        form.append("file", blob, "screen-frame.jpg");
-        form.append("source", "screen");
-        await api.post(`/api/student/attempts/${activeAttemptId}/evidence`, form, { timeout: 16_000 });
-      } catch {
-        // Screen capture is a consented technical signal; the exam remains usable if storage is unavailable.
+        form.append("file", blob, "full-display-still.jpg");
+        form.append("capturedAt", new Date().toISOString());
+        form.append("displaySurface", "monitor");
+        await api.post(`/api/student/attempts/${activeAttemptId}/screen-capture`, form, { timeout: 16_000 });
+      } catch (captureError) {
+        setAttentionWarning(axios.isAxiosError(captureError) && captureError.response?.data?.error
+          ? `Full-display still could not be saved: ${captureError.response.data.error}`
+          : "A full-display still could not be saved. Check your connection and keep screen sharing enabled.");
+      } finally {
+        captureInFlight = false;
       }
     };
     void capture();
@@ -1088,17 +1497,71 @@ function StudentExam({ session }: { session: Session }) {
     return () => { stopped = true; window.clearInterval(interval); };
   }, [payload?.attempt?.id, receipt]);
   useEffect(() => {
+    const activeAttemptId = payload?.attempt?.id;
+    const stream = (window as any).__examguardScreenStream as MediaStream | undefined;
+    const track = stream?.getVideoTracks()[0];
+    if (!activeAttemptId || receipt || !track) return;
+    const handleEnded = () => {
+      setAttentionWarning("Full-display sharing stopped. Screen evidence is no longer being captured; tell your exam organizer if this was accidental.");
+      void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+        examId: payload.attempt.examId,
+        candidateId: payload.attempt.candidateId,
+        attemptId: activeAttemptId,
+        type: "screen_sharing_stopped",
+        occurredAt: new Date().toISOString(),
+        source: "browser",
+        details: { clientWarning: true, displaySurface: "monitor" },
+      }).catch(() => undefined);
+    };
+    track.addEventListener("ended", handleEnded);
+    return () => track.removeEventListener("ended", handleEnded);
+  }, [payload?.attempt?.candidateId, payload?.attempt?.examId, payload?.attempt?.id, receipt, session.organization.id]);
+  useEffect(() => {
+    const activeAttemptId = payload?.attempt?.id;
+    const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
+    if (!activeAttemptId || receipt || !stream) return;
+    const handleEnded = (event: Event) => {
+      const track = event.target as MediaStreamTrack;
+      void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+        examId: payload.attempt.examId,
+        candidateId: payload.attempt.candidateId,
+        attemptId: activeAttemptId,
+        type: "camera_permission_lost",
+        occurredAt: new Date().toISOString(),
+        source: "browser",
+        details: {
+          clientWarning: true,
+          cameraState: "disconnected",
+          trackKind: track.kind,
+          reason: "media_track_ended",
+        },
+      }).catch(() => undefined);
+      contextBuffer.current = [];
+      contextUploadEvents.current.clear();
+      setAiStatus("Camera disconnected — reconnect the camera to continue monitoring");
+    };
+    const tracks = stream.getVideoTracks();
+    tracks.forEach((track) => track.addEventListener("ended", handleEnded));
+    return () => tracks.forEach((track) => track.removeEventListener("ended", handleEnded));
+  }, [payload?.attempt?.candidateId, payload?.attempt?.examId, payload?.attempt?.id, receipt, session.organization.id]);
+  useEffect(() => {
     const hasCodingQuestions = Boolean(payload?.questions?.some((item: any) => item.type === "coding"));
     if (payload && left === 0 && !hasCodingQuestions) void submit(true);
   }, [left, payload]);
-  if (!payload) return <ReadinessChecks onStart={start} error={error} />;
+  if (!payload) return <ReadinessChecks onStart={start} error={error} fullscreenRequired={fullscreenRequired} />;
   if (receipt)
     return (
       <div className="card max-w-xl text-center py-14">
         <ShieldCheck className="mx-auto text-emerald-600" />
         <h2 className="mt-4 text-xl font-semibold">{completionStatus === "expired" ? "Time expired" : "Submission received"}</h2>
         <p className="mt-2 text-slate-500">
-          {completionStatus === "expired" ? "Your attempt was closed when the server deadline was reached." : "Your receipt code is "}<b>{receipt}</b>{completionStatus === "expired" ? "" : "."}
+          {payload.exam.isPractice
+            ? completionStatus === "expired"
+              ? "Your practice attempt was closed at the deadline. It is not graded or included in official reports."
+              : `Your practice attempt was submitted. It is not graded or included in official reports. Receipt code: ${receipt}.`
+            : completionStatus === "expired"
+              ? "Your attempt was closed when the server deadline was reached."
+              : "Your receipt code is "}<b>{payload.exam.isPractice || completionStatus === "expired" ? "" : receipt}</b>{payload.exam.isPractice || completionStatus === "expired" ? "" : "."}
         </p>
       </div>
     );
@@ -1115,29 +1578,48 @@ function StudentExam({ session }: { session: Session }) {
           }];
         }),
     );
-    return <CodingExamWorkspace
-      assessment={{ title: payload.exam.title, instructions: payload.exam.instructions, deadlineAt: payload.attempt.deadlineAt }}
-      attemptId={payload.attempt.id}
-      questions={codingQuestions.map((item: any) => ({
-        id: item.id,
-        title: item.coding?.title ?? "Coding problem",
-        description: item.coding?.description ?? item.prompt,
-        difficulty: item.coding?.difficulty ?? "medium",
-        inputFormat: item.coding?.inputFormat,
-        outputFormat: item.coding?.outputFormat,
-        constraints: item.coding?.constraints,
-        explanation: item.coding?.explanation,
-        marks: item.marks,
-        languageIds: item.coding?.languageIds ?? [],
-        starterCode: item.coding?.starterCode ?? {},
-        samples: item.coding?.samples ?? []
-      }))}
-      initialCodes={initialCodes}
-      persistence={codingPersistence}
-      submissionError={error}
-      clockOffsetMs={clockOffset.current}
-      onFinishAssessment={(automatic = false) => submit(automatic)}
-    />;
+    return <div className="relative">
+      {attentionWarning && <div role="alert" className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-3 border-b border-amber-300 bg-amber-100 px-4 py-3 text-sm text-amber-950 shadow-md">
+        <span><b>Attention required.</b> {attentionWarning}</span>
+        <div className="flex items-center gap-3">
+          {!document.fullscreenElement && <button type="button" onClick={() => { void document.documentElement.requestFullscreen?.().catch(() => setAttentionWarning("Fullscreen could not be restored. Continue only after your organizer helps resolve the browser issue.")); }} className="font-semibold underline">Return to fullscreen</button>}
+          <button type="button" onClick={() => setAttentionWarning("")} className="font-semibold">Dismiss</button>
+        </div>
+      </div>}
+      <CodingExamWorkspace
+        assessment={{ title: payload.exam.isPractice ? `${payload.exam.title} — Practice (ungraded)` : payload.exam.title, instructions: payload.exam.instructions, deadlineAt: payload.attempt.deadlineAt }}
+        attemptId={payload.attempt.id}
+        questions={codingQuestions.map((item: any) => ({
+          id: item.id,
+          title: item.coding?.title ?? "Coding problem",
+          description: item.coding?.description ?? item.prompt,
+          difficulty: item.coding?.difficulty ?? "medium",
+          inputFormat: item.coding?.inputFormat,
+          outputFormat: item.coding?.outputFormat,
+          constraints: item.coding?.constraints,
+          explanation: item.coding?.explanation,
+          marks: item.marks,
+          languageIds: item.coding?.languageIds ?? [],
+          starterCode: item.coding?.starterCode ?? {},
+          samples: item.coding?.samples ?? []
+        }))}
+        initialCodes={initialCodes}
+        persistence={codingPersistence}
+        execution={codingExecution}
+        submissionError={error}
+        clockOffsetMs={clockOffset.current}
+        onFinishAssessment={(automatic = false) => submit(automatic)}
+      />
+      {fullscreenLost && <FullscreenLock onRestore={() => { void document.documentElement.requestFullscreen().catch(() => setAttentionWarning("Fullscreen could not be restored. Continue only after your organizer helps resolve the browser issue.")); }} />}
+      {singleWindowBlocked && <div role="alertdialog" aria-modal="true" className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-6">
+        <div className="max-w-md rounded-2xl bg-white p-6 text-center shadow-2xl">
+          <ShieldCheck className="mx-auto text-red-600" size={32} />
+          <h2 className="mt-4 text-xl font-semibold">Single exam-tab lock active</h2>
+          <p className="mt-2 text-sm leading-6 text-slate-600">{singleWindowMessage}</p>
+          <p className="mt-3 text-xs leading-5 text-slate-500">Only one active ExamGuard exam is allowed in this browser profile. Browser security does not let a website close unrelated tabs or apps. The signal is for human review, not an automatic misconduct decision.</p>
+        </div>
+      </div>}
+    </div>;
   }
   const question = payload.questions[current];
   const answered = (id: string) => isAnswered(answers[id]);
@@ -1145,13 +1627,14 @@ function StudentExam({ session }: { session: Session }) {
     <div className="mx-auto max-w-6xl">
       <div className="card mb-5 flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h2 className="font-semibold">{payload.exam.title}</h2>
+          <h2 className="font-semibold">{payload.exam.title} {payload.exam.isPractice && <Badge variant="outline">Practice · ungraded</Badge>}</h2>
+          {payload.exam.isPractice && <p className="text-sm font-medium text-amber-800">Practice mode — this attempt is not graded or included in official reports.</p>}
           <p className="text-sm text-slate-500">{payload.exam.instructions}</p>
         </div>
-        <div className="flex flex-wrap items-center gap-4"><span className="text-xs font-semibold text-slate-600">{pairingLoading ? "Connecting Companion…" : "Companion required"}</span><CompanionStatus attemptId={payload.attempt.id} /><span className="max-w-48 text-right text-xs text-slate-500">{aiStatus}</span><div className="flex flex-col items-end gap-1"><ExamTimer ms={left} /><SyncIndicator online={online} sync={syncSnap} /></div></div>
+        <div className="flex flex-wrap items-center gap-4"><span className="text-xs font-semibold text-slate-600">{pairingLoading ? "Connecting Companion…" : "Companion required"}</span><CompanionStatus attemptId={payload.attempt.id} /><span className="text-xs font-semibold text-emerald-700">One active ExamGuard exam enforced</span><span className="max-w-48 text-right text-xs text-slate-500">{aiStatus}</span><div className="flex flex-col items-end gap-1"><ExamTimer ms={left} /><SyncIndicator online={online} sync={syncSnap} /></div></div>
       </div>
       {error && !reviewing && <p role="alert" className="mb-3 text-sm text-red-600">{error}</p>}
-      {attentionWarning && <div role="alert" className="mb-3 flex items-start justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"><span><b>Attention required.</b> {attentionWarning}</span><button type="button" onClick={() => setAttentionWarning("")} className="font-semibold">Dismiss</button></div>}
+      {attentionWarning && <div role="alert" className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"><span><b>Attention required.</b> {attentionWarning}</span><div className="flex items-center gap-3">{!document.fullscreenElement && <button type="button" onClick={() => { void document.documentElement.requestFullscreen?.().catch(() => setAttentionWarning("Fullscreen could not be restored. Continue only after your organizer helps resolve the browser issue.")); }} className="font-semibold underline">Return to fullscreen</button>}<button type="button" onClick={() => setAttentionWarning("")} className="font-semibold">Dismiss</button></div></div>}
       <div className="grid gap-5 lg:grid-cols-[1fr_250px]">
         <section className="card">
           <div className="flex items-center justify-between gap-3"><p className="font-medium">Question {current + 1} of {payload.questions.length}</p><button type="button" onClick={() => setMarked((items) => ({ ...items, [question.id]: !items[question.id] }))} aria-pressed={Boolean(marked[question.id])} className="text-sm font-semibold text-blue-700">{marked[question.id] ? "Remove review mark" : "Mark for review"}</button></div>
@@ -1170,6 +1653,15 @@ function StudentExam({ session }: { session: Session }) {
       </div>
       <SubmitReviewDialog open={reviewing} onOpenChange={setReviewing} {...examProgress(payload.questions, answers, marked)} sync={syncSnap} online={online} busy={submitBusy} error={error} onJump={setCurrent} onConfirm={() => void submit()} />
       {pairingError && <p role="alert" className="mt-3 text-sm text-red-600">{pairingError}</p>}
+      {fullscreenLost && <FullscreenLock onRestore={() => { void document.documentElement.requestFullscreen().catch(() => setAttentionWarning("Fullscreen could not be restored. Continue only after your organizer helps resolve the browser issue.")); }} />}
+      {singleWindowBlocked && <div role="alertdialog" aria-modal="true" className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-6">
+        <div className="max-w-md rounded-2xl bg-white p-6 text-center shadow-2xl">
+          <ShieldCheck className="mx-auto text-red-600" size={32} />
+          <h2 className="mt-4 text-xl font-semibold">Single exam-tab lock active</h2>
+          <p className="mt-2 text-sm leading-6 text-slate-600">{singleWindowMessage}</p>
+          <p className="mt-3 text-xs leading-5 text-slate-500">Only one active ExamGuard exam is allowed in this browser profile. Browser security does not let a website close unrelated tabs or apps. The signal is for human review, not an automatic misconduct decision.</p>
+        </div>
+      </div>}
     </div>
   );
 }
@@ -1278,9 +1770,13 @@ export function Exams({ session }: { session: Session }) {
                   title: string;
                   status: string;
                   durationMinutes: number;
-                }) => (
-                  <tr className="border-b last:border-0" key={e.id}>
-                    <td className="py-4 font-medium">{e.title}</td>
+                isPractice?: boolean;
+              }) => (
+                <tr className="border-b last:border-0" key={e.id}>
+                  <td className="py-4 font-medium">
+                    {e.title} {e.isPractice && <Badge variant="outline">Practice · ungraded</Badge>}
+                    <CopyableId id={e.id} label="Examination UUID" compact />
+                  </td>
                     <td className="py-4">
                       <span className="rounded-full bg-blue-50 px-2 py-1 text-xs text-blue-700">
                         {e.status}
@@ -1334,8 +1830,8 @@ export function Exams({ session }: { session: Session }) {
       </div>
       <Dialog open={Boolean(assignmentExam)} onOpenChange={(open) => { if (!open) setAssignmentExam(null); }} ariaLabel="Assign assessment">
         {assignmentExam && <DialogContent className="w-[min(100vw-2rem,32rem)]">
-          <div className="flex items-start justify-between gap-4"><div><p className="eyebrow">Assessment delivery</p><h3 className="mt-1 text-lg font-semibold">Assign candidates</h3><p className="mt-1 text-sm text-slate-500">{assignmentExam.title} · {assignmentExam.durationMinutes} minutes</p></div><button type="button" onClick={() => setAssignmentExam(null)} className="rounded-lg px-2 py-1 text-sm font-medium text-slate-500 hover:bg-slate-100">Close</button></div>
-          <div className="mt-5 space-y-2">{candidatesLoading ? <p className="py-6 text-center text-sm text-slate-500">Loading candidates…</p> : candidatesError ? <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">Candidate records could not be loaded. <button type="button" className="ml-1 underline" onClick={() => refetchCandidates()}>Retry</button></div> : candidates.length ? candidates.map((candidate: any) => <label key={candidate.id} className="flex cursor-pointer items-center gap-3 rounded-xl border border-slate-200 p-3 transition hover:border-blue-300 hover:bg-blue-50/40"><Checkbox checked={selectedCandidateIds.includes(candidate.id)} onChange={() => toggleCandidate(candidate.id)} aria-label={`Select ${candidate.name}`} /><span><span className="block text-sm font-semibold">{candidate.name}</span><span className="block text-xs text-slate-500">{candidate.email}</span></span></label>) : <p className="rounded-xl border border-dashed p-5 text-center text-sm text-slate-500">Create a student account before assigning this assessment.</p>}</div>
+          <div className="flex items-start justify-between gap-4"><div><p className="eyebrow">Assessment delivery</p><h3 className="mt-1 text-lg font-semibold">Assign candidates</h3><p className="mt-1 text-sm text-slate-500">{assignmentExam.title} · {assignmentExam.durationMinutes} minutes</p><CopyableId id={assignmentExam.id} label="Examination UUID" compact /></div><button type="button" onClick={() => setAssignmentExam(null)} className="rounded-lg px-2 py-1 text-sm font-medium text-slate-500 hover:bg-slate-100">Close</button></div>
+          <div className="mt-5 space-y-2">{candidatesLoading ? <p className="py-6 text-center text-sm text-slate-500">Loading candidates…</p> : candidatesError ? <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">Candidate records could not be loaded. <button type="button" className="ml-1 underline" onClick={() => refetchCandidates()}>Retry</button></div> : candidates.length ? candidates.map((candidate: any) => <div key={candidate.id} className="rounded-xl border border-slate-200 p-3 transition hover:border-blue-300 hover:bg-blue-50/40"><label className="flex min-w-0 cursor-pointer items-center gap-3"><Checkbox checked={selectedCandidateIds.includes(candidate.id)} onChange={() => toggleCandidate(candidate.id)} aria-label={`Select ${candidate.name}`} /><span className="min-w-0"><span className="block text-sm font-semibold">{candidate.name}</span><span className="block text-xs text-slate-500">{candidate.email}</span></span></label><div className="mt-2 border-t border-slate-100 pt-2"><CopyableId id={candidate.id} label="Candidate UUID" compact /></div></div>) : <p className="rounded-xl border border-dashed p-5 text-center text-sm text-slate-500">Create a student account before assigning this assessment.</p>}</div>
           {assignmentError && <p role="alert" className="mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{assignmentError}</p>}
           {assignmentNotice && <p className="mt-4 rounded-lg bg-emerald-50 p-3 text-sm text-emerald-700">{assignmentNotice}</p>}
           <div className="mt-6 flex justify-end gap-3"><button type="button" onClick={() => setAssignmentExam(null)} className="rounded-lg px-4 py-2.5 text-sm font-semibold text-slate-600 hover:bg-slate-100">Cancel</button><button type="button" disabled={assigning || !candidates.length} onClick={assignSelected} className="button">{assigning ? "Assigning…" : `Assign selected (${selectedCandidateIds.length})`}</button></div>
@@ -1425,7 +1921,7 @@ function Reports({ session }: { session: Session }) {
           <table className="w-full text-left text-sm">
             <thead className="border-b text-slate-500">
               <tr>
-                <th className="pb-2">Candidate</th>
+                <th className="pb-2">Candidate / UUID</th>
                 <th className="pb-2">Score</th>
                 <th className="pb-2">Status</th>
               </tr>
@@ -1443,7 +1939,7 @@ function Reports({ session }: { session: Session }) {
                     i: number,
                   ) => (
                     <tr className="border-b" key={`${g.candidateId}-${i}`}>
-                      <td className="py-3">{g.candidateId}</td>
+                      <td className="py-3"><CopyableId id={g.candidateId} label="Candidate UUID" compact /></td>
                       <td>
                         {g.totalMarks}/{g.maxMarks}
                       </td>
@@ -1544,7 +2040,7 @@ function Candidates({ session }: { session: Session }) {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [selectedCandidateId, setSelectedCandidateId] = useState("");
-  const [verificationRejectOpen, setVerificationRejectOpen] = useState(false);
+  const [applicationRejectOpen, setApplicationRejectOpen] = useState(false);
   const { data: candidateDetails, isLoading: detailsLoading, refetch: refetchCandidateDetails } = useQuery({
     queryKey: ["candidate-details", session.organization.id, selectedCandidateId],
     enabled: Boolean(selectedCandidateId),
@@ -1579,30 +2075,45 @@ function Candidates({ session }: { session: Session }) {
       setError(axios.isAxiosError(e) ? (e.response?.data?.error ?? "Could not assign this assessment.") : "Could not assign this assessment.");
     }
   };
-  const reviewVerification = async (approved: boolean, reason: string): Promise<boolean> => {
+  const reviewStudentApplication = async (approved: boolean, reason: string): Promise<boolean> => {
     const verificationId = candidateDetails?.verification?.id;
     if (!verificationId) return false;
     setError("");
     try {
-      await api.post(`/api/organizations/${session.organization.id}/verifications/${verificationId}/review`, { action: approved ? "approve" : "reject", reason });
-      setNotice(approved ? "Identity verification approved." : "Identity verification rejected with the supplied reason.");
+      await api.post(`/api/organizations/${session.organization.id}/student-applications/${verificationId}/decision`, { action: approved ? "approve" : "reject", reason });
+      setNotice(approved ? "Student application approved." : "Student application rejected.");
       await refetchCandidateDetails();
       return true;
     } catch (requestError) {
-      setError(axios.isAxiosError(requestError) ? (requestError.response?.data?.error ?? "Could not review identity verification.") : "Could not review identity verification.");
+      setError(axios.isAxiosError(requestError) ? (requestError.response?.data?.error ?? "Could not review the student application.") : "Could not review the student application.");
       return false;
     }
   };
-  const requestVerificationReview = (approved: boolean) => {
-    if (approved) void reviewVerification(true, "Approved by institute review");
-    else setVerificationRejectOpen(true);
+  const openStudentIdDocument = async () => {
+    const verificationId = candidateDetails?.verification?.id;
+    if (!verificationId) return;
+    const tab = window.open("about:blank", "_blank");
+    if (!tab) return setError("Allow pop-ups to view the private student ID document.");
+    tab.opener = null;
+    setError("");
+    try {
+      const { data } = await api.get<{ url: string }>(`/api/organizations/${session.organization.id}/student-applications/${verificationId}/documents/idDocument`);
+      tab.location.replace(data.url);
+    } catch (requestError) {
+      tab.close();
+      setError(axios.isAxiosError(requestError) ? requestError.response?.data?.error ?? "The student ID document could not be opened." : "The student ID document could not be opened.");
+    }
+  };
+  const requestApplicationDecision = (approved: boolean) => {
+    if (approved) void reviewStudentApplication(true, "Approved by institute review");
+    else setApplicationRejectOpen(true);
   };
   return (
     <div className="grid gap-5 xl:grid-cols-[320px_minmax(0,1fr)_340px]">
       {canManage ? <CandidateCreateForm onCreate={add} error={error} notice={notice} /> : <section className="card h-fit"><p className="eyebrow">Candidate directory</p><h2 className="mt-1 font-semibold">Read-only access</h2><p className="mt-2 text-sm leading-6 text-slate-500">Your role can inspect candidate records but cannot create accounts or assign assessments.</p></section>}
       <div className="card min-w-0 overflow-hidden">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div><h2 className="font-semibold">Candidates</h2><p className="mt-1 text-sm text-slate-500">Select a candidate to see assignments, verification and result status.</p></div>
+          <div><h2 className="font-semibold">Candidates</h2><p className="mt-1 text-sm text-slate-500">Select a candidate to see application, assessment and result status.</p></div>
           <span className="w-fit rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">{pagination ? `${pagination.totalCount} total` : "Total unavailable"}</span>
         </div>
         <div className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_150px_150px]">
@@ -1622,15 +2133,15 @@ function Candidates({ session }: { session: Session }) {
         </div>
         <div className="mt-3">
           <Table>
-            <TableHeader><TableRow><TableHead>Name</TableHead><TableHead>Email</TableHead><TableHead>Email status</TableHead><TableHead>Account</TableHead><TableHead>Action</TableHead></TableRow></TableHeader>
+            <TableHeader><TableRow><TableHead>Name</TableHead><TableHead>Email</TableHead><TableHead>Application</TableHead><TableHead>Account</TableHead><TableHead>Action</TableHead></TableRow></TableHeader>
             <TableBody>
               {candidatesLoading ? <TableRow><TableCell colSpan={5} className="py-10 text-center text-stone-500">Loading candidates…</TableCell></TableRow>
               : candidatesError ? <TableRow><TableCell colSpan={5} className="py-10 text-center text-red-700">Candidate records could not be loaded. <button type="button" className="ml-2 underline" onClick={() => refetch()}>Retry</button></TableCell></TableRow>
-              : data.length ? data.map((candidate: { id: string; name: string; email: string; emailVerifiedAt?: string; userId?: string }) => (
+              : data.length ? data.map((candidate: { id: string; name: string; email: string; verificationStatus?: string; userId?: string }) => (
                 <TableRow key={candidate.id}>
-                  <TableCell className="font-semibold text-stone-900">{candidate.name}</TableCell>
+                  <TableCell className="font-semibold text-stone-900">{candidate.name}<CopyableId id={candidate.id} label="Candidate UUID" compact /></TableCell>
                   <TableCell>{candidate.email}</TableCell>
-                  <TableCell><Badge variant={candidate.emailVerifiedAt ? "success" : "muted"}>{candidate.emailVerifiedAt ? "Verified" : "Not verified"}</Badge></TableCell>
+                  <TableCell><Badge variant={candidate.verificationStatus === "approved" ? "success" : candidate.verificationStatus === "submitted" ? "warning" : candidate.verificationStatus === "rejected" ? "danger" : "muted"}>{(candidate.verificationStatus ?? "not_submitted").replaceAll("_", " ")}</Badge></TableCell>
                   <TableCell><Badge variant={candidate.userId ? "success" : "muted"}>{candidate.userId ? "Linked" : "Not linked"}</Badge></TableCell>
                   <TableCell><Button variant="ghost" size="sm" onClick={() => setSelectedCandidateId(candidate.id)}>View details</Button></TableCell>
                 </TableRow>
@@ -1650,153 +2161,43 @@ function Candidates({ session }: { session: Session }) {
         </div>
       </div>
       <aside className="card h-fit xl:sticky xl:top-6">
-        {!selectedCandidateId ? <div className="py-10 text-center"><Users className="mx-auto text-blue-600" size={28}/><h2 className="mt-3 font-semibold">Candidate details</h2><p className="mt-2 text-sm leading-6 text-slate-500">Choose a candidate to inspect their real account, assessment and result details.</p></div> : detailsLoading ? <div className="h-72 animate-pulse rounded-xl bg-slate-100" /> : candidateDetails ? <CandidateDetails details={candidateDetails} exams={availableExams} onAssign={assignAssessment} onReview={requestVerificationReview} canReview={canReviewVerifications(session.role)} canAssign={canManage} onClose={() => setSelectedCandidateId("")} /> : <p className="text-sm text-red-600">Candidate details could not be loaded.</p>}
+        {!selectedCandidateId ? <div className="py-10 text-center"><Users className="mx-auto text-blue-600" size={28}/><h2 className="mt-3 font-semibold">Candidate details</h2><p className="mt-2 text-sm leading-6 text-slate-500">Choose a candidate to inspect their real account, assessment and result details.</p></div> : detailsLoading ? <div className="h-72 animate-pulse rounded-xl bg-slate-100" /> : candidateDetails ? <CandidateDetails details={candidateDetails} exams={availableExams} onAssign={assignAssessment} onReview={requestApplicationDecision} onOpenIdDocument={openStudentIdDocument} canReview={session.role === "institute_admin"} canAssign={canManage} onClose={() => setSelectedCandidateId("")} /> : <p className="text-sm text-red-600">Candidate details could not be loaded.</p>}
       </aside>
       <ReasonDialog
-        open={verificationRejectOpen}
-        title="Reject identity verification"
+        open={applicationRejectOpen}
+        title="Reject student application"
         maxLength={1000}
-        description="Explain what needs correction so the candidate can respond. The decision is recorded for authorized reviewers."
-        submitLabel="Reject verification"
-        onCancel={() => setVerificationRejectOpen(false)}
+        description="Provide a reason for rejecting this student application."
+        submitLabel="Reject application"
+        onCancel={() => setApplicationRejectOpen(false)}
         onSubmit={async (reason) => {
-          const saved = await reviewVerification(false, reason);
-          if (saved) setVerificationRejectOpen(false);
+          const saved = await reviewStudentApplication(false, reason);
+          if (saved) setApplicationRejectOpen(false);
           return saved;
         }}
       />
     </div>
   );
 }
-function CandidateDetails({ details, exams, onAssign, onReview, canReview, canAssign, onClose }: { details: any; exams: any[]; onAssign: (examId: string) => void; onReview: (approved: boolean) => void; canReview: boolean; canAssign: boolean; onClose: () => void }) {
+function CandidateDetails({ details, exams, onAssign, onReview, onOpenIdDocument, canReview, canAssign, onClose }: { details: any; exams: any[]; onAssign: (examId: string) => void; onReview: (approved: boolean) => void; onOpenIdDocument: () => void; canReview: boolean; canAssign: boolean; onClose: () => void }) {
   const c = details.candidate;
+  const hasIdentityDocument = Boolean(details.verification.hasIdentityDocument);
   const assignedIds = new Set(details.assessments.map((item: any) => String(item.exam?.id)));
   const assignable = exams.filter((exam) => ["published", "scheduled", "live"].includes(exam.status) && !assignedIds.has(String(exam.id)));
-  return <div><div className="flex items-start justify-between gap-3"><div><p className="eyebrow">Candidate profile</p><h2 className="mt-1 text-lg font-semibold">{c.name}</h2></div><button type="button" onClick={onClose} className="text-sm font-semibold text-slate-500 hover:text-slate-900">Close</button></div><dl className="mt-5 space-y-3 text-sm"><div><dt className="text-slate-500">Email</dt><dd className="mt-1 break-all font-medium">{c.email}</dd></div><div className="grid grid-cols-2 gap-3"><div><dt className="text-slate-500">Email status</dt><dd className="mt-1 font-medium">{c.emailVerifiedAt ? "Verified" : "Not verified"}</dd></div><div><dt className="text-slate-500">Exam account</dt><dd className="mt-1 font-medium">{c.accountLinked ? "Linked" : "Not linked"}</dd></div></div><div><dt className="text-slate-500">Identity verification</dt><dd className="mt-1 font-medium capitalize">{String(details.verification.status).replaceAll("_", " ")}</dd>{canReview && ["submitted", "resubmission_required"].includes(details.verification.status) && <div className="mt-3 flex gap-3"><button type="button" onClick={() => onReview(true)} className="text-sm font-semibold text-emerald-700">Approve identity</button><button type="button" onClick={() => onReview(false)} className="text-sm font-semibold text-red-700">Reject</button></div>}</div>{c.externalId && <div><dt className="text-slate-500">Candidate ID</dt><dd className="mt-1 font-medium">{c.externalId}</dd></div>}</dl><div className="mt-6 border-t pt-5"><h3 className="font-semibold">Assign an assessment</h3>{!canAssign ? <p className="mt-2 text-sm text-slate-500">Assessment assignment is restricted to institute administrators and teachers.</p> : assignable.length ? <div className="mt-3 space-y-2">{assignable.map((exam) => <button type="button" key={exam.id} onClick={() => onAssign(exam.id)} className="flex w-full items-center justify-between rounded-xl border border-blue-100 bg-blue-50 p-3 text-left text-sm hover:border-blue-300"><span><b className="block text-slate-900">{exam.title}</b><span className="text-slate-600">{exam.durationMinutes} minutes · {exam.status}</span></span><span className="font-semibold text-blue-700">Assign</span></button>)}</div> : <p className="mt-2 text-sm text-slate-500">No unassigned published assessments are available.</p>}<h3 className="mt-6 font-semibold">Assigned assessments</h3><div className="mt-3 space-y-3">{details.assessments.length ? details.assessments.map((item: any, index: number) => <article key={index} className="rounded-xl border border-slate-200 p-3 text-sm"><p className="font-medium">{item.exam?.title ?? "Assessment unavailable"}</p><p className="mt-1 capitalize text-slate-500">{item.attempt?.status?.replaceAll("_", " ") ?? "Assigned — not started"}</p>{item.attempt?.receiptCode && <p className="mt-1 text-xs text-slate-500">Receipt: {item.attempt.receiptCode}</p>}{item.grade && <p className="mt-2 font-semibold text-emerald-700">Score: {item.grade.totalMarks}/{item.grade.maxMarks} · {item.grade.status}</p>}</article>) : <p className="text-sm text-slate-500">No assessments assigned yet.</p>}</div></div></div>;
-}
-function Verification({ session }: { session: Session }) {
-  const {
-    data = [],
-    isLoading,
-    isError,
-    refetch,
-  } = useQuery({
-    queryKey: ["verification", session.organization.id],
-    queryFn: () =>
-      api
-        .get(`/api/organizations/${session.organization.id}/verifications`)
-        .then((r) => r.data),
-  });
-  const canReview = canReviewVerifications(session.role);
-  const [reviewError, setReviewError] = useState("");
-  const [reviewingId, setReviewingId] = useState("");
-  const [rejectionTarget, setRejectionTarget] = useState<string | null>(null);
-  const review = async (id: string, action: "approve" | "reject" | "request_more_information", reason: string): Promise<boolean> => {
-    if (!canReview) return false;
-    setReviewError("");
-    setReviewingId(id);
-    try {
-      await api.post(
-        `/api/organizations/${session.organization.id}/verifications/${id}/review`,
-        { action, reason },
-      );
-      await refetch();
-      return true;
-    } catch (error) {
-      setReviewError(axios.isAxiosError(error) ? (error.response?.data?.error ?? "The verification decision could not be saved.") : "The verification decision could not be saved.");
-      return false;
-    } finally {
-      setReviewingId("");
-    }
-  };
-  if (isLoading)
-    return <div className="h-48 animate-pulse rounded-2xl bg-slate-200" />;
-  if (isError)
-    return <div className="card"><p role="alert" className="text-sm text-red-700">Verification requests could not be loaded.</p><button type="button" className="button mt-4" onClick={() => refetch()}>Retry</button></div>;
-  return (
-    <div className="card overflow-x-auto">
-      <h2 className="font-semibold">Verification center</h2>
-      <p className="mt-1 text-sm text-slate-500">
-        {canReview ? "Review submitted identity evidence. Documents remain private." : "Read-only review queue. Your role can inspect verification status but cannot approve or reject requests."}
-      </p>
-      {reviewError && <p role="alert" className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-800">{reviewError}</p>}
-      <table className="mt-5 w-full text-left text-sm">
-        <thead className="border-b text-slate-500">
-          <tr>
-            <th className="pb-2">Candidate</th>
-            <th className="pb-2">Status</th>
-            <th className="pb-2">Decision</th>
-          </tr>
-        </thead>
-        <tbody>
-          {data.length ? (
-            data.map((v: any) => (
-              <tr className="border-b" key={v.id}>
-                <td className="py-3">
-                  {v.candidateId?.name ?? "Candidate"}
-                  <span className="block text-xs text-slate-500">
-                    {v.candidateId?.email}
-                  </span>
-                </td>
-                <td>{v.status}</td>
-                <td className="space-x-2">
-                  {(v.profilePhoto || v.idDocument) && <span className="mr-2 inline-flex gap-2">
-                    {v.profilePhoto && <button type="button" className="text-blue-700 underline" onClick={async () => { const response = await api.get(`/api/organizations/${session.organization.id}/verifications/${v.id}/document/photo`, { responseType: "blob" }); const url = URL.createObjectURL(response.data); window.open(url, "_blank", "noopener,noreferrer"); }}>View selfie</button>}
-                    {v.idDocument && <button type="button" className="text-blue-700 underline" onClick={async () => { const response = await api.get(`/api/organizations/${session.organization.id}/verifications/${v.id}/document/idDocument`, { responseType: "blob" }); const url = URL.createObjectURL(response.data); window.open(url, "_blank", "noopener,noreferrer"); }}>View document</button>}
-                  </span>}
-                  {canReview && ["submitted", "resubmission_required"].includes(
-                    v.status,
-                  ) && (
-                    <>
-                      <button
-                        type="button"
-                        disabled={reviewingId === v.id}
-                        onClick={() => void review(v.id, "approve", "Approved after review")}
-                        className="text-emerald-700 disabled:opacity-50"
-                      >
-                        Approve
-                      </button>
-                      <button
-                        type="button"
-                        disabled={reviewingId === v.id}
-                        onClick={() => setRejectionTarget(v.id)}
-                        className="text-red-700 disabled:opacity-50"
-                      >
-                        Reject
-                      </button>
-                      <button type="button" disabled={reviewingId === v.id} onClick={() => void review(v.id, "request_more_information", "Please upload clearer or additional identity evidence.")} className="text-amber-700 disabled:opacity-50">Request more information</button>
-                    </>
-                  )}
-                </td>
-              </tr>
-            ))
-          ) : (
-            <tr>
-              <td colSpan={3} className="py-10 text-center text-slate-500">
-                No verification requests.
-              </td>
-            </tr>
-          )}
-        </tbody>
-      </table>
-      <ReasonDialog
-        open={Boolean(rejectionTarget)}
-        title="Reject identity verification"
-        maxLength={1000}
-        description="Provide a clear reason so the candidate understands what must be corrected. This decision is recorded for authorized reviewers."
-        submitLabel="Reject verification"
-        onCancel={() => setRejectionTarget(null)}
-        onSubmit={async (reason) => {
-          if (!rejectionTarget) return false;
-          const saved = await review(rejectionTarget, false, reason);
-          if (saved) setRejectionTarget(null);
-          return saved;
-        }}
-      />
+  return <div>
+    <div className="flex items-start justify-between gap-3"><div><p className="eyebrow">Candidate profile</p><h2 className="mt-1 text-lg font-semibold">{c.name}</h2><CopyableId id={c.id} label="Candidate UUID" /></div><button type="button" onClick={onClose} className="text-sm font-semibold text-slate-500 hover:text-slate-900">Close</button></div>
+    <dl className="mt-5 space-y-3 text-sm">
+      <div><dt className="text-slate-500">Email</dt><dd className="mt-1 break-all font-medium">{c.email}</dd></div>
+      <div className="grid grid-cols-2 gap-3"><div><dt className="text-slate-500">Signup application</dt><dd className="mt-1 font-medium capitalize">{String(details.verification.status).replaceAll("_", " ")}</dd></div><div><dt className="text-slate-500">Exam account</dt><dd className="mt-1 font-medium">{c.accountLinked ? "Linked" : "Not linked"}</dd></div></div>
+      {canReview && <div><dt className="text-slate-500">Government ID proof</dt><dd className="mt-1">{hasIdentityDocument ? <button type="button" onClick={onOpenIdDocument} className="font-semibold text-blue-700 underline">View private ID proof</button> : <span className="text-amber-700">Not submitted</span>}</dd></div>}
+      {canReview && details.verification.status === "submitted" && <div className="flex gap-3">{hasIdentityDocument ? <button type="button" onClick={() => onReview(true)} className="text-sm font-semibold text-emerald-700">Approve application</button> : <span className="text-sm text-amber-700">ID proof is required before approval.</span>}<button type="button" onClick={() => onReview(false)} className="text-sm font-semibold text-red-700">Reject application</button></div>}
+      {c.externalId && <div><dt className="text-slate-500">Institution-provided candidate ID</dt><dd className="mt-1 font-medium">{c.externalId}</dd></div>}
+    </dl>
+    <div className="mt-6 border-t pt-5"><h3 className="font-semibold">Assign an assessment</h3>{!canAssign ? <p className="mt-2 text-sm text-slate-500">Assessment assignment is restricted to institute administrators and teachers.</p> : assignable.length ? <div className="mt-3 space-y-2">{assignable.map((exam) => <div key={exam.id} className="flex items-center justify-between gap-3 rounded-xl border border-blue-100 bg-blue-50 p-3 text-sm"><div className="min-w-0"><b className="block text-slate-900">{exam.title}</b><span className="text-slate-600">{exam.durationMinutes} minutes · {exam.status}</span></div><button type="button" onClick={() => onAssign(exam.id)} className="shrink-0 font-semibold text-blue-700">Assign</button></div>)}</div> : <p className="mt-2 text-sm text-slate-500">No unassigned published assessments are available.</p>}
+      <h3 className="mt-6 font-semibold">Assigned assessments</h3><div className="mt-3 space-y-3">{details.assessments.length ? details.assessments.map((item: any, index: number) => <article key={index} className="rounded-xl border border-slate-200 p-3 text-sm"><p className="font-medium">{item.exam?.title ?? "Assessment unavailable"}</p>{item.exam?.id && <CopyableId id={item.exam.id} label="Examination UUID" compact />}<p className="mt-1 capitalize text-slate-500">{item.attempt?.status?.replaceAll("_", " ") ?? "Assigned — not started"}</p>{item.attempt?.id && <CopyableId id={item.attempt.id} label="Attempt UUID" compact />}{item.attempt?.receiptCode && <p className="mt-1 text-xs text-slate-500">Receipt: {item.attempt.receiptCode}</p>}{item.grade && <p className="mt-2 font-semibold text-emerald-700">Score: {item.grade.totalMarks}/{item.grade.maxMarks} · {item.grade.status}</p>}</article>) : <p className="text-sm text-slate-500">No assessments assigned yet.</p>}</div>
     </div>
-  );
+  </div>;
 }
-
 function Incidents({ session }: { session: Session }) {
   const [selected, setSelected] = useState<any>(null);
   const [searchParams, setSearchParams] = useSearchParams();
@@ -1817,6 +2218,34 @@ function Incidents({ session }: { session: Session }) {
   const eventType = searchParams.get("eventType") ?? "";
   const from = searchParams.get("from") ?? "";
   const to = searchParams.get("to") ?? "";
+  const [liveUpdatesStatus, setLiveUpdatesStatus] = useState("Enter an examination UUID to enable live updates.");
+
+  useEffect(() => {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(examId)) {
+      setLiveUpdatesStatus("Enter an examination UUID to enable live updates.");
+      return;
+    }
+
+    setLiveUpdatesStatus("Connecting to live exam updates…");
+    const socket = io(api.defaults.baseURL || window.location.origin, {
+      auth: { token: session.token },
+      transports: ["websocket", "polling"],
+    });
+    socket.on("connect", () => {
+      socket.emit("join-exam", { organizationId: session.organization.id, examId });
+    });
+    socket.on("subscription_ready", () => setLiveUpdatesStatus("Live updates connected for this exam."));
+    socket.on("subscription_error", (message: { error?: string }) => {
+      setLiveUpdatesStatus(message.error || "Live updates are not authorized for this exam.");
+    });
+    socket.on("connect_error", () => setLiveUpdatesStatus("Live updates unavailable; reconnecting…"));
+    socket.on("disconnect", () => setLiveUpdatesStatus("Live updates disconnected; reconnecting…"));
+    socket.on("proctoring_incident", () => {
+      void queryClient.invalidateQueries({ queryKey: ["incidents", session.organization.id] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", session.organization.id] });
+    });
+    return () => socket.disconnect();
+  }, [examId, session.organization.id, session.token]);
 
   const updateListParams = (
     changes: Record<string, string | null>,
@@ -2026,6 +2455,7 @@ function Incidents({ session }: { session: Session }) {
             : "Total unavailable"}
         </span>
       </div>
+      <p className="mt-3 text-xs text-slate-500" role="status">{liveUpdatesStatus}</p>
 
       {/* Incident filters */}
       <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
@@ -2070,6 +2500,7 @@ function Incidents({ session }: { session: Session }) {
 
         <label className="text-xs font-semibold text-slate-600">
           Candidate ID
+          <span className="mt-1 block font-normal text-slate-500">Copy the Candidate UUID from the Candidates list or a review record.</span>
 
           <input
             value={candidateId}
@@ -2086,6 +2517,7 @@ function Incidents({ session }: { session: Session }) {
 
         <label className="text-xs font-semibold text-slate-600">
           Examination ID
+          <span className="mt-1 block font-normal text-slate-500">Copy the Examination UUID from the Examinations list or a review record.</span>
 
           <input
             value={examId}
@@ -2234,6 +2666,8 @@ function Incidents({ session }: { session: Session }) {
                     signal && typeof signal === "object",
                 )
               : [];
+            const incidentCandidate = i.candidateId && typeof i.candidateId === "object" ? i.candidateId : null;
+            const incidentExam = i.examId && typeof i.examId === "object" ? i.examId : null;
 
             return (
               <article
@@ -2252,6 +2686,11 @@ function Incidents({ session }: { session: Session }) {
                 <p className="mt-2 text-sm text-slate-600">
                   {i.details ?? "No additional incident details provided."}
                 </p>
+
+                <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                  {incidentCandidate?.id && <div><p className="mb-1 text-xs font-medium text-slate-500">{incidentCandidate.name ?? "Candidate"}</p><CopyableId id={incidentCandidate.id} label="Candidate UUID" compact /></div>}
+                  {incidentExam?.id && <div><p className="mb-1 text-xs font-medium text-slate-500">{incidentExam.title ?? "Examination"}</p><CopyableId id={incidentExam.id} label="Examination UUID" compact /></div>}
+                </div>
 
                 <div className="mt-4 grid gap-3 md:grid-cols-[220px_1fr]">
                   <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50 p-2">
@@ -2453,6 +2892,11 @@ function Incidents({ session }: { session: Session }) {
                   {selected.candidateId?.name ?? "Candidate"} ·{" "}
                   {selected.examId?.title ?? "Assessment"}
                 </p>
+                <div className="mt-3 space-y-2">
+                  {selected.candidateId?.id && <CopyableId id={selected.candidateId.id} label="Candidate UUID" />}
+                  {selected.examId?.id && <CopyableId id={selected.examId.id} label="Examination UUID" />}
+                  {selected.id && <CopyableId id={selected.id} label="Incident UUID" />}
+                </div>
               </div>
 
               <button
@@ -2533,103 +2977,6 @@ function Incidents({ session }: { session: Session }) {
   );
 }
 
-function Monitoring({ session }: { session: Session }) {
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
-    queryKey: ["monitoring", session.organization.id],
-    queryFn: () =>
-      Promise.all([
-        api.get("/api/system/status"),
-        api.get(
-          `/api/organizations/${session.organization.id}/radio-observations`,
-        ),
-      ]).then(([status, radio]) => ({
-        status: status.data,
-        radio: radio.data,
-      })),
-    refetchInterval: 30000,
-  });
-  if (isLoading)
-    return <div className="h-40 animate-pulse rounded-2xl bg-slate-200" />;
-  if (isError) return <div className="card text-center"><AlertTriangle className="mx-auto text-amber-600" size={28}/><h2 className="mt-3 font-semibold">Monitoring data is temporarily unavailable</h2><p className="mt-1 text-sm text-slate-500">The application could not load the current service or companion review status.</p><button type="button" onClick={() => refetch()} className="button mt-5">Retry</button></div>;
-  const observations = data.radio.observations ?? [];
-  const signals = data.radio.signals ?? [];
-  const statusHelp: Record<string, string> = { healthy: "The ExamGuard API is responding.", configured_not_verified: "Credentials exist; verify the service before using it in an exam.", unconfigured: "No credentials are configured in this environment.", unavailable_no_adapter: "Email delivery adapter is not configured." };
-  const statusLabel: Record<string, string> = { healthy: "Operational", configured_not_verified: "Configuration pending verification", unconfigured: "Setup required", unavailable_no_adapter: "Setup required" };
-  return (
-    <div className="space-y-5">
-      <div className="card">
-        <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="eyebrow">Operations</p><h2 className="mt-1 font-semibold">Monitoring readiness</h2><p className="mt-1 text-sm text-slate-500">Service configuration is not a claim that hardware scanning is active.</p></div><button type="button" onClick={() => refetch()} disabled={isFetching} className="text-sm font-semibold text-blue-700 disabled:text-slate-400">{isFetching ? "Refreshing…" : "Refresh status"}</button></div>
-        <div className="mt-5 grid gap-3 sm:grid-cols-2">
-          {Object.entries(data.status).map(([name, status]) => (
-            <div key={name} className="rounded-xl border border-slate-100 bg-slate-50/80 p-4">
-              <p className="text-sm capitalize text-slate-500">
-                {name.replace(/([A-Z])/g, " $1")}
-              </p>
-              <p className={`mt-1 font-medium ${status === "healthy" ? "text-emerald-700" : status === "unconfigured" || String(status).startsWith("unavailable") ? "text-amber-700" : "text-slate-800"}`}>{statusLabel[String(status)] ?? String(status).replaceAll("_", " ")}</p>
-              <p className="mt-1 text-xs leading-5 text-slate-500">{statusHelp[String(status)] ?? "Current service status reported by the server."}</p>
-            </div>
-          ))}
-        </div>
-      </div>
-      <div className="card">
-        <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="eyebrow">Consent-based signals</p><h2 className="mt-1 font-semibold">Radio observation review</h2></div><span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">{observations.length} observations · {signals.length} indicators</span></div>
-        <p className="mt-1 text-sm text-slate-500">
-          BLE and Wi-Fi observations are evidence for human review only; they do
-          not identify a phone or determine misconduct.
-        </p>
-        <div className="mt-5 grid gap-4 sm:grid-cols-2">
-          <div>
-            <h3 className="text-sm font-semibold">
-              Recent observations ({observations.length})
-            </h3>
-            <div className="mt-2 space-y-2">
-              {observations.length ? (
-                observations.slice(0, 8).map((o: any) => (
-                  <div className="rounded-lg border p-3 text-sm" key={o.id}>
-                    <b>{o.source.replace("_", " ")}</b> ·{" "}
-                    {o.kind.replace("_", " ")}{" "}
-                    {typeof o.rssi === "number" && ` · ${o.rssi} dBm`}
-                    <span className="mt-1 block text-xs text-slate-500">
-                      {new Date(o.observedAt).toLocaleString()} ·{" "}
-                      {o.scannerStatus}
-                    </span>
-                  </div>
-                ))
-              ) : (
-                <p className="rounded-lg border border-dashed p-5 text-sm text-slate-500">
-                  No observations have been received from a consented companion
-                  session.
-                </p>
-              )}
-            </div>
-          </div>
-          <div>
-            <h3 className="text-sm font-semibold">
-              Review indicators ({signals.length})
-            </h3>
-            <div className="mt-2 space-y-2">
-              {signals.length ? (
-                signals.map((s: any) => (
-                  <div className="rounded-lg border p-3 text-sm" key={s.id}>
-                    <b>{s.label}</b>
-                    <span className="mt-1 block text-xs text-slate-500">
-                      {s.status.replaceAll("_", " ")} · {s.rule}
-                    </span>
-                  </div>
-                ))
-              ) : (
-                <p className="rounded-lg border border-dashed p-5 text-sm text-slate-500">
-                  No repeated-observation indicators require review.
-                </p>
-              )}
-            </div>
-          </div>
-        </div>
-        {!observations.length && <div className="mt-5 rounded-xl border border-blue-100 bg-blue-50/60 p-4 text-sm leading-6 text-slate-600"><b className="text-slate-800">How to activate companion monitoring:</b> the student starts an assessment after the locally installed Windows Companion is running. ExamGuard authenticates the active attempt and connects the Companion automatically after the student accepts monitoring consent. No manual token entry is required.</div>}
-      </div>
-    </div>
-  );
-}
 function OrganizationSettings({ session }: { session: Session }) {
   const isAdministrator = session.role === "institute_admin";
   const errorSummaryRef = useRef<HTMLDivElement>(null);
@@ -2743,44 +3090,82 @@ function LoginChoice({ onSave }: { onSave: (session: Session) => void }) {
     }
   }, [navigate, onSave]);
   return (
-    <main className="min-h-screen bg-slate-50 px-5 py-10 text-slate-900">
-      <div className="mx-auto max-w-4xl">
-        <button onClick={() => navigate("/")} className="flex items-center gap-2 font-bold">
-          <span className="rounded-lg bg-blue-600 p-2 text-white"><ShieldCheck size={18} /></span>
-          ExamGuard
-        </button>
-        <section className="mt-12 rounded-3xl border border-slate-200 bg-white p-7 shadow-xl shadow-slate-200/60 md:p-10">
-          <p className="eyebrow">Secure access</p>
-          <h1 className="mt-2 text-3xl font-bold tracking-tight">Choose your workspace</h1>
-          <p className="mt-3 max-w-2xl text-slate-600">Students take assigned assessments in a focused workspace. Institute teams manage candidates, assessments and results separately.</p>
-          {sessionExpired && <p role="alert" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">Your session expired. Sign in again to continue.</p>}
-          {oauthError && <p role="alert" className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">{oauthError}</p>}
-          <div className="mt-8 grid gap-5 md:grid-cols-2">
-            <button onClick={() => navigate("/student/login")} className="rounded-2xl border border-blue-200 bg-blue-50 p-6 text-left transition hover:-translate-y-0.5 hover:border-blue-400 hover:shadow-md">
+    <main className="min-h-screen bg-slate-50 px-4 py-6 text-slate-900 sm:px-6 sm:py-9">
+      <div className="mx-auto max-w-7xl">
+        <header className="flex items-center justify-between gap-4">
+          <button onClick={() => navigate("/")} className="flex items-center gap-3 rounded-xl font-bold tracking-tight focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-blue-600">
+            <span className="rounded-xl bg-slate-950 p-2.5 text-cyan-300 shadow-sm"><ShieldCheck size={20} /></span>
+            <span className="text-lg">ExamGuard</span>
+          </button>
+          <span className="hidden items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 sm:inline-flex">
+            <span className="h-2 w-2 rounded-full bg-emerald-500" /> Secure assessment platform
+          </span>
+        </header>
+        <section className="mt-7 overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-xl shadow-slate-200/70">
+          <div className="grid gap-8 bg-slate-950 px-6 py-9 text-white md:grid-cols-[minmax(0,1fr)_auto] md:items-end md:px-10 md:py-12">
+            <div>
+              <p className="text-xs font-bold uppercase tracking-[0.2em] text-cyan-300">Secure access · role-based workspaces</p>
+              <h1 className="mt-3 text-3xl font-semibold tracking-tight sm:text-4xl">Welcome to ExamGuard</h1>
+              <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-300">Choose a workspace to continue. Your account permissions determine which assessments, people, and platform tools you can access.</p>
+            </div>
+            <div className="hidden rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300 md:block">
+              <div className="flex items-center gap-2 font-semibold text-white"><ShieldCheck size={17} className="text-cyan-300" /> Protected sign-in</div>
+              <p className="mt-1 text-xs">Every workspace uses your assigned role.</p>
+            </div>
+          </div>
+          <div className="p-5 sm:p-8 lg:p-10">
+          {sessionExpired && <p role="alert" className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">Your session expired. Sign in again to continue.</p>}
+          {oauthError && <p role="alert" className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">{oauthError}</p>}
+          <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
+            <div><p className="text-xs font-bold uppercase tracking-wider text-slate-500">Choose a workspace</p><p className="mt-1 text-sm text-slate-600">Select the role that matches your account.</p></div>
+            <span className="text-xs text-slate-500">4 secure portals</span>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            <button onClick={() => navigate("/student/login")} className="group rounded-2xl border border-slate-200 bg-white p-5 text-left transition duration-200 hover:-translate-y-1 hover:border-blue-300 hover:shadow-lg hover:shadow-blue-950/5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600">
               <GraduationCap className="text-blue-700" size={30} />
               <h2 className="mt-4 text-lg font-semibold">Student login</h2>
               <p className="mt-2 text-sm leading-6 text-slate-600">See your assigned exams, take an assessment, and view released results.</p>
               <span className="mt-5 inline-block text-sm font-semibold text-blue-700">Open student workspace →</span>
             </button>
-            <button onClick={() => navigate("/institute/login")} className="rounded-2xl border border-slate-200 bg-slate-50 p-6 text-left transition hover:-translate-y-0.5 hover:border-slate-400 hover:shadow-md">
+            <button onClick={() => navigate("/institute/login")} className="group rounded-2xl border border-slate-200 bg-white p-5 text-left transition duration-200 hover:-translate-y-1 hover:border-violet-300 hover:shadow-lg hover:shadow-violet-950/5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-600">
               <Building2 className="text-slate-800" size={30} />
               <h2 className="mt-4 text-lg font-semibold">Institute login</h2>
               <p className="mt-2 text-sm leading-6 text-slate-600">For administrators, teachers and proctors who create and manage assessments.</p>
               <span className="mt-5 inline-block text-sm font-semibold text-slate-800">Open institute workspace →</span>
             </button>
+            <button onClick={() => navigate("/teacher/login")} className="group rounded-2xl border border-slate-200 bg-white p-5 text-left transition duration-200 hover:-translate-y-1 hover:border-amber-300 hover:shadow-lg hover:shadow-amber-950/5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600">
+              <BriefcaseBusiness className="text-violet-700" size={30} />
+              <h2 className="mt-4 text-lg font-semibold">Exam coordinator</h2>
+              <p className="mt-2 text-sm leading-6 text-slate-600">Conduct exams, author coding questions, manage learners, grade work, and review reports.</p>
+              <span className="mt-5 inline-block text-sm font-semibold text-violet-700">Open coordinator workspace →</span>
+            </button>
+            <button onClick={() => navigate("/system/login")} className="group rounded-2xl border border-slate-200 bg-white p-5 text-left transition duration-200 hover:-translate-y-1 hover:border-cyan-300 hover:shadow-lg hover:shadow-cyan-950/5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-700">
+              <ShieldCheck className="text-emerald-700" size={30} />
+              <h2 className="mt-4 text-lg font-semibold">System administration</h2>
+              <p className="mt-2 text-sm leading-6 text-slate-600">Approve institutions, verify staff, manage access, and review platform operations.</p>
+              <span className="mt-5 inline-block text-sm font-semibold text-emerald-700">Open admin workspace →</span>
+            </button>
+          </div>
           </div>
         </section>
+        <footer className="mt-5 flex flex-wrap items-center justify-between gap-2 px-1 text-xs text-slate-500">
+          <span>ExamGuard · Secure examination management</span>
+          <span>Access is restricted by account role and institution membership.</span>
+        </footer>
       </div>
     </main>
   );
 }
-function PortalLogin({ portal, onSave }: { portal: "student" | "institute"; onSave: (session: Session) => void }) {
+function PortalLogin({ portal, onSave }: { portal: "student" | "institute" | "teacher" | "system"; onSave: (session: Session) => void }) {
   const navigate = useNavigate();
   const student = portal === "student";
+  const teacher = portal === "teacher";
+  const system = portal === "system";
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     setError("");
@@ -2792,9 +3177,9 @@ function PortalLogin({ portal, onSave }: { portal: "student" | "institute"; onSa
     setLoading(true);
     try {
       const { data } = await publicApi.post("/api/auth/login", { email: normalizedEmail, password });
-      const correctWorkspace = student ? data.role === "student" : data.role !== "student";
+      const correctWorkspace = student ? data.role === "student" : teacher ? data.role === "teacher" : system ? data.role === "platform_admin" : data.role !== "student";
       if (!correctWorkspace) {
-        setError(student ? "This is an institute account. Please use Institute login." : "This is a student account. Please use Student login.");
+        setError(student ? "This is an institute account. Please use Institute or Coordinator login." : teacher ? "This is not a coordinator account. Please use the workspace that matches your role." : system ? "This account is not a system administrator." : "This is a student account. Please use Student login.");
         return;
       }
       onSave(data);
@@ -2808,28 +3193,49 @@ function PortalLogin({ portal, onSave }: { portal: "student" | "institute"; onSa
   };
   const otherPortal = student ? "institute" : "student";
   return (
-    <main className="min-h-screen bg-slate-50 px-5 py-10 text-slate-900">
-      <div className="mx-auto max-w-md">
-        <button onClick={() => navigate("/")} className="flex items-center gap-2 font-bold">
-          <span className="rounded-lg bg-blue-600 p-2 text-white"><ShieldCheck size={18} /></span>
-          ExamGuard
-        </button>
-        <section className="mt-10 rounded-3xl border border-slate-200 bg-white p-7 shadow-xl shadow-slate-200/60">
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-50 text-blue-700">{student ? <GraduationCap size={23} /> : <Building2 size={22} />}</div>
-          <p className="eyebrow mt-5">{student ? "Candidate workspace" : "Institute workspace"}</p>
-          <h1 className="mt-2 text-2xl font-bold">{student ? "Student sign in" : "Institute sign in"}</h1>
-          <p className="mt-2 text-sm leading-6 text-slate-600">{student ? "Use the email and password provided by your institute." : "For institute administrators, teachers and proctors."}</p>
-          <form onSubmit={submit} className="mt-6 space-y-4">
-            <label className="block text-sm font-medium">Email<input className="input mt-1" value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoComplete="email" placeholder="name@example.edu" required /></label>
-            <label className="block text-sm font-medium">Password<input className="input mt-1" value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" required /></label>
-            {error && <p role="alert" className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
-            <button disabled={loading} className="button w-full disabled:opacity-60">{loading ? "Signing in…" : student ? "Open student workspace" : "Open institute workspace"}</button>
-          </form>
-          <div className="mt-5 flex items-center justify-between text-sm">
-            <button onClick={() => navigate("/forgot-password")} className="font-medium text-blue-700 hover:underline">Forgot password?</button>
-            <button onClick={() => navigate(`/${otherPortal}/login`)} className="font-medium text-blue-700 hover:underline">Use {student ? "Institute" : "Student"} login</button>
-          </div>
-        </section>
+    <main className={`min-h-screen px-5 py-6 text-slate-900 sm:px-8 sm:py-10 ${student ? "bg-[radial-gradient(circle_at_10%_0%,#dbeafe,transparent_34%),linear-gradient(135deg,#f8fbff_0%,#eef4ff_52%,#f8fafc_100%)]" : "bg-slate-50"}`}>
+      <div className="mx-auto max-w-6xl">
+        <header className="flex items-center justify-between">
+          <button onClick={() => navigate("/")} className="group flex items-center gap-3 font-bold tracking-tight">
+            <span className="grid h-10 w-10 place-items-center rounded-xl bg-blue-600 text-white shadow-lg shadow-blue-600/25"><ShieldCheck size={20} /></span>
+            <span>ExamGuard<small className="ml-2 hidden text-[10px] font-semibold uppercase tracking-[.18em] text-slate-400 sm:inline">Assessment platform</small></span>
+          </button>
+          <button onClick={() => navigate("/")} className="inline-flex items-center gap-2 text-sm font-semibold text-slate-500 transition hover:text-slate-900"><ArrowLeft size={16}/> Back home</button>
+        </header>
+        <div className="mt-10 grid items-stretch gap-6 lg:grid-cols-[1.05fr_.95fr]">
+          <section className={`relative hidden overflow-hidden rounded-[2rem] p-10 text-white shadow-2xl lg:flex lg:flex-col lg:justify-between ${student ? "bg-slate-950 shadow-blue-900/15" : "bg-[#10243f] shadow-slate-900/15"}`}>
+            <div className="absolute -right-20 -top-20 h-72 w-72 rounded-full bg-blue-500/25 blur-3xl" />
+            <div className="absolute -bottom-28 -left-20 h-72 w-72 rounded-full bg-cyan-400/10 blur-3xl" />
+            <div className="relative">
+              <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/10 px-3 py-1.5 text-xs font-semibold text-blue-200"><LockKeyhole size={14}/> {student ? "Protected candidate access" : "Trusted institution access"}</span>
+              <h1 className="mt-8 max-w-lg text-4xl font-semibold leading-tight tracking-tight">{student ? "A calm, focused place to do your best work." : "Run every assessment with confidence and control."}</h1>
+              <p className="mt-5 max-w-md text-sm leading-7 text-slate-300">{student ? "Access assigned assessments, save your progress, and review released results from one secure student workspace." : "Coordinate exams, review evidence, and keep every important decision inside one accountable workspace."}</p>
+            </div>
+            <div className="relative mt-12 space-y-3">
+              {(student ? ["Your answers save as you work", "Exam timing is held by the server", "Review signals are handled by people"] : ["Create and deliver structured assessments", "Review incidents with full context", "Publish results when your team is ready"]).map((item) => <div key={item} className="flex items-center gap-3 text-sm text-slate-200"><CheckCircle2 size={17} className="text-cyan-300"/> {item}</div>)}
+            </div>
+          </section>
+          <section className="rounded-[2rem] border border-white/70 bg-white/90 p-7 shadow-xl shadow-slate-300/35 backdrop-blur sm:p-10">
+            <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-50 text-blue-700 ring-8 ring-blue-50/60">{student ? <GraduationCap size={25} /> : <Building2 size={24} />}</div>
+            <p className="eyebrow mt-7">{student ? "Candidate workspace" : system ? "System administration" : teacher ? "Coordinator workspace" : "Institute workspace"}</p>
+            <h1 className="mt-2 text-3xl font-bold tracking-tight">{student ? "Student sign in" : system ? "Admin sign in" : teacher ? "Coordinator sign in" : "Institute sign in"}</h1>
+            <p className="mt-3 text-sm leading-6 text-slate-600">{student ? "Use the email and password provided by your institute." : system ? "For authorized ExamGuard platform administrators." : teacher ? "For exam coordinators who conduct exams, manage classes, and review student work." : "For institute administrators, exam coordinators, and proctors."}</p>
+            <form onSubmit={submit} className="mt-8 space-y-5">
+              <label className="block text-sm font-semibold text-slate-800">Email<input className="input mt-2" value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoComplete="email" placeholder="name@example.edu" required /></label>
+              <label className="block text-sm font-semibold text-slate-800">Password<span className="relative mt-2 block"><input className="input pr-12" value={password} onChange={(event) => setPassword(event.target.value)} type={showPassword ? "text" : "password"} autoComplete="current-password" required /><button type="button" aria-label={showPassword ? "Hide password" : "Show password"} onClick={() => setShowPassword((value) => !value)} className="absolute right-3 top-3 text-slate-400 transition hover:text-slate-700">{showPassword ? <EyeOff size={18}/> : <Eye size={18}/>}</button></span></label>
+              {error && <p role="alert" className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm leading-5 text-red-700">{error}</p>}
+              <button disabled={loading} className="button w-full !rounded-xl !bg-blue-600 py-3 shadow-lg shadow-blue-600/20 hover:!bg-blue-700 disabled:opacity-60">{loading ? "Signing in…" : student ? "Open student workspace" : system ? "Open admin workspace" : teacher ? "Open coordinator workspace" : "Open institute workspace"}<ChevronRight size={17} className="ml-2"/></button>
+            </form>
+            <div className="mt-6 flex flex-wrap items-center justify-between gap-3 text-sm">
+              <button onClick={() => navigate("/forgot-password")} className="font-semibold text-blue-700 hover:underline">Forgot password?</button>
+              <button onClick={() => navigate(`/${otherPortal}/login`)} className="font-semibold text-slate-600 hover:text-slate-950">Use {student ? "Institute" : "Student"} login</button>
+            </div>
+            {teacher && <p className="mt-5 border-t border-stone-200 pt-4 text-sm text-stone-600">New coordinator? <button type="button" onClick={() => navigate("/coordinator/register")} className="font-semibold text-blue-700 underline">Apply with university identity proof</button></p>}
+            {student && <p className="mt-5 border-t border-stone-200 pt-4 text-sm text-stone-600">New student? <button type="button" onClick={() => navigate("/student/register")} className="font-semibold text-blue-700 underline">Sign up with identity proof</button></p>}
+            {portal === "institute" && <p className="mt-5 border-t border-stone-200 pt-4 text-sm text-stone-600">New institution? <button type="button" onClick={() => navigate("/institute/register")} className="font-semibold text-blue-700 underline">Apply for a verified workspace</button></p>}
+            <div className="mt-8 flex items-start gap-3 rounded-xl border border-blue-100 bg-blue-50/70 p-4 text-xs leading-5 text-slate-600"><LockKeyhole size={16} className="mt-0.5 shrink-0 text-blue-700"/><span><b className="text-slate-800">{student ? "Your privacy matters." : "Your workspace is protected."}</b> {student ? "ExamGuard uses visible, consent-based monitoring during assessments and keeps review decisions human-led." : "Organization data, evidence, and review actions stay scoped to authorized team members."}</span></div>
+          </section>
+        </div>
       </div>
     </main>
   );
@@ -2851,9 +3257,15 @@ function App() {
       <Route path="/login" element={<LoginChoice onSave={s.save} />} />
       <Route path="/student/login" element={<PortalLogin portal="student" onSave={s.save} />} />
       <Route path="/institute/login" element={<PortalLogin portal="institute" onSave={s.save} />} />
-      <Route path="/register" element={<Auth register onSave={s.save} />} />
+      <Route path="/teacher/login" element={<PortalLogin portal="teacher" onSave={s.save} />} />
+      <Route path="/system/login" element={<PortalLogin portal="system" onSave={s.save} />} />
+      <Route path="/coordinator/register" element={<CoordinatorApplicationPage />} />
+      <Route path="/student/register" element={<StudentApplicationPage />} />
+      <Route path="/institute/register" element={<InstitutionApplicationPage />} />
+      <Route path="/register" element={<InstitutionApplicationPage />} />
       <Route path="/forgot-password" element={<ForgotPasswordPage />} />
       <Route path="/reset-password" element={<ResetPasswordPage />} />
+      <Route path="/student/invitation" element={<StudentInvitationPage onSave={s.save} />} />
       <Route
         path="/app/take/:examId"
         element={
@@ -2894,7 +3306,7 @@ function App() {
         path="/app/*"
         element={
           s.session ? (
-            ["student", "institute_admin", "teacher", "proctor"].includes(s.session.role)
+            ["student", "platform_admin", "institute_admin", "teacher", "proctor"].includes(s.session.role)
               ? <Shell session={s.session} clear={s.clear} />
               : <UnsupportedWorkspace session={s.session} clear={s.clear} />
           ) : (

@@ -2,14 +2,16 @@ import bcrypt from 'bcryptjs';
 import { connectDatabase } from '../src/db.js';
 import { prisma } from '../src/prisma.js';
 
-const password = process.env.DEMO_SEED_PASSWORD;
+const password = process.env.DEMO_SEED_PASSWORD ?? 'ExamGuard-Demo-2026!';
 const databaseName = decodeURIComponent(new URL(process.env.DATABASE_URL ?? 'postgresql://invalid/').pathname.slice(1)).toLowerCase();
-if (process.env.DEMO_SEED !== 'yes' || !password || password.length < 12 || /(^|[-_])(prod|production)([-_]|$)/.test(databaseName)) throw new Error('Refusing to seed. Set DEMO_SEED=yes and a 12+ character DEMO_SEED_PASSWORD, and use a non-production database name in DATABASE_URL.');
+if (process.env.DEMO_SEED !== 'yes' || password.length < 12 || /(^|[-_])(prod|production)([-_]|$)/.test(databaseName)) throw new Error('Refusing to seed. Set DEMO_SEED=yes and use a non-production PostgreSQL database name in DATABASE_URL.');
 
 const people = [
   ['Aarav Sharma', 'aarav.admin@demo.examguard.test', 'institute_admin'],
+  ['ExamGuard Platform Admin', 'platform.admin@demo.examguard.test', 'platform_admin'],
   ['Priya Verma', 'priya.teacher@demo.examguard.test', 'teacher'],
   ['Rahul Mehta', 'rahul.teacher@demo.examguard.test', 'teacher'],
+  ['Karan Patel', 'karan.proctor@demo.examguard.test', 'proctor'],
   ['Aditi Singh', 'aditi.candidate@demo.examguard.test', 'student', 'EG-C001'],
   ['Rohan Kumar', 'rohan.candidate@demo.examguard.test', 'student', 'EG-C002'],
   ['Neha Joshi', 'neha.candidate@demo.examguard.test', 'student', 'EG-C003'],
@@ -35,8 +37,14 @@ async function seed() {
   const passwordHash = await bcrypt.hash(password!, 12);
   const identities = new Map<string, { id: string; name: string; candidateCode?: string }>();
   for (const [name, email, role, candidateCode] of people) {
-    const user = await prisma.user.upsert({ where: { email }, update: {}, create: { name: `[DEMO] ${name}`, email, passwordHash } });
-    await prisma.membership.upsert({ where: { userId_organizationId: { userId: user.id, organizationId: org.id } }, update: {}, create: { userId: user.id, organizationId: org.id, role } });
+    const isPlatformAdmin = role === 'platform_admin';
+    const user = await prisma.user.upsert({ where: { email }, update: { name: `[DEMO] ${name}`, passwordHash, isPlatformAdmin }, create: { name: `[DEMO] ${name}`, email, passwordHash, isPlatformAdmin } });
+    const subjects = email === 'priya.teacher@demo.examguard.test'
+      ? ['Computer Science', 'Data Structures']
+      : email === 'rahul.teacher@demo.examguard.test'
+        ? ['Database Systems', 'Operating Systems']
+        : [];
+    await prisma.membership.upsert({ where: { userId_organizationId: { userId: user.id, organizationId: org.id } }, update: { role, active: true, subjects }, create: { userId: user.id, organizationId: org.id, role, subjects } });
     identities.set(email, { id: user.id, name, candidateCode });
   }
   const candidateIds: string[] = [];
@@ -61,7 +69,7 @@ async function seed() {
   for (const candidateId of candidateIds) {
     await prisma.examAssignment.upsert({ where: { examId_candidateId: { examId: exam.id, candidateId } }, update: {}, create: { organizationId: org.id, examId: exam.id, candidateId } });
   }
-  console.info('Development demo data is ready. Use the documented local password; no monitoring observations were created.');
+  console.info(`Development demo data is ready. Demo account password: ${password}. No monitoring observations were created.`);
 }
 
 seed()

@@ -2,19 +2,58 @@ import { useEffect, useMemo, useState } from "react";
 import axios from "axios";
 import { api } from "./lib/api";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { CopyableId } from "./components/ui";
 
 type Session = { organization: { id: string } };
 type Question = {
   id?: string;
   type:
-    "mcq" | "multiple_select" | "true_false" | "short_answer" | "descriptive";
+    | "mcq"
+    | "multiple_select"
+    | "true_false"
+    | "short_answer"
+    | "descriptive"
+    | "coding";
   prompt: string;
   options: Array<{ id: string; text: string }>;
   correctAnswer?: unknown;
   marks: number;
   negativeMarks: number;
+  coding?: {
+    title: string;
+    description: string;
+    difficulty: "easy" | "medium" | "hard";
+    mode: "function" | "stdin_stdout";
+    inputFormat: string;
+    outputFormat: string;
+    constraints: string;
+    explanation: string;
+    languageIds: string[];
+    starterCode: Record<string, string>;
+    timeLimitMs: number;
+    memoryLimitKb: number;
+    comparisonMode: "exact" | "whitespace_normalized";
+  };
+  codingTestCases?: Array<{ input: string; expectedOutput: string; visibility: "sample" | "private"; position: number }>;
 };
 type QuestionBank = { id: string; name: string };
+type ExamTemplateSummary = { id: string; name: string; description?: string | null };
+const CODING_LANGUAGES = [
+  { id: "python", label: "Python" },
+  { id: "javascript", label: "JavaScript" },
+  { id: "java", label: "Java" },
+  { id: "cpp", label: "C++" },
+  { id: "c", label: "C" },
+] as const;
+const DEFAULT_CODING_LANGUAGE_IDS = CODING_LANGUAGES.map(({ id }) => id);
+const defaultInterventionPolicy = () => ({
+  windowSeconds: 300,
+  warningAt: 1,
+  pauseAt: 3,
+  terminateAt: 5,
+  automaticTerminationEnabled: false,
+  fullscreenRequired: true,
+});
 const blankQuestion = (): Question => ({
   type: "mcq",
   prompt: "",
@@ -25,7 +64,50 @@ const blankQuestion = (): Question => ({
   correctAnswer: undefined,
   marks: 1,
   negativeMarks: 0,
+  codingTestCases: [],
 });
+const blankCoding = (): NonNullable<Question["coding"]> => ({
+  title: "",
+  description: "",
+  difficulty: "medium",
+  mode: "stdin_stdout",
+  inputFormat: "",
+  outputFormat: "",
+  constraints: "",
+  explanation: "",
+  languageIds: [...DEFAULT_CODING_LANGUAGE_IDS],
+  starterCode: Object.fromEntries(DEFAULT_CODING_LANGUAGE_IDS.map((id) => [id, ""])),
+  timeLimitMs: 2000,
+  memoryLimitKb: 262144,
+  comparisonMode: "exact",
+});
+type ApiQuestion = Question & {
+  codingQuestion?: NonNullable<Question["coding"]> & {
+    testCases?: NonNullable<Question["codingTestCases"]>;
+  };
+};
+const questionForEditor = (question: ApiQuestion): Question => {
+  const { codingQuestion, ...base } = question;
+  return {
+    ...base,
+    coding: base.coding ?? (codingQuestion ? {
+      title: codingQuestion.title,
+      description: codingQuestion.description,
+      difficulty: codingQuestion.difficulty,
+      mode: codingQuestion.mode,
+      inputFormat: codingQuestion.inputFormat,
+      outputFormat: codingQuestion.outputFormat,
+      constraints: codingQuestion.constraints,
+      explanation: codingQuestion.explanation,
+      languageIds: codingQuestion.languageIds,
+      starterCode: codingQuestion.starterCode,
+      timeLimitMs: codingQuestion.timeLimitMs,
+      memoryLimitKb: codingQuestion.memoryLimitKb,
+      comparisonMode: codingQuestion.comparisonMode,
+    } : undefined),
+    codingTestCases: base.codingTestCases ?? codingQuestion?.testCases?.map(({ input, expectedOutput, visibility, position }) => ({ input, expectedOutput, visibility, position })),
+  };
+};
 
 export function ExamBuilder({ session }: { session: Session }) {
   const navigate = useNavigate();
@@ -43,12 +125,23 @@ export function ExamBuilder({ session }: { session: Session }) {
     endsAt: "",
     randomizeQuestions: false,
     randomizeOptions: false,
-    requireVerification: true,
+    isPractice: false,
+    interventionPolicy: defaultInterventionPolicy(),
   });
   const [questions, setQuestions] = useState<Question[]>([]);
   const [banks, setBanks] = useState<QuestionBank[]>([]);
   const [bankId, setBankId] = useState("");
   const [bankQuestions, setBankQuestions] = useState<Question[]>([]);
+  const [bankName, setBankName] = useState("");
+  const [banksLoading, setBanksLoading] = useState(true);
+  const [bankQuestionsLoading, setBankQuestionsLoading] = useState(false);
+  const [banksError, setBanksError] = useState("");
+  const [bankQuestionsError, setBankQuestionsError] = useState("");
+  const [templates, setTemplates] = useState<ExamTemplateSummary[]>([]);
+  const [templateId, setTemplateId] = useState("");
+  const [templateName, setTemplateName] = useState("");
+  const [templatesLoading, setTemplatesLoading] = useState(true);
+  const [templatesError, setTemplatesError] = useState("");
   const total = useMemo(
     () => questions.reduce((n, q) => n + (Number(q.marks) || 0), 0),
     [questions],
@@ -75,9 +168,10 @@ export function ExamBuilder({ session }: { session: Session }) {
           endsAt: e.endsAt ? new Date(e.endsAt).toISOString().slice(0, 16) : "",
           randomizeQuestions: !!e.randomizeQuestions,
           randomizeOptions: !!e.randomizeOptions,
-          requireVerification: e.requireVerification !== false,
+          isPractice: e.isPractice === true,
+          interventionPolicy: { ...defaultInterventionPolicy(), ...e.interventionPolicy },
         });
-        setQuestions(questionList.data);
+        setQuestions(questionList.data.map(questionForEditor));
       })
       .catch((err) =>
         setError(
@@ -88,20 +182,183 @@ export function ExamBuilder({ session }: { session: Session }) {
       );
   }, [routeExamId, session.organization.id]);
   useEffect(() => {
+    setBanksLoading(true);
+    setBanksError("");
     api
       .get(`/api/organizations/${session.organization.id}/question-banks`)
       .then((response) => setBanks(response.data))
-      .catch(() => setBanks([]));
+      .catch((error) => {
+        setBanksError(
+          axios.isAxiosError(error)
+            ? (error.response?.data?.error ?? "Could not load question banks.")
+            : "Could not load question banks.",
+        );
+      })
+      .finally(() => setBanksLoading(false));
   }, [session.organization.id]);
   useEffect(() => {
-    if (!bankId) return setBankQuestions([]);
+    setTemplatesLoading(true);
+    setTemplatesError("");
+    api.get(`/api/organizations/${session.organization.id}/exam-templates`)
+      .then(({ data }) => setTemplates(data))
+      .catch((requestError) => {
+        setTemplatesError(
+          axios.isAxiosError(requestError)
+            ? (requestError.response?.data?.error ?? "Could not load exam templates.")
+            : "Could not load exam templates.",
+        );
+      })
+      .finally(() => setTemplatesLoading(false));
+  }, [session.organization.id]);
+  useEffect(() => {
+    if (!bankId) {
+      setBankQuestions([]);
+      setBankQuestionsError("");
+      return;
+    }
+    setBankQuestionsLoading(true);
+    setBankQuestionsError("");
     api
       .get(
         `/api/organizations/${session.organization.id}/question-banks/${bankId}/questions`,
       )
       .then((response) => setBankQuestions(response.data))
-      .catch(() => setBankQuestions([]));
+      .catch((error) => {
+        setBankQuestionsError(
+          axios.isAxiosError(error)
+            ? (error.response?.data?.error ?? "Could not load bank questions.")
+            : "Could not load bank questions.",
+        );
+        setBankQuestions([]);
+      })
+      .finally(() => setBankQuestionsLoading(false));
   }, [bankId, session.organization.id]);
+  const createBank = async () => {
+    if (bankName.trim().length < 2) {
+      setError("Enter a question bank name with at least two characters.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const { data } = await api.post(
+        `/api/organizations/${session.organization.id}/question-banks`,
+        { name: bankName.trim() },
+      );
+      setBanks((current) => [...current, data].sort((a, b) => a.name.localeCompare(b.name)));
+      setBankId(data.id);
+      setBankName("");
+      setNotice("Question bank created. Add questions from this draft to make them reusable.");
+    } catch (requestError) {
+      setError(
+        axios.isAxiosError(requestError)
+          ? (requestError.response?.data?.error ?? "Could not create the question bank.")
+          : "Could not create the question bank.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  const saveQuestionToBank = async (index: number) => {
+    const question = questions[index];
+    if (!bankId || !question) return;
+    if (!question.prompt.trim() || question.marks <= 0) {
+      setError("Add a question prompt and positive marks before saving it to the bank.");
+      return;
+    }
+    if (
+      ["mcq", "multiple_select", "true_false"].includes(question.type) &&
+      question.options.some((option) => !option.text.trim())
+    ) {
+      setError("Complete every answer option before saving this question to the bank.");
+      return;
+    }
+    if (question.type === "coding" && (!question.coding?.title.trim() || !question.coding.description.trim() || !question.codingTestCases?.length)) {
+      setError("Complete the coding question details and add at least one test case before saving it to the bank.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const { data } = await api.post(
+        `/api/organizations/${session.organization.id}/question-banks/${bankId}/questions`,
+        question,
+      );
+      setBankQuestions((current) => [data, ...current]);
+      setNotice("Question saved to the selected bank; the draft question remains unchanged.");
+    } catch (requestError) {
+      setError(
+        axios.isAxiosError(requestError)
+          ? (requestError.response?.data?.error ?? "Could not save this question to the bank.")
+          : "Could not save this question to the bank.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  const applyTemplate = async () => {
+    if (!templateId) return;
+    setBusy(true);
+    setError("");
+    try {
+      const { data } = await api.get(
+        `/api/organizations/${session.organization.id}/exam-templates/${templateId}`,
+      );
+      const settings = data.settings;
+      setExamId(undefined);
+      setDetails({
+        title: settings.title,
+        instructions: settings.instructions ?? "",
+        durationMinutes: settings.durationMinutes,
+        startsAt: "",
+        endsAt: "",
+        randomizeQuestions: settings.randomizeQuestions,
+        randomizeOptions: settings.randomizeOptions,
+        isPractice: settings.isPractice === true,
+        interventionPolicy: { ...defaultInterventionPolicy(), ...settings.interventionPolicy },
+      });
+      setQuestions((data.questions as ApiQuestion[]).map(questionForEditor));
+      setStep(2);
+      setNotice(`Loaded “${data.name}”. Review the copied questions and settings before saving the new draft.`);
+    } catch (requestError) {
+      setError(
+        axios.isAxiosError(requestError)
+          ? (requestError.response?.data?.error ?? "Could not load this exam template.")
+          : "Could not load this exam template.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  const saveAsTemplate = async () => {
+    if (!examId) {
+      setError("Save the draft and its questions before creating a reusable template.");
+      return;
+    }
+    if (templateName.trim().length < 2) {
+      setError("Enter a template name with at least two characters.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const { data } = await api.post(
+        `/api/organizations/${session.organization.id}/exam-templates`,
+        { name: templateName.trim(), sourceExamId: examId },
+      );
+      setTemplates((current) => [...current, data].sort((a, b) => a.name.localeCompare(b.name)));
+      setTemplateName("");
+      setNotice(`“${data.name}” is ready to reuse for future exams.`);
+    } catch (requestError) {
+      setError(
+        axios.isAxiosError(requestError)
+          ? (requestError.response?.data?.error ?? "Could not save this exam as a template.")
+          : "Could not save this exam as a template.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
   const saveDraft = async () => {
     if (details.title.trim().length < 3)
       return setError(
@@ -158,7 +415,7 @@ export function ExamBuilder({ session }: { session: Session }) {
       const response = await api.post(
         `/api/organizations/${session.organization.id}/exams/${id}/questions/from-bank/${questionId}`,
       );
-      setQuestions((current) => [...current, response.data]);
+      setQuestions((current) => [...current, questionForEditor(response.data)]);
       setNotice(
         "Question copied to this draft. The bank entry was not changed.",
       );
@@ -218,6 +475,8 @@ export function ExamBuilder({ session }: { session: Session }) {
         q.options.some((o) => !o.text.trim())
       )
         return setError("Complete every option before saving.");
+      if (q.type === "coding" && (!q.coding?.title.trim() || !q.coding.description.trim() || !q.coding.languageIds.length || !q.codingTestCases?.length))
+        return setError("Coding questions need a title, problem description, and at least one language.");
     }
     setBusy(true);
     setError("");
@@ -228,7 +487,7 @@ export function ExamBuilder({ session }: { session: Session }) {
             `/api/organizations/${session.organization.id}/exams/${id}/questions`,
             question,
           );
-          return response.data as Question;
+          return questionForEditor(response.data);
         }),
       );
       let savedIndex = 0;
@@ -284,6 +543,7 @@ export function ExamBuilder({ session }: { session: Session }) {
           <p className="text-sm text-slate-500">
             Step {step} of 4 · total new-question marks: {total}
           </p>
+          {routeExamId && <CopyableId id={routeExamId} label="Examination UUID" />}
         </div>
         <Link
           to="/app/exams"
@@ -323,6 +583,19 @@ export function ExamBuilder({ session }: { session: Session }) {
       )}
       {step === 1 && (
         <section className="card grid gap-4 sm:grid-cols-2">
+          {!routeExamId && !examId && <div className="sm:col-span-2 rounded-xl border border-blue-100 bg-blue-50/50 p-4">
+            <p className="text-sm font-semibold text-slate-800">Start from an exam template</p>
+            <p className="mt-1 text-xs text-slate-600">Templates copy settings and questions into a new draft. Review them before publishing.</p>
+            <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+              <select aria-label="Exam template" className="input min-w-0 flex-1" value={templateId} onChange={(event) => setTemplateId(event.target.value)} disabled={templatesLoading}>
+                <option value="">{templatesLoading ? "Loading templates…" : "Choose a template"}</option>
+                {templates.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}
+              </select>
+              <button type="button" className="button" onClick={() => void applyTemplate()} disabled={busy || !templateId}>Use template</button>
+            </div>
+            {templatesError && <p role="alert" className="mt-2 text-sm text-red-700">{templatesError}</p>}
+            {!templatesLoading && !templatesError && templates.length === 0 && <p className="mt-2 text-xs text-slate-500">No templates yet. Build and save an exam, then save it as a template from the review step.</p>}
+          </div>}
           <label className="sm:col-span-2 text-sm font-medium">
             Title
             <input
@@ -384,7 +657,7 @@ export function ExamBuilder({ session }: { session: Session }) {
             {[
               ["randomizeQuestions", "Randomize questions"],
               ["randomizeOptions", "Randomize options"],
-              ["requireVerification", "Require candidate verification"],
+              ["isPractice", "Practice exam (ungraded; excluded from official results)"],
             ].map(([key, label]) => (
               <label key={key}>
                 <input
@@ -398,6 +671,17 @@ export function ExamBuilder({ session }: { session: Session }) {
               </label>
             ))}
           </div>
+          <label className="sm:col-span-2 flex items-start gap-3 rounded-xl border border-blue-100 bg-blue-50/50 p-4 text-sm">
+            <input
+              type="checkbox"
+              checked={details.interventionPolicy.fullscreenRequired}
+              onChange={(event) => setDetails({
+                ...details,
+                interventionPolicy: { ...details.interventionPolicy, fullscreenRequired: event.target.checked },
+              })}
+            />
+            <span><b>Require fullscreen during this exam</b><span className="mt-1 block text-xs leading-5 text-slate-600">Candidates must enter fullscreen before starting and return to it if they exit. A normal browser cannot prevent switching to other apps; use institution-managed kiosk devices for enforced lockdown.</span></span>
+          </label>
           <div className="sm:col-span-2 flex justify-end gap-3">
             <button onClick={saveDraft} disabled={busy} className="button">
               Save draft
@@ -428,8 +712,9 @@ export function ExamBuilder({ session }: { session: Session }) {
                   className="input mt-1"
                   value={bankId}
                   onChange={(event) => setBankId(event.target.value)}
+                  disabled={banksLoading}
                 >
-                  <option value="">Choose a bank</option>
+                  <option value="">{banksLoading ? "Loading banks…" : "Choose a bank"}</option>
                   {banks.map((bank) => (
                     <option key={bank.id} value={bank.id}>
                       {bank.name}
@@ -438,9 +723,36 @@ export function ExamBuilder({ session }: { session: Session }) {
                 </select>
               </label>
             </div>
+            <form
+              className="mt-4 flex flex-col gap-2 rounded-xl border border-blue-100 bg-white p-3 sm:flex-row"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void createBank();
+              }}
+            >
+              <label className="min-w-0 flex-1 text-xs font-semibold text-slate-600">
+                Create a bank
+                <input
+                  className="input mt-1"
+                  aria-label="New question bank name"
+                  placeholder="e.g. Biology · Cell structure"
+                  value={bankName}
+                  onChange={(event) => setBankName(event.target.value)}
+                  maxLength={160}
+                />
+              </label>
+              <button type="submit" className="button self-end" disabled={busy || bankName.trim().length < 2}>
+                Create bank
+              </button>
+            </form>
+            {banksError && <p role="alert" className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-700">{banksError}</p>}
             {bankId && (
               <div className="mt-4 space-y-2">
-                {bankQuestions.length ? (
+                {bankQuestionsLoading ? (
+                  <p role="status" className="rounded-xl bg-white p-4 text-sm text-slate-500">Loading questions…</p>
+                ) : bankQuestionsError ? (
+                  <p role="alert" className="rounded-xl bg-red-50 p-4 text-sm text-red-700">{bankQuestionsError}</p>
+                ) : bankQuestions.length ? (
                   bankQuestions.map((question) => (
                     <div
                       key={question.id}
@@ -477,6 +789,8 @@ export function ExamBuilder({ session }: { session: Session }) {
             <article className="card" key={i}>
               <div className="flex justify-between">
                 <b>Question {i + 1}</b>
+              <div className="flex items-center gap-3">
+                {bankId && <button type="button" onClick={() => void saveQuestionToBank(i)} disabled={busy} className="text-sm font-semibold text-blue-700 disabled:text-slate-400">Save to selected bank</button>}
                 <button
                   onClick={() => removeQuestion(i)}
                   disabled={busy}
@@ -484,6 +798,7 @@ export function ExamBuilder({ session }: { session: Session }) {
                 >
                   Remove
                 </button>
+              </div>
               </div>
               <label className="mt-3 block text-sm">
                 Type
@@ -500,6 +815,10 @@ export function ExamBuilder({ session }: { session: Session }) {
                               { id: "false", text: "False" },
                             ]
                           : q.options,
+                      coding: e.target.value === "coding" ? (q.coding ?? blankCoding()) : q.coding,
+                      codingTestCases: e.target.value === "coding" && !q.codingTestCases?.length
+                        ? [{ input: "", expectedOutput: "", visibility: "sample", position: 0 }]
+                        : q.codingTestCases,
                     })
                   }
                 >
@@ -509,6 +828,7 @@ export function ExamBuilder({ session }: { session: Session }) {
                     "true_false",
                     "short_answer",
                     "descriptive",
+                    "coding",
                   ].map((x) => (
                     <option key={x}>{x}</option>
                   ))}
@@ -522,8 +842,9 @@ export function ExamBuilder({ session }: { session: Session }) {
                   onChange={(e) => update(i, { prompt: e.target.value })}
                 />
               </label>
-              {["mcq", "multiple_select", "true_false"].includes(q.type) && (
+              {(["mcq", "multiple_select", "true_false"].includes(q.type) || q.type === "coding") && (
                 <div className="mt-3 space-y-2">
+                  {["mcq", "multiple_select", "true_false"].includes(q.type) && <>
                   {q.options.map((o, n) => (
                     <label className="flex gap-2 text-sm" key={o.id}>
                       <input
@@ -577,6 +898,57 @@ export function ExamBuilder({ session }: { session: Session }) {
                     >
                       Add option
                     </button>
+                  )}
+                  </>}
+                  {q.type === "coding" && (
+                    <div className="mt-4 rounded-2xl border border-blue-100 bg-blue-50/50 p-4">
+                      <div className="mb-4 flex items-start justify-between gap-3">
+                        <div><h4 className="font-semibold text-slate-900">Coding problem</h4><p className="mt-1 text-xs leading-5 text-slate-500">Candidates will solve this in the secure coding workspace. Add clear input, output, and constraints.</p></div>
+                        <span className="rounded-full bg-blue-100 px-2.5 py-1 text-[11px] font-semibold text-blue-700">Code runner</span>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <label className="text-sm font-medium sm:col-span-2">Problem title<input className="input mt-1" value={q.coding?.title ?? ""} onChange={(e) => update(i, { coding: { ...blankCoding(), ...q.coding, title: e.target.value } })} placeholder="Two Sum" /></label>
+                        <label className="text-sm font-medium sm:col-span-2">Problem description<textarea className="input mt-1 min-h-28" value={q.coding?.description ?? ""} onChange={(e) => update(i, { coding: { ...blankCoding(), ...q.coding, description: e.target.value } })} placeholder="Describe the task and expected behavior." /></label>
+                        <label className="text-sm font-medium">Difficulty<select className="input mt-1" value={q.coding?.difficulty ?? "medium"} onChange={(e) => update(i, { coding: { ...blankCoding(), ...q.coding, difficulty: e.target.value as "easy" | "medium" | "hard" } })}><option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option></select></label>
+                        <label className="text-sm font-medium">Execution mode<select className="input mt-1" value={q.coding?.mode ?? "stdin_stdout"} onChange={(e) => update(i, { coding: { ...blankCoding(), ...q.coding, mode: e.target.value as "function" | "stdin_stdout" } })}><option value="stdin_stdout">Standard input / output</option><option value="function">Function</option></select></label>
+                        <fieldset className="rounded-xl border border-slate-200 bg-white p-3 sm:col-span-2">
+                          <legend className="px-1 text-sm font-medium">Candidate programming languages</legend>
+                          <p className="mb-3 text-xs text-slate-500">All supported languages are selected by default. Candidates may choose any selected language during the exam.</p>
+                          <div className="grid gap-2 sm:grid-cols-2">
+                            {CODING_LANGUAGES.map(({ id, label }) => (
+                              <label key={id} className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm font-normal text-slate-700 hover:bg-slate-50">
+                                <input
+                                  type="checkbox"
+                                  checked={(q.coding?.languageIds ?? DEFAULT_CODING_LANGUAGE_IDS).includes(id)}
+                                  onChange={(event) => {
+                                    const current = q.coding?.languageIds ?? [...DEFAULT_CODING_LANGUAGE_IDS];
+                                    const languageIds = event.target.checked
+                                      ? [...current, id]
+                                      : current.filter((languageId) => languageId !== id);
+                                    update(i, {
+                                      coding: {
+                                        ...blankCoding(),
+                                        ...q.coding,
+                                        languageIds,
+                                        starterCode: q.coding?.starterCode ?? blankCoding().starterCode,
+                                      },
+                                    });
+                                  }}
+                                />
+                                {label}
+                              </label>
+                            ))}
+                          </div>
+                        </fieldset>
+                        <label className="text-sm font-medium">Input format<textarea className="input mt-1 min-h-20" value={q.coding?.inputFormat ?? ""} onChange={(e) => update(i, { coding: { ...blankCoding(), ...q.coding, inputFormat: e.target.value } })} /></label>
+                        <label className="text-sm font-medium">Output format<textarea className="input mt-1 min-h-20" value={q.coding?.outputFormat ?? ""} onChange={(e) => update(i, { coding: { ...blankCoding(), ...q.coding, outputFormat: e.target.value } })} /></label>
+                        <label className="text-sm font-medium sm:col-span-2">Constraints<textarea className="input mt-1 min-h-20" value={q.coding?.constraints ?? ""} onChange={(e) => update(i, { coding: { ...blankCoding(), ...q.coding, constraints: e.target.value } })} /></label>
+                      </div>
+                      <div className="mt-4 border-t border-blue-100 pt-4">
+                        <div className="flex items-center justify-between gap-3"><div><h5 className="text-sm font-semibold">Test cases</h5><p className="mt-1 text-xs text-slate-500">Sample cases are visible to candidates; private cases are used for validation.</p></div><button type="button" className="text-sm font-semibold text-blue-700" onClick={() => update(i, { codingTestCases: [...(q.codingTestCases ?? []), { input: "", expectedOutput: "", visibility: "private", position: q.codingTestCases?.length ?? 0 }] })}>Add test case</button></div>
+                        <div className="mt-3 space-y-3">{(q.codingTestCases ?? []).map((testCase, testIndex) => <div key={testIndex} className="grid gap-2 rounded-xl border border-blue-100 bg-white p-3 sm:grid-cols-[1fr_1fr_auto]"><label className="text-xs font-semibold text-slate-600">Input<textarea className="input mt-1 min-h-16 text-sm font-normal" value={testCase.input} onChange={(e) => update(i, { codingTestCases: q.codingTestCases?.map((item, index) => index === testIndex ? { ...item, input: e.target.value } : item) })} /></label><label className="text-xs font-semibold text-slate-600">Expected output<textarea className="input mt-1 min-h-16 text-sm font-normal" value={testCase.expectedOutput} onChange={(e) => update(i, { codingTestCases: q.codingTestCases?.map((item, index) => index === testIndex ? { ...item, expectedOutput: e.target.value } : item) })} /></label><div className="flex items-end gap-2 sm:flex-col sm:items-stretch"><select className="input text-sm" value={testCase.visibility} onChange={(e) => update(i, { codingTestCases: q.codingTestCases?.map((item, index) => index === testIndex ? { ...item, visibility: e.target.value as "sample" | "private" } : item) })}><option value="sample">Sample</option><option value="private">Private</option></select>{(q.codingTestCases?.length ?? 0) > 1 && <button type="button" className="text-xs font-semibold text-red-600" onClick={() => update(i, { codingTestCases: q.codingTestCases?.filter((_, index) => index !== testIndex).map((item, index) => ({ ...item, position: index })) })}>Remove</button>}</div></div>)}</div>
+                      </div>
+                    </div>
                   )}
                 </div>
               )}
@@ -643,6 +1015,14 @@ export function ExamBuilder({ session }: { session: Session }) {
               </dd>
             </div>
           </dl>
+          {examId && <div className="mt-5 rounded-xl border border-blue-100 bg-blue-50/50 p-4">
+            <h4 className="text-sm font-semibold text-slate-800">Save this draft as a reusable template</h4>
+            <p className="mt-1 text-xs text-slate-600">The template stores exam settings, answer keys, and coding test cases for reuse by authorized staff in this institution.</p>
+            <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+              <input aria-label="Template name" className="input min-w-0 flex-1" value={templateName} maxLength={160} onChange={(event) => setTemplateName(event.target.value)} placeholder="e.g. Biology midterm" />
+              <button type="button" className="button" disabled={busy || templateName.trim().length < 2} onClick={() => void saveAsTemplate()}>Save template</button>
+            </div>
+          </div>}
           <button onClick={() => setStep(4)} className="button mt-6">
             Continue to publish
           </button>

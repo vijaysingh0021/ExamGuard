@@ -5,22 +5,26 @@ import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import multer from 'multer';
 import rateLimit from 'express-rate-limit';
-import { authenticate, authenticateCompanion, authorize, signCompanionToken, signToken, tenantFilter, type AuthRequest, type CompanionClaims } from './auth.js';
+import { authenticate, authenticateCompanion, authorize, authorizePlatformAdmin, signCompanionToken, signToken, tenantFilter, type AuthRequest, type CompanionClaims } from './auth.js';
 import { canStartExam, deadlineFor, isAttemptOpen, submissionStatusAt } from './exam.js';
 import { StorageInterface, realStorage, verifyLocalEvidenceToken } from './storage.js';
 import { dedupeWindow, fingerprintFor, reviewPriority } from './proctor.js';
 import { aiSignalsForFrame } from './ai-monitoring.js';
+import { radioProximity, supportsPotentialVisualAssistance } from './radio-proximity.js';
+import { radioObservationSelect, withAdvertisedNameCompatibility } from './radio-observation.js';
 import { registerOpsRoutes } from './ops-routes.js';
 import { registerReviewRoutes } from './review-routes.js';
 import { registerEmailRoutes } from './email-routes.js';
 import { emailProviderFromEnv } from './email.js';
 import { registerAnalyticsRoutes } from './analytics-routes.js';
+import { registerStudentInvitationRoutes } from './student-invitation-routes.js';
+import { registerSupportRoutes } from './support-routes.js';
 import { toCsv } from './csv.js';
 import { evaluateQuota, parseQuotaBytes } from './quota.js';
 import { securityHeaders } from './security-headers.js';
 import { automaticallyGrade, gradeStatusAfterAuto, manualMarksWithinBounds, totalMarks } from './grading.js';
 import { createOtp, createResetToken, hashResetToken, otpConfig, passwordPolicy } from './password-reset.js';
-import { sendPasswordChangeConfirmationEmail, sendPasswordOtpEmail } from './mailer.js';
+import { sendPasswordChangeConfirmationEmail, sendPasswordOtpEmail, sendSignupOtpEmail } from './mailer.js';
 import { loadConfig } from './config.js';
 import { regionsForCountry, searchDirectory } from './institutions.js';
 import { beginAuthorization, configuredProviders, finishAuthorization, type OAuthProvider } from './oauth.js';
@@ -33,6 +37,9 @@ import { explanationResponseOpen, incidentStatusForExplanation, validExplanation
 import { isSupportedImage, isSupportedIdentityDocument } from './upload-validation.js';
 import { candidateListQuerySchema, candidateWhere, incidentListQuerySchema, incidentWhere, memberUpdateSchema, paginationHeaders, paginationOffset, questionOrderMatches, questionOrderSchema, memberCanBeManaged, wouldRemoveLastActiveAdmin, organizationApiRoles, prismaErrorResponse } from './organization-api.js';
 import { evidenceInventoryQuerySchema, evidenceReviewerRoles, evidenceUrlTtlSeconds, incidentReviewStatus, radioReviewStatus, canTransitionIncident, canTransitionRadio, evidencePaginationHeaders, evidenceOffset, privateEvidenceMetadataError, evidenceKeyMatchesAttempt, evidenceAttemptScopeMatches, uploadErrorHttpStatus, signedEvidenceUrlExpiresAt, sanitizeEvidenceDetails } from './evidence-api.js';
+import { codingExecutionRequest, codingQuestionInput, codingRateLimits, codingTestCaseInput } from './coding-contracts.js';
+import { judge0AdapterFromEnv, judge0LanguageIdsFromEnv } from './judge0-adapter.js';
+import { aggregateExecutionStatus, candidateExecutionResults, executeCodingCases } from './coding-execution-service.js';
 export const validateFileContent = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
@@ -73,13 +80,31 @@ const validateOptionalFileContent = (req: express.Request, res: express.Response
   return validateFileContent(req, res, next);
 };
 
-const registration = z.object({ name: z.string().min(2), email: z.string().email().transform(value => value.toLowerCase()), password: z.string().min(10), organizationName: z.string().min(2) });
+const coordinatorApplication = z.object({ name: z.string().trim().min(2).max(120), email: z.string().email().transform(value => value.toLowerCase()), password: z.string().min(10), organizationId: z.string().uuid(), verificationTicket: z.string().min(40).max(100) });
+const signupPurpose = z.enum(['student', 'coordinator', 'institution_admin']);
+const signupHash = (value: string) => crypto.createHmac('sha256', loadConfig().JWT_SECRET).update(value).digest('hex');
+const sameHash = (left: string, right: string) => {
+  const leftBuffer = Buffer.from(left, 'hex');
+  const rightBuffer = Buffer.from(right, 'hex');
+  return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+};
 const credentials = z.object({ email: z.string().email().transform(value => value.toLowerCase()), password: z.string().min(1) });
 const resetRequest = z.object({ email: z.string().email().transform(value => value.toLowerCase()) });
 const passwordResetOtp = resetRequest.extend({ otp: z.string().regex(/^\d{6}$/) });
 const resetPassword = z.object({ token: z.string().min(20).max(200), password: z.string().min(10), confirmPassword: z.string() }).refine(data => data.password === data.confirmPassword, { message: 'Passwords do not match', path: ['confirmPassword'] });
-const examInput = z.object({ title: z.string().min(3), instructions: z.string().max(10000).default(''), durationMinutes: z.number().int().positive().default(60), startsAt: z.string().datetime().optional(), endsAt: z.string().datetime().optional(), randomizeQuestions: z.boolean().default(false), randomizeOptions: z.boolean().default(false), requireVerification: z.boolean().default(true), interventionPolicy: z.object({ windowSeconds: z.number().int().min(30).max(3600).default(300), warningAt: z.number().int().min(1).default(1), pauseAt: z.number().int().min(2).default(3), terminateAt: z.number().int().min(3).default(5), automaticTerminationEnabled: z.boolean().default(false), fullscreenRequired: z.boolean().default(false) }).default({ windowSeconds: 300, warningAt: 1, pauseAt: 3, terminateAt: 5, automaticTerminationEnabled: false, fullscreenRequired: false }), accessCode: z.string().min(4).optional() });
-const questionInput = z.object({ type: z.enum(['mcq', 'multiple_select', 'true_false', 'short_answer', 'descriptive']), prompt: z.string().min(1), options: z.array(z.object({ id: z.string(), text: z.string() })).default([]), correctAnswer: z.unknown().optional(), marks: z.number().positive(), negativeMarks: z.number().min(0).default(0) });
+const examInput = z.object({ title: z.string().min(3), instructions: z.string().max(10000).default(''), durationMinutes: z.number().int().positive().default(60), startsAt: z.string().datetime().optional(), endsAt: z.string().datetime().optional(), randomizeQuestions: z.boolean().default(false), randomizeOptions: z.boolean().default(false), isPractice: z.boolean().default(false), interventionPolicy: z.object({ windowSeconds: z.number().int().min(30).max(3600).default(300), warningAt: z.number().int().min(1).default(1), pauseAt: z.number().int().min(2).default(3), terminateAt: z.number().int().min(3).default(5), automaticTerminationEnabled: z.boolean().default(false), fullscreenRequired: z.boolean().default(true) }).default({ windowSeconds: 300, warningAt: 1, pauseAt: 3, terminateAt: 5, automaticTerminationEnabled: false, fullscreenRequired: true }), accessCode: z.string().min(4).optional() });
+const questionInput = z.object({
+  type: z.enum(['mcq', 'multiple_select', 'true_false', 'short_answer', 'descriptive', 'coding']),
+  prompt: z.string().min(1),
+  options: z.array(z.object({ id: z.string(), text: z.string() })).default([]),
+  correctAnswer: z.unknown().optional(),
+  marks: z.number().positive(),
+  negativeMarks: z.number().min(0).default(0),
+  coding: codingQuestionInput.optional(),
+  codingTestCases: z.array(codingTestCaseInput).max(100).default([]),
+}).superRefine((data, ctx) => {
+  if (data.type === 'coding' && !data.coding) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['coding'], message: 'Coding question details are required' });
+});
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 const audit = (organizationId: string, actorId: string, action: string, targetType: string, targetId: string, metadata?: unknown) => prisma.auditLog.create({ data: { organizationId, actorId, action, targetType, targetId, metadata: metadata as Prisma.InputJsonValue | undefined } });
 const notify = (organizationId: string, userId: string, type: string, title: string, body: string, metadata?: unknown) => prisma.notification.create({ data: { organizationId, userId, type, title, body, metadata: metadata as Prisma.InputJsonValue | undefined, delivery: 'email_unconfigured' } });
@@ -106,19 +131,89 @@ const questionFields = (data: z.infer<typeof questionInput>, clearMissing = fals
   marks: data.marks,
   negativeMarks: data.negativeMarks
 });
+const codingQuestionFields = (data: z.infer<typeof codingQuestionInput>) => ({
+  title: data.title,
+  description: data.description,
+  difficulty: data.difficulty,
+  mode: data.mode,
+  inputFormat: data.inputFormat,
+  outputFormat: data.outputFormat,
+  constraints: data.constraints,
+  explanation: data.explanation,
+  languageIds: data.languageIds,
+  starterCode: data.starterCode,
+  timeLimitMs: data.timeLimitMs,
+  memoryLimitKb: data.memoryLimitKb,
+  comparisonMode: data.comparisonMode,
+});
 const orgConfig = (organizationId: string) => prisma.proctoringConfig.upsert({ where: { organizationId }, update: {}, create: { organizationId } });
 const shuffle = <T>(items: T[]) => { const copy = [...items]; for (let i = copy.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [copy[i], copy[j]] = [copy[j], copy[i]]; } return copy; };
-const proctorEventInput = z.object({ examId: z.string().uuid(), candidateId: z.string().uuid(), sessionId: z.string().uuid().optional(), attemptId: z.string().uuid(), type: z.enum(['face_missing', 'multiple_faces', 'looking_away', 'phone_detected', 'visibility_hidden', 'fullscreen_exit', 'window_blur', 'focus_regain', 'multiple_window_hint', 'network_interruption', 'camera_permission_lost']), occurredAt: z.string().datetime(), source: z.literal('browser'), details: z.record(z.unknown()).optional(), evidenceKey: z.string().max(512).optional() });
-const radioObservationInput = z.object({ organizationId: z.string().uuid(), examId: z.string().uuid(), candidateId: z.string().uuid(), attemptId: z.string().uuid(), source: z.enum(['bluetooth_le', 'wifi', 'scanner_health']), kind: z.enum(['advertisement', 'access_point', 'heartbeat', 'scan_unavailable', 'permission_denied', 'scan_error', 'scan_stopped']), rssi: z.number().int().min(-127).max(0).optional(), pseudonym: z.string().min(16).max(128).optional(), scannerStatus: z.enum(['active', 'unavailable', 'permission_denied', 'stopped', 'error']), errorCode: z.string().max(120).optional() }).superRefine((data, ctx) => { if (data.kind === 'advertisement' || data.kind === 'access_point') { if (!data.pseudonym) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'A session-scoped pseudonym is required for a radio observation' }); if (data.scannerStatus !== 'active') ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Radio observations require an active scanner status' }); } });
+const proctorEventInput = z.object({ examId: z.string().uuid(), candidateId: z.string().uuid(), sessionId: z.string().uuid().optional(), attemptId: z.string().uuid(), type: z.enum(['face_missing', 'multiple_faces', 'looking_away', 'phone_detected', 'camera_obstructed', 'visibility_hidden', 'fullscreen_exit', 'window_blur', 'focus_regain', 'multiple_window_hint', 'network_interruption', 'camera_permission_lost', 'screen_sharing_stopped']), occurredAt: z.string().datetime(), source: z.literal('browser'), details: z.record(z.unknown()).optional(), evidenceKey: z.string().max(512).optional() });
+const radioObservationInput = z.object({ organizationId: z.string().uuid(), examId: z.string().uuid(), candidateId: z.string().uuid(), attemptId: z.string().uuid(), source: z.enum(['bluetooth_le', 'wifi', 'scanner_health']), kind: z.enum(['advertisement', 'access_point', 'heartbeat', 'scan_unavailable', 'permission_denied', 'scan_error', 'scan_stopped']), rssi: z.number().int().min(-127).max(0).optional(), pseudonym: z.string().min(16).max(128).optional(), advertisedName: z.string().trim().min(1).max(80).refine(value => !/[\u0000-\u001f\u007f]/.test(value), 'Advertised name contains invalid control characters').optional(), scannerStatus: z.enum(['active', 'unavailable', 'permission_denied', 'stopped', 'error']), errorCode: z.string().max(120).optional() }).superRefine((data, ctx) => { if (data.kind === 'advertisement' || data.kind === 'access_point') { if (!data.pseudonym) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'A session-scoped pseudonym is required for a radio observation' }); if (data.scannerStatus !== 'active') ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Radio observations require an active scanner status' }); } if (data.advertisedName && data.source !== 'bluetooth_le') ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['advertisedName'], message: 'Advertised names are accepted only from Bluetooth LE' }); });
 
 const aiFrameSchema = z.object({
   face_presence: z.boolean(),
   face_count: z.number().int().min(0).max(20),
+  face_boxes: z.array(z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number(), confidence: z.number().min(0).max(1).nullable() })).max(20).default([]),
+  face_pose_estimates: z.array(z.object({
+    face_box: z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number(), confidence: z.number().min(0).max(1).nullable() }),
+    head_pose: z.object({ yaw_degrees: z.number(), pitch_degrees: z.number(), roll_degrees: z.number() }).nullable(),
+    looking_away: z.enum(['looking_away', 'looking_forward', 'unavailable']),
+  })).max(20).default([]),
   multiple_faces: z.boolean(),
   looking_away: z.enum(['looking_away', 'looking_forward', 'unavailable']),
   head_pose: z.object({ yaw_degrees: z.number(), pitch_degrees: z.number(), roll_degrees: z.number() }).nullable().optional(),
   phone_detection: z.enum(['detected', 'not_detected', 'unavailable']),
   phone_confidence: z.number().min(0).max(1).nullable().optional(),
+  phone_boxes: z.array(z.object({ x1: z.number(), y1: z.number(), x2: z.number(), y2: z.number(), confidence: z.number().min(0).max(1), label: z.string().max(80) })).max(20).default([]),
+  visible_devices: z.array(z.object({
+    kind: z.enum(['phone', 'tablet', 'laptop', 'screen']),
+    label: z.string().max(80),
+    confidence: z.number().min(0).max(1),
+    box: z.array(z.number()).length(4),
+  })).max(30).default([]),
+  readability_assessment: z.object({
+    status: z.enum(['potentially_readable', 'not_indicated']),
+    confidence: z.enum(['low']),
+    basis: z.string().max(500),
+    devices: z.array(z.object({
+      kind: z.enum(['phone', 'tablet', 'laptop', 'screen']),
+      label: z.string().max(80),
+      confidence: z.number().min(0).max(1),
+      box: z.array(z.number()).length(4),
+      visible: z.boolean(),
+      estimated_distance_band: z.enum(['near', 'medium', 'far']),
+      screen_bearing_from_face_degrees: z.number().nullable(),
+      view_alignment: z.enum(['roughly_aligned', 'not_indicated', 'unavailable']),
+      estimated_text_height_px: z.number().nonnegative(),
+      potentially_readable: z.boolean(),
+    })).max(30),
+    limitations: z.string().max(1000),
+  }).optional(),
+  proximity_context: z.array(z.object({
+    source: z.enum(['bluetooth_le', 'wifi']),
+    kind: z.string().max(40),
+    rssi: z.number().int().nullable(),
+    pseudonym: z.string().max(128).nullable(),
+    advertisedName: z.string().max(80).nullable(),
+    advertisedNameAvailable: z.boolean(),
+    observedAt: z.string().datetime(),
+    proximity: z.object({
+      band: z.enum(['near', 'medium', 'far', 'unknown']),
+      confidence: z.enum(['low', 'unavailable']),
+      calibration: z.string().max(80),
+    }),
+    association: z.literal('temporal_only_device_not_linked'),
+  })).max(20).optional(),
+  advertised_name_storage_available: z.boolean().optional(),
+  potential_visual_assistance: z.object({
+    flagged: z.boolean(),
+    confidence: z.enum(['low']),
+    rationale: z.string().max(500),
+  }).optional(),
+  camera_health: z.enum(['ok', 'obstructed']).default('ok'),
+  frame_quality: z.object({ mean_luminance: z.number(), luminance_stddev: z.number() }).optional(),
+  inference_ms: z.number().nonnegative().optional(),
   disclosure: z.string().max(1000).optional(),
   service_version: z.string().max(80).optional(),
   phone_model: z.string().max(40).optional()
@@ -126,6 +221,8 @@ const aiFrameSchema = z.object({
 const aiFrameLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false });
 export function createApp(storageImpl?: StorageInterface): express.Express {
   const app = express();
+  const codeRunner = judge0AdapterFromEnv();
+  const judge0LanguageIds = judge0LanguageIdsFromEnv();
   const storage = storageImpl ?? realStorage;
 
   app.disable('x-powered-by');
@@ -140,14 +237,17 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
     if (process.env.NODE_ENV === 'production') res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     next();
   });
-  app.use(express.json());
+  app.use(express.json({ limit: '1mb' }));
   app.use('/api', (_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
   app.use('/api/auth', rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false }));
   const passwordResetLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false });
+  const signupEmailLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false });
   const directoryLimiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false });
   const radioObservationLimiter = rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false });
+  const codingRunLimiter = rateLimit({ windowMs: codingRateLimits.run.windowMs, limit: codingRateLimits.run.limit, standardHeaders: 'draft-7', legacyHeaders: false });
+  const codingSubmitLimiter = rateLimit({ windowMs: codingRateLimits.submit.windowMs, limit: codingRateLimits.submit.limit, standardHeaders: 'draft-7', legacyHeaders: false });
   app.use('/api', rateLimit({ windowMs: 60_000, limit: 240, standardHeaders: 'draft-7', legacyHeaders: false }));
-  for (const name of ['organizationId', 'examId', 'candidateId', 'attemptId', 'questionId', 'incidentId', 'signalId', 'gradeId', 'userId', 'evidenceId', 'id']) {
+  for (const name of ['organizationId', 'examId', 'candidateId', 'attemptId', 'questionId', 'incidentId', 'signalId', 'gradeId', 'userId', 'evidenceId', 'invitationId', 'ticketId', 'id']) {
     app.param(name, (_req, res, next, value) => (isUuid(value) ? next() : res.status(404).json({ error: 'Not found' })));
   }
   app.get('/health', (_req, res) => res.json({ status: 'ok' }));
@@ -156,32 +256,47 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
       const key = verifyLocalEvidenceToken(String(req.params.token));
       if (!key.startsWith('organizations/')) return res.status(404).end();
       const object = await prisma.evidenceObject.findUnique({ where: { objectKey: key }, select: { organizationId: true, attemptId: true, mimeType: true, sizeBytes: true } });
-      if (!object || !evidenceKeyMatchesAttempt(key, object.organizationId, object.attemptId)) return res.status(404).end();
+      const staffDocument = object ? null : await prisma.staffVerificationRequest.findFirst({ where: { OR: [{ governmentIdDocument: key }, { institutionIdDocument: key }, { authorizationDocument: key }] }, select: { id: true } });
+      const verificationDocument = object || staffDocument ? null : await prisma.verificationRequest.findFirst({ where: { OR: [{ profilePhoto: key }, { idDocument: key }] }, select: { id: true } });
+      const institutionDocument = object || staffDocument || verificationDocument ? null : await prisma.institutionRequest.findFirst({ where: { OR: [{ governmentIdDocument: key }, { institutionIdDocument: key }, { authorizationLetterDocument: key }] }, select: { id: true } });
+      if ((!object || !evidenceKeyMatchesAttempt(key, object.organizationId, object.attemptId)) && !staffDocument && !verificationDocument && !institutionDocument) return res.status(404).end();
       const storage = req.app.get('storage') as StorageInterface;
       if (!storage.getPrivateDocument) return res.status(404).end();
       const bytes = await storage.getPrivateDocument(key);
-      if (!bytes || bytes.length !== object.sizeBytes) return res.status(404).end();
-      res.set({ 'Content-Type': object.mimeType, 'Content-Length': String(bytes.length), 'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Content-Disposition': 'inline' });
+      const metadata = object ? null : await storage.privateDocumentMetadata?.(key);
+      if (!bytes || (object && bytes.length !== object.sizeBytes) || (metadata?.contentLength !== undefined && bytes.length !== metadata.contentLength)) return res.status(404).end();
+      res.set({ 'Content-Type': object?.mimeType ?? metadata?.contentType ?? 'application/octet-stream', 'Content-Length': String(bytes.length), 'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Content-Disposition': 'inline' });
       return res.status(200).send(bytes);
     } catch {
       return res.status(404).end();
     }
   });
 
-  app.get('/api/student/monitoring-readiness', authenticate, async (_req: AuthRequest, res) => {
+  app.get('/api/student/monitoring-readiness', authenticate, async (req: AuthRequest, res) => {
+    const evidenceStorageReady = (req.app.get('storage') as StorageInterface).storageConfigured();
     const serviceUrl = process.env.AI_SERVICE_URL;
     const serviceToken = process.env.AI_SERVICE_TOKEN;
-    if (!serviceUrl || !serviceToken || serviceToken.length < 32) return res.status(503).json({ ready: false, aiService: 'not_configured', error: 'Configure AI_SERVICE_URL and a 32-character AI_SERVICE_TOKEN on the local server.' });
+    if (!serviceUrl || !serviceToken || serviceToken.length < 32) return res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'not_configured', error: 'Configure AI_SERVICE_URL and the same 32-character AI_SERVICE_TOKEN for the local server and AI service.' });
     try {
       const base = new URL(serviceUrl);
-      if (!['localhost', '127.0.0.1', '[::1]'].includes(base.hostname) || !['http:', 'https:'].includes(base.protocol)) return res.status(503).json({ ready: false, aiService: 'invalid_local_url' });
-      const response = await fetch(new URL('/health', base), { signal: AbortSignal.timeout(2500) });
-      if (!response.ok) return res.status(503).json({ ready: false, aiService: 'unavailable' });
+      const localHosts = ['localhost', '127.0.0.1', '[::1]'];
+      if (!['http:', 'https:'].includes(base.protocol) || (process.env.NODE_ENV !== 'production' && !localHosts.includes(base.hostname))) return res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'invalid_service_url', error: 'In production, AI_SERVICE_URL must point to the private AI service address reachable by the API.' });
+      const response = await fetch(new URL('/health/ready', base), {
+        headers: { Authorization: `Bearer ${serviceToken}` },
+        signal: AbortSignal.timeout(2500),
+      });
+      if (response.status === 401) return res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'authentication_mismatch', error: 'The Node backend and AI service must load the same AI_SERVICE_TOKEN from the shared environment.' });
+      if (response.status === 503) return res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'authentication_not_configured', error: 'Set the same 32-character AI_SERVICE_TOKEN for the local server and AI service.' });
+      if (!response.ok) return res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'unavailable', error: `The AI service returned HTTP ${response.status}.` });
       const health = await response.json() as Record<string, unknown>;
       const ready = health.mediapipe === 'ready' && health.phone_model === 'ready' && health.looking_away === 'ready' && health.multiple_faces === 'ready';
-      res.status(ready ? 200 : 503).json({ ready, aiService: ready ? 'ready' : 'models_unavailable', capabilities: { faceDetection: health.mediapipe === 'ready', phoneDetection: health.phone_model === 'ready', headOrientation: health.looking_away === 'ready', multipleFaces: health.multiple_faces === 'ready' }, note: 'Head orientation is an approximate review signal, not eye-gaze tracking.' });
+      const unavailableModels = [
+        health.mediapipe !== 'ready' && 'face analysis',
+        health.phone_model !== 'ready' && 'phone detection (configure YOLO_MODEL_PATH to a supported model)',
+      ].filter(Boolean);
+      res.status(ready ? 200 : 503).json({ ready, evidenceStorageReady, aiService: ready ? 'ready' : 'models_unavailable', ...(ready ? {} : { error: `The AI service is running, but these capabilities are unavailable: ${unavailableModels.join(', ')}.` }), capabilities: { faceDetection: health.mediapipe === 'ready', phoneDetection: health.phone_model === 'ready', headOrientation: health.looking_away === 'ready', multipleFaces: health.multiple_faces === 'ready' }, note: 'Head orientation is an approximate review signal, not eye-gaze tracking.' });
     } catch {
-      res.status(503).json({ ready: false, aiService: 'unavailable', error: 'Start the local ExamGuard AI service and check its model configuration.' });
+      res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'unavailable', error: 'The AI service is not responding. Check the hosted AI service health and API-to-AI network connection.' });
     }
   });
 
@@ -217,37 +332,732 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
   } catch { res.status(400).send('We could not complete provider sign-in. Verify the provider configuration and try again.'); } });
   app.get('/api/public/institutions/regions', directoryLimiter, (req, res) => { const countryCode = typeof req.query.countryCode === 'string' ? req.query.countryCode : ''; if (!/^[A-Za-z]{2}$/.test(countryCode)) return res.status(400).json({ error: 'A two-letter country code is required' }); res.json({ countryCode: countryCode.toUpperCase(), regions: regionsForCountry(countryCode) }); });
   app.get('/api/public/institutions/search', directoryLimiter, async (req, res) => { const country = typeof req.query.country === 'string' ? req.query.country.trim() : ''; const name = typeof req.query.name === 'string' ? req.query.name.trim() : ''; if (country.length < 2 || name.length < 2) return res.status(400).json({ error: 'Country and a two-character institution search are required' }); try { res.json({ source: 'hipolabs', results: await searchDirectory(country, name) }); } catch { res.status(503).json({ error: 'The public institution directory could not be reached after retrying. You can submit an institution review request below; this does not verify or create an institution.' }); } });
-  app.post('/api/public/institution-requests', directoryLimiter, async (req, res, next) => { try {
-    const data = z.object({ name: z.string().min(2).max(200), countryCode: z.string().regex(/^[A-Za-z]{2}$/), region: z.string().max(120).optional(), website: z.string().url().optional(), details: z.string().max(2000).optional(), requesterEmail: z.string().email().transform(value => value.toLowerCase()) }).parse(req.body);
-    const request = await prisma.institutionRequest.create({ data: { ...data, countryCode: data.countryCode.toUpperCase() } });
-    res.status(201).json({ reference: request.id, status: request.status });
+  app.get('/api/public/organizations', directoryLimiter, async (req, res, next) => { try {
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    if (search.length < 2 || search.length > 100) return res.status(400).json({ error: 'Enter 2 to 100 characters to search institutions.' });
+    const organizations = await prisma.organization.findMany({ where: { status: 'active', name: { contains: search, mode: 'insensitive' } }, select: { id: true, name: true }, orderBy: { name: 'asc' }, take: 20 });
+    res.json(organizations);
+  } catch (error) { next(error); } });
+  app.post('/api/public/signup-email/request', signupEmailLimiter, async (req, res, next) => { try {
+    const data = z.object({
+      email: z.string().email().transform(value => value.toLowerCase()),
+      purpose: signupPurpose,
+      organizationId: z.string().uuid().optional(),
+    }).superRefine((value, context) => {
+      if (value.purpose !== 'institution_admin' && !value.organizationId) context.addIssue({ code: 'custom', message: 'Select an active institution.' });
+      if (value.purpose === 'institution_admin' && value.organizationId) context.addIssue({ code: 'custom', message: 'Institution administrator verification does not use an institution ID.' });
+    }).parse(req.body);
+    if (!emailProviderFromEnv()) return res.status(503).json({ error: 'Email verification is unavailable because email delivery is not configured.' });
+    if (data.organizationId) {
+      const organization = await prisma.organization.findFirst({ where: { id: data.organizationId, status: 'active' }, select: { id: true } });
+      if (!organization) return res.status(404).json({ error: 'Select an active ExamGuard institution.' });
+    }
+    const user = await prisma.user.findUnique({ where: { email: data.email }, select: { id: true } });
+    const candidate = data.purpose === 'student' && data.organizationId
+      ? await prisma.candidate.findUnique({ where: { organizationId_email: { organizationId: data.organizationId, email: data.email } }, select: { id: true } })
+      : null;
+    const priorInstitutionRequest = data.purpose === 'institution_admin'
+      ? await prisma.institutionRequest.findFirst({ where: { requesterEmail: data.email, status: { in: ['submitted', 'under_review'] } }, select: { id: true } })
+      : null;
+    if (user || candidate || priorInstitutionRequest) return res.status(202).json({ message: 'If this address is eligible, a verification code will be sent.' });
+    const now = new Date();
+    const organizationId = data.organizationId ?? null;
+    const active = await prisma.signupEmailChallenge.findFirst({
+      where: { email: data.email, purpose: data.purpose, organizationId, consumedAt: null },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (active && now.getTime() - active.lastSentAt.getTime() < 60_000) return res.status(429).json({ error: 'Wait one minute before requesting another verification code.' });
+    const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, '0');
+    await prisma.$transaction(async tx => {
+      await tx.signupEmailChallenge.updateMany({ where: { email: data.email, purpose: data.purpose, organizationId, consumedAt: null }, data: { consumedAt: now } });
+      await tx.signupEmailChallenge.create({
+        data: { email: data.email, purpose: data.purpose, organizationId, codeHash: signupHash(code), expiresAt: new Date(now.getTime() + 10 * 60_000), lastSentAt: now },
+      });
+    });
+    const challenge = await prisma.signupEmailChallenge.findFirstOrThrow({ where: { email: data.email, purpose: data.purpose, organizationId, consumedAt: null }, orderBy: { createdAt: 'desc' } });
+    try {
+      await sendSignupOtpEmail(data.email, code);
+    } catch (error) {
+      await prisma.signupEmailChallenge.updateMany({ where: { id: challenge.id, consumedAt: null }, data: { consumedAt: new Date() } });
+      console.error('Signup email verification delivery failed:', error instanceof Error ? error.message : 'Unknown email error');
+      return res.status(503).json({ error: 'The verification email could not be delivered. Please try again later.' });
+    }
+    res.status(202).json({ message: 'If this address is eligible, a verification code will be sent.' });
+  } catch (error) { next(error); } });
+  app.post('/api/public/signup-email/verify', signupEmailLimiter, async (req, res, next) => { try {
+    const data = z.object({
+      email: z.string().email().transform(value => value.toLowerCase()),
+      purpose: signupPurpose,
+      organizationId: z.string().uuid().optional(),
+      code: z.string().regex(/^\d{6}$/),
+    }).parse(req.body);
+    const organizationId = data.organizationId ?? null;
+    const challenge = await prisma.signupEmailChallenge.findFirst({
+      where: { email: data.email, purpose: data.purpose, organizationId, consumedAt: null },
+      orderBy: { createdAt: 'desc' },
+    });
+    const now = new Date();
+    if (!challenge || challenge.expiresAt <= now || challenge.attempts >= 5 || challenge.verifiedAt) return res.status(400).json({ error: 'The verification code is invalid, expired, or already used.' });
+    if (!sameHash(signupHash(data.code), challenge.codeHash)) {
+      await prisma.signupEmailChallenge.updateMany({ where: { id: challenge.id, consumedAt: null, attempts: { lt: 5 } }, data: { attempts: { increment: 1 } } });
+      return res.status(400).json({ error: 'The verification code is invalid, expired, or already used.' });
+    }
+    const ticket = crypto.randomBytes(32).toString('base64url');
+    const verified = await prisma.signupEmailChallenge.updateMany({
+      where: { id: challenge.id, consumedAt: null, verifiedAt: null, expiresAt: { gt: now }, attempts: { lt: 5 } },
+      data: { verifiedAt: now, verificationTokenHash: signupHash(ticket) },
+    });
+    if (!verified.count) return res.status(400).json({ error: 'The verification code is invalid, expired, or already used.' });
+    res.json({ ticket });
+  } catch (error) { next(error); } });
+  app.post('/api/public/student-applications', directoryLimiter, upload.single('idDocument'), validateOptionalFileContent, async (req, res, next) => { try {
+   const data = z.object({
+     name: z.string().trim().min(2).max(120),
+     email: z.string().email().transform(value => value.toLowerCase()),
+     password: z.string().min(10),
+     organizationId: z.string().uuid(),
+     verificationTicket: z.string().min(40).max(100),
+   }).parse(req.body);
+   if (!passwordPolicy(data.password)) return res.status(400).json({ error: 'Password must contain upper and lower case letters, a number, and be at least 10 characters.' });
+   const idDocument = req.file;
+   if (!idDocument) return res.status(400).json({ error: 'Upload a government-issued ID document.' });
+   const organization = await prisma.organization.findFirst({ where: { id: data.organizationId, status: 'active' }, select: { id: true } });
+   if (!organization) return res.status(404).json({ error: 'Select an active ExamGuard institution.' });
+   const [existingUser, existingCandidate] = await Promise.all([
+     prisma.user.findUnique({ where: { email: data.email }, select: { id: true } }),
+     prisma.candidate.findUnique({ where: { organizationId_email: { organizationId: data.organizationId, email: data.email } }, select: { id: true } }),
+   ]);
+   if (existingUser || existingCandidate) return res.status(409).json({ error: 'This email already has an ExamGuard account or student profile.' });
+   const storage = req.app.get('storage') as StorageInterface;
+   if (!storage.storageConfigured()) return res.status(503).json({ error: 'Private document storage is not configured. Contact your institution administrator.' });
+   const candidateId = crypto.randomUUID();
+   const idDocumentKey = `organizations/${organization.id}/student-applications/${candidateId}/government-id`;
+   await storage.putPrivateDocument(idDocumentKey, idDocument.buffer, idDocument.mimetype);
+   const passwordHash = await bcrypt.hash(data.password, 12);
+   const created = await prisma.$transaction(async tx => {
+     const now = new Date();
+     const consumed = await tx.signupEmailChallenge.updateMany({
+       where: { email: data.email, purpose: 'student', organizationId: data.organizationId, verificationTokenHash: signupHash(data.verificationTicket), verifiedAt: { not: null }, expiresAt: { gt: now }, consumedAt: null },
+       data: { consumedAt: now },
+     });
+     if (!consumed.count) return null;
+     const createdUser = await tx.user.create({
+       data: { name: data.name, email: data.email, passwordHash },
+     });
+     await tx.membership.create({
+       data: { userId: createdUser.id, organizationId: data.organizationId, role: 'student', active: false },
+     });
+     const candidate = await tx.candidate.create({
+       data: { id: candidateId, organizationId: data.organizationId, userId: createdUser.id, name: data.name, email: data.email, emailVerifiedAt: now },
+     });
+     await tx.verificationRequest.create({
+       data: {
+         organizationId: data.organizationId,
+         candidateId: candidate.id,
+         status: 'submitted',
+         idDocument: idDocumentKey,
+         submittedAt: now,
+       },
+     });
+     return createdUser;
+   });
+   if (!created) return res.status(400).json({ error: 'Verify your email again before submitting this application.' });
+   await audit(data.organizationId, created.id, 'student_application.submitted', 'Candidate', candidateId);
+   res.status(201).json({ status: 'submitted', message: 'Your application is awaiting approval by your institution.' });
   } catch (error) {
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return res.status(409).json({ error: 'A matching institution request already exists' });
+   if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return res.status(409).json({ error: 'This email already has an ExamGuard account or student profile.' });
+   next(error);
+  } });
+  app.post('/api/auth/coordinator-applications', directoryLimiter, upload.fields([
+    { name: 'governmentIdDocument', maxCount: 1 },
+    { name: 'institutionIdDocument', maxCount: 1 },
+    { name: 'authorizationDocument', maxCount: 1 },
+  ]), async (req, res, next) => { try {
+    const data = coordinatorApplication.parse(req.body);
+    if (!passwordPolicy(data.password)) return res.status(400).json({ error: 'Password must contain upper and lower case letters, a number, and be at least 10 characters.' });
+    const files = req.files as Record<string, Express.Multer.File[]> | undefined;
+    const kinds = ['governmentIdDocument', 'institutionIdDocument', 'authorizationDocument'] as const;
+    const documents = kinds.map(kind => files?.[kind]?.[0]);
+    if (documents.some(file => !file)) return res.status(400).json({ error: 'Upload a government ID, institution ID, and university authorization letter.' });
+    for (const file of documents) {
+      if (!file || !['image/jpeg', 'image/png', 'image/webp', 'application/pdf'].includes(file.mimetype)) return res.status(415).json({ error: 'Proof files must be JPEG, PNG, WebP, or PDF.' });
+      const valid = file.mimetype === 'application/pdf' ? isSupportedIdentityDocument(file.mimetype, file.buffer) : isSupportedImage(file.mimetype, file.buffer);
+      if (!valid) return res.status(422).json({ error: 'A proof file does not match its declared file type.' });
+    }
+    const [organization, existingUser] = await Promise.all([
+      prisma.organization.findFirst({ where: { id: data.organizationId, status: 'active' }, select: { id: true, name: true } }),
+      prisma.user.findUnique({ where: { email: data.email }, select: { id: true } }),
+    ]);
+    if (!organization) return res.status(404).json({ error: 'Select an active ExamGuard institution.' });
+    if (existingUser) return res.status(409).json({ error: 'This email already has an ExamGuard account. Sign in or contact your institution administrator.' });
+    const validTicket = await prisma.signupEmailChallenge.findFirst({ where: { email: data.email, purpose: 'coordinator', organizationId: organization.id, verificationTokenHash: signupHash(data.verificationTicket), verifiedAt: { not: null }, expiresAt: { gt: new Date() }, consumedAt: null } });
+    if (!validTicket) return res.status(400).json({ error: 'Verify your email again before submitting this application.' });
+    const storage = req.app.get('storage') as StorageInterface;
+    if (!storage.storageConfigured()) return res.status(503).json({ error: 'Private document storage is not configured. Contact the institution administrator.' });
+    const applicationId = crypto.randomUUID();
+    const keys: Record<(typeof kinds)[number], string> = {
+      governmentIdDocument: `organizations/${organization.id}/staff-applications/${applicationId}/government-id`,
+      institutionIdDocument: `organizations/${organization.id}/staff-applications/${applicationId}/institution-id`,
+      authorizationDocument: `organizations/${organization.id}/staff-applications/${applicationId}/authorization-letter`,
+    };
+    await Promise.all(kinds.map((kind, index) => storage.putPrivateDocument(keys[kind], documents[index]!.buffer, documents[index]!.mimetype)));
+    const passwordHash = await bcrypt.hash(data.password, 12);
+    const result = await prisma.$transaction(async tx => {
+      const now = new Date();
+      const consumed = await tx.signupEmailChallenge.updateMany({
+        where: { email: data.email, purpose: 'coordinator', organizationId: organization.id, verificationTokenHash: signupHash(data.verificationTicket), verifiedAt: { not: null }, expiresAt: { gt: now }, consumedAt: null },
+        data: { consumedAt: now },
+      });
+      if (!consumed.count) return null;
+      const user = await tx.user.create({ data: { name: data.name, email: data.email, passwordHash, memberships: { create: { organizationId: organization.id, role: 'teacher', active: false } } } });
+      const request = await tx.staffVerificationRequest.create({ data: { organizationId: organization.id, userId: user.id, governmentIdDocument: keys.governmentIdDocument, institutionIdDocument: keys.institutionIdDocument, authorizationDocument: keys.authorizationDocument, status: 'submitted' } });
+      return { user, request };
+    });
+    if (!result) return res.status(400).json({ error: 'Verify your email again before submitting this application.' });
+    await audit(organization.id, result.user.id, 'staff_verification.submitted', 'StaffVerificationRequest', result.request.id);
+    res.status(201).json({ status: result.request.status, organization: organization.name, message: 'Application submitted. Your coordinator access remains locked until the institution administrator reviews your proof.' });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return res.status(409).json({ error: 'This email already has an ExamGuard account.' });
     next(error);
   } });
-  app.post('/api/auth/register', async (req, res, next) => { try {
-    const data = registration.parse(req.body);
+  app.post('/api/public/institution-requests', directoryLimiter, (_req, res) => res.status(410).json({ error: 'Submit an institution application with identity documents and an administrator account.' }));
+  app.post('/api/public/institution-applications', directoryLimiter, upload.fields([
+    { name: 'governmentIdDocument', maxCount: 1 },
+    { name: 'institutionIdDocument', maxCount: 1 },
+    { name: 'authorizationLetterDocument', maxCount: 1 },
+  ]), async (req, res, next) => { try {
+    const data = z.object({
+      contactName: z.string().trim().min(2).max(120),
+      name: z.string().trim().min(2).max(200),
+      countryCode: z.string().regex(/^[A-Za-z]{2}$/),
+      region: z.string().trim().max(120).optional(),
+      website: z.string().url().optional().or(z.literal('')),
+      details: z.string().trim().max(2000).optional(),
+      requesterEmail: z.string().email().transform(value => value.toLowerCase()),
+      password: z.string().min(10),
+      verificationTicket: z.string().min(40).max(100),
+    }).parse(req.body);
     if (!passwordPolicy(data.password)) return res.status(400).json({ error: 'Password must contain upper and lower case letters, a number, and be at least 10 characters.' });
-    const exists = await prisma.user.findUnique({ where: { email: data.email }, select: { id: true } });
-    if (exists) return res.status(409).json({ error: 'Email already registered' });
-    const slug = data.organizationName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') + '-' + Math.random().toString(36).slice(2, 6);
-    const user = await prisma.user.create({ data: { name: data.name, email: data.email, passwordHash: await bcrypt.hash(data.password, 12), memberships: { create: { role: 'institute_admin', organization: { create: { name: data.organizationName, slug } } } } }, include: { memberships: { include: { organization: true } } } });
-    const { organization } = user.memberships[0];
-    res.status(201).json({ token: signToken(user.id, user.updatedAt.getTime()), user: { id: user.id, name: user.name, email: user.email }, organization: { id: organization.id, name: organization.name }, role: 'institute_admin' });
+    const files = (req.files ?? {}) as Record<string, Express.Multer.File[]>;
+    const documentFields = [
+      ['governmentIdDocument', files.governmentIdDocument?.[0]],
+      ['institutionIdDocument', files.institutionIdDocument?.[0]],
+      ['authorizationLetterDocument', files.authorizationLetterDocument?.[0]],
+    ] as const;
+    if (documentFields.some(([, file]) => !file)) return res.status(400).json({ error: 'Government ID, institution ID, and authorization letter are required.' });
+    for (const [, file] of documentFields) {
+      if (!file || !['image/jpeg', 'image/png', 'image/webp', 'application/pdf'].includes(file.mimetype)) {
+        return res.status(415).json({ error: 'Proof files must be JPEG, PNG, WebP, or PDF.' });
+      }
+      const valid = file.mimetype === 'application/pdf'
+        ? isSupportedIdentityDocument(file.mimetype, file.buffer)
+        : isSupportedImage(file.mimetype, file.buffer);
+      if (!valid) return res.status(422).json({ error: 'A proof file does not match its declared file type.' });
+    }
+    const existing = await prisma.user.findUnique({ where: { email: data.requesterEmail }, select: { id: true } });
+    if (existing) return res.status(409).json({ error: 'This email already has an ExamGuard account. Sign in or use a different institutional contact email.' });
+    const validTicket = await prisma.signupEmailChallenge.findFirst({ where: { email: data.requesterEmail, purpose: 'institution_admin', organizationId: null, verificationTokenHash: signupHash(data.verificationTicket), verifiedAt: { not: null }, expiresAt: { gt: new Date() }, consumedAt: null } });
+    if (!validTicket) return res.status(400).json({ error: 'Verify your email again before submitting this application.' });
+    const requestId = crypto.randomUUID();
+    const storage = req.app.get('storage') as StorageInterface;
+    if (!storage.storageConfigured()) return res.status(503).json({ error: 'Private document storage is not configured. Contact the system administrator.' });
+    const keys: Record<string, string> = {};
+    for (const [field, file] of documentFields) {
+      if (!file) continue;
+      const key = `organizations/institution-applications/${requestId}/${field}-${crypto.randomUUID()}`;
+      await storage.putPrivateDocument(key, file.buffer, file.mimetype);
+      keys[field] = key;
+    }
+    const submitted = await prisma.$transaction(async tx => {
+      const now = new Date();
+      const consumed = await tx.signupEmailChallenge.updateMany({
+        where: { email: data.requesterEmail, purpose: 'institution_admin', organizationId: null, verificationTokenHash: signupHash(data.verificationTicket), verifiedAt: { not: null }, expiresAt: { gt: now }, consumedAt: null },
+        data: { consumedAt: now },
+      });
+      if (!consumed.count) return false;
+      await tx.user.create({
+        data: { name: data.contactName, email: data.requesterEmail, passwordHash: await bcrypt.hash(data.password, 12) },
+      });
+      await tx.institutionRequest.create({
+        data: {
+          id: requestId,
+          name: data.name,
+          countryCode: data.countryCode.toUpperCase(),
+          region: data.region || null,
+          website: data.website || null,
+          details: data.details || null,
+          requesterEmail: data.requesterEmail,
+          governmentIdDocument: keys.governmentIdDocument,
+          institutionIdDocument: keys.institutionIdDocument,
+          authorizationLetterDocument: keys.authorizationLetterDocument,
+        },
+      });
+      return true;
+    });
+    if (!submitted) return res.status(400).json({ error: 'Verify your email again before submitting this application.' });
+    res.status(201).json({ status: 'submitted', message: 'Your institution application is awaiting system-administrator review.' });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return res.status(409).json({ error: 'This email or institution application is already registered.' });
+    next(error);
+  } });
+  app.get('/api/platform/overview', authenticate, authorizePlatformAdmin, async (req: AuthRequest, res, next) => { try {
+    const filters = z.object({ days: z.coerce.number().int().min(7).max(90).default(30) }).parse(req.query);
+    const snapshotStartedAt = performance.now();
+    const activityStart = new Date();
+    activityStart.setUTCHours(0, 0, 0, 0);
+    activityStart.setUTCDate(activityStart.getUTCDate() - (filters.days - 1));
+    const previousStart = new Date(activityStart);
+    previousStart.setUTCDate(previousStart.getUTCDate() - filters.days);
+    const rangeEnd = new Date();
+    const [organizationCount, activeOrganizationCount, userCount, memberships, exams, attempts, institutionRequests, staffVerifications, activityRows, registrationRows, participationRows, examCreationRows, scoreSummary, scoreBuckets, recentAudit, detectionRows, incidentGroups, incidentTrendRows, evidenceSummary, evidenceKinds, emailOutbox, activeExamCount, liveExamDetails, comparisons] = await Promise.all([
+      prisma.organization.count({ where: { slug: { not: 'examguard-system' } } }),
+      prisma.organization.count({ where: { slug: { not: 'examguard-system' }, status: 'active' } }),
+      prisma.user.count(),
+      prisma.membership.groupBy({ by: ['role', 'active'], _count: { _all: true } }),
+      prisma.exam.groupBy({ by: ['status'], _count: { _all: true } }),
+      prisma.examAttempt.groupBy({ by: ['status'], _count: { _all: true } }),
+      prisma.institutionRequest.groupBy({ by: ['status'], _count: { _all: true } }),
+      prisma.staffVerificationRequest.groupBy({ by: ['status'], _count: { _all: true } }),
+      prisma.$queryRaw<Array<{ day: string; count: number }>>`
+        SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS day,
+               COUNT(*)::int AS count
+        FROM "audit_logs"
+        WHERE "createdAt" >= ${activityStart}
+        GROUP BY 1
+        ORDER BY 1
+      `,
+      prisma.$queryRaw<Array<{ day: string; count: number }>>`
+        SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS day,
+               COUNT(*)::int AS count
+        FROM "users"
+        WHERE "createdAt" >= ${activityStart}
+        GROUP BY 1
+        ORDER BY 1
+      `,
+      prisma.$queryRaw<Array<{ day: string; count: number }>>`
+        SELECT to_char(date_trunc('day', "startedAt"), 'YYYY-MM-DD') AS day,
+               COUNT(*)::int AS count
+        FROM "exam_attempts"
+        WHERE "startedAt" >= ${activityStart}
+        GROUP BY 1
+        ORDER BY 1
+      `,
+      prisma.$queryRaw<Array<{ day: string; count: number }>>`
+        SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS day,
+               COUNT(*)::int AS count
+        FROM "exams"
+        WHERE "createdAt" >= ${activityStart}
+        GROUP BY 1
+        ORDER BY 1
+      `,
+      prisma.$queryRaw<Array<{ averagePercent: number | null; count: number }>>`
+        SELECT AVG(("totalMarks" / NULLIF("maxMarks", 0)) * 100)::float8 AS "averagePercent",
+               COUNT(*)::int AS count
+        FROM "grades"
+        WHERE "status" = 'published' AND "maxMarks" > 0
+      `,
+      prisma.$queryRaw<Array<{ bucket: number; count: number }>>`
+        SELECT LEAST(FLOOR(("totalMarks" / NULLIF("maxMarks", 0)) * 10), 10)::int AS bucket,
+               COUNT(*)::int AS count
+        FROM "grades"
+        WHERE "status" = 'published' AND "maxMarks" > 0
+        GROUP BY 1
+        ORDER BY 1
+      `,
+      prisma.auditLog.findMany({
+        orderBy: { createdAt: 'desc' },
+        take: 20,
+        select: { id: true, action: true, targetType: true, createdAt: true, actor: { select: { name: true } } },
+      }),
+      prisma.$queryRaw<Array<{ day: string; type: string; source: string; count: number }>>`
+        SELECT to_char(date_trunc('day', "occurredAt"), 'YYYY-MM-DD') AS day,
+               type, source::text AS source, COUNT(*)::int AS count
+        FROM "proctoring_events"
+        WHERE "occurredAt" >= ${activityStart} AND type != 'ai_context_frame'
+        GROUP BY 1, 2, 3
+        ORDER BY 1, 2, 3
+      `,
+      prisma.incident.groupBy({ by: ['severity', 'status'], _count: { _all: true } }),
+      prisma.$queryRaw<Array<{ day: string; severity: string; count: number }>>`
+        SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS day,
+               severity::text AS severity, COUNT(*)::int AS count
+        FROM "incidents"
+        WHERE "createdAt" >= ${activityStart}
+        GROUP BY 1, 2
+        ORDER BY 1, 2
+      `,
+      prisma.evidenceObject.aggregate({ _count: { _all: true }, _sum: { sizeBytes: true } }),
+      prisma.evidenceObject.groupBy({ by: ['mimeType'], _count: { _all: true }, _sum: { sizeBytes: true }, orderBy: { _count: { id: 'desc' } } }),
+      prisma.emailOutbox.groupBy({ by: ['status'], _count: { _all: true } }),
+      prisma.exam.count({ where: { status: 'live' } }),
+      prisma.exam.findMany({
+        where: { status: 'live' },
+        orderBy: { startsAt: 'asc' },
+        take: 10,
+        select: { id: true, title: true, startsAt: true, endsAt: true, organization: { select: { name: true } }, _count: { select: { attempts: true } } },
+      }),
+      prisma.$queryRaw<Array<{ currentRegistrations: number; previousRegistrations: number; currentParticipation: number; previousParticipation: number; currentExams: number; previousExams: number }>>`
+        SELECT
+          (SELECT COUNT(*)::int FROM "users" WHERE "createdAt" >= ${activityStart} AND "createdAt" < ${rangeEnd}) AS "currentRegistrations",
+          (SELECT COUNT(*)::int FROM "users" WHERE "createdAt" >= ${previousStart} AND "createdAt" < ${activityStart}) AS "previousRegistrations",
+          (SELECT COUNT(*)::int FROM "exam_attempts" WHERE "startedAt" >= ${activityStart} AND "startedAt" < ${rangeEnd}) AS "currentParticipation",
+          (SELECT COUNT(*)::int FROM "exam_attempts" WHERE "startedAt" >= ${previousStart} AND "startedAt" < ${activityStart}) AS "previousParticipation",
+          (SELECT COUNT(*)::int FROM "exams" WHERE "createdAt" >= ${activityStart} AND "createdAt" < ${rangeEnd}) AS "currentExams",
+          (SELECT COUNT(*)::int FROM "exams" WHERE "createdAt" >= ${previousStart} AND "createdAt" < ${activityStart}) AS "previousExams"
+      `,
+    ]);
+    const snapshotQueryMs = Math.round(performance.now() - snapshotStartedAt);
+    const dailySeries = (rows: Array<{ day: string; count: number }>) => {
+      const dayCounts = new Map(rows.map(row => [row.day, row.count]));
+      return Array.from({ length: filters.days }, (_, index) => {
+        const day = new Date(activityStart);
+        day.setUTCDate(day.getUTCDate() + index);
+        const key = day.toISOString().slice(0, 10);
+        return { day: key, count: dayCounts.get(key) ?? 0 };
+      });
+    };
+    const dailyGroupedSeries = (rows: Array<{ day: string; type?: string; severity?: string; source?: string; count: number }>, keyName: 'type' | 'severity' | 'source') => {
+      const groups = [...new Set(rows.map(row => row[keyName]).filter((value): value is string => Boolean(value)))];
+      return groups.map(key => ({
+        key,
+        series: dailySeries(rows.filter(row => row[keyName] === key)),
+      }));
+    };
+    const membershipsByRole = Object.fromEntries(['platform_admin', 'institute_admin', 'teacher', 'proctor', 'student'].map(role => [
+      role,
+      memberships.filter(item => item.role === role).reduce((total, item) => total + item._count._all, 0),
+    ]));
+    const groupedCounts = <T extends { _count: { _all: number } }>(groups: T[], key: (group: T) => string) =>
+      Object.fromEntries(groups.map(group => [key(group), group._count._all]));
+    res.json({
+      generatedAt: new Date().toISOString(),
+      range: { days: filters.days, from: activityStart.toISOString().slice(0, 10) },
+      comparisons: comparisons[0] ?? { currentRegistrations: 0, previousRegistrations: 0, currentParticipation: 0, previousParticipation: 0, currentExams: 0, previousExams: 0 },
+      health: {
+        api: 'operational',
+        database: 'connected',
+        storage: realStorage.storageConfigured() ? 'configured_not_verified' : 'unconfigured',
+        aiService: process.env.AI_SERVICE_URL ? 'configured_not_verified' : 'unconfigured',
+        email: emailProviderFromEnv() ? 'configured_not_verified' : 'unconfigured',
+      },
+      runtime: {
+        uptimeSeconds: Math.floor(process.uptime()),
+        snapshotQueryMs,
+        memory: process.memoryUsage(),
+      },
+      organizations: { total: organizationCount, active: activeOrganizationCount },
+      users: {
+        total: userCount,
+        memberships: memberships.reduce((total, item) => total + item._count._all, 0),
+        activeMemberships: memberships.filter(item => item.active).reduce((total, item) => total + item._count._all, 0),
+        inactiveMemberships: memberships.filter(item => !item.active).reduce((total, item) => total + item._count._all, 0),
+        byRole: membershipsByRole,
+      },
+      exams: { total: exams.reduce((total, item) => total + item._count._all, 0), byStatus: groupedCounts(exams, item => item.status) },
+      attempts: { total: attempts.reduce((total, item) => total + item._count._all, 0), byStatus: groupedCounts(attempts, item => item.status) },
+      institutionRequests: groupedCounts(institutionRequests, item => item.status),
+      staffVerifications: groupedCounts(staffVerifications, item => item.status),
+      activity: dailySeries(activityRows),
+      registrations: dailySeries(registrationRows),
+      participation: dailySeries(participationRows),
+      examCreations: dailySeries(examCreationRows),
+      detections: {
+        byType: Object.fromEntries([...new Set(detectionRows.map(row => row.type))].map(type => [type, detectionRows.filter(row => row.type === type).reduce((total, row) => total + row.count, 0)])),
+        ai: dailyGroupedSeries(detectionRows.filter(row => row.source === 'ai_service'), 'type'),
+        phone: dailySeries(detectionRows.filter(row => row.type === 'phone_detected')),
+      },
+      incidents: {
+        bySeverity: Object.fromEntries(['low', 'medium', 'high', 'critical'].map(severity => [severity, incidentGroups.filter(row => row.severity === severity).reduce((total, row) => total + row._count._all, 0)])),
+        byStatus: Object.fromEntries([...new Set(incidentGroups.map(row => row.status))].map(status => [status, incidentGroups.filter(row => row.status === status).reduce((total, row) => total + row._count._all, 0)])),
+        trend: dailyGroupedSeries(incidentTrendRows, 'severity'),
+      },
+      evidence: {
+        items: evidenceSummary._count._all,
+        bytes: evidenceSummary._sum.sizeBytes ?? 0,
+        byType: evidenceKinds.map(row => ({ type: row.mimeType, count: row._count._all, bytes: row._sum.sizeBytes ?? 0 })),
+      },
+      emailOutbox: Object.fromEntries(emailOutbox.map(row => [row.status, row._count._all])),
+      activeExams: activeExamCount,
+      liveExamDetails,
+      performance: {
+        publishedGrades: scoreSummary[0]?.count ?? 0,
+        averagePercent: scoreSummary[0]?.averagePercent ?? null,
+        distribution: Array.from({ length: 11 }, (_, bucket) => ({
+          range: bucket === 10 ? '100%' : `${bucket * 10}-${bucket * 10 + 9}%`,
+          count: scoreBuckets.find(item => item.bucket === bucket)?.count ?? 0,
+        })),
+      },
+      recentAudit,
+    });
   } catch (error) { next(error); } });
+  app.get('/api/platform/members', authenticate, authorizePlatformAdmin, async (req: AuthRequest, res, next) => { try {
+    const filters = z.object({
+      page: z.coerce.number().int().min(1).max(10_000).default(1),
+      pageSize: z.coerce.number().int().min(1).max(100).default(25),
+      search: z.string().trim().max(120).optional(),
+      role: z.enum(['platform_admin', 'institute_admin', 'teacher', 'proctor', 'student']).optional(),
+      status: z.enum(['active', 'inactive']).optional(),
+    }).parse(req.query);
+    const where: Prisma.MembershipWhereInput = {
+      ...(filters.role ? { role: filters.role } : {}),
+      ...(filters.status ? { active: filters.status === 'active' } : {}),
+      ...(filters.search ? {
+        OR: [
+          { user: { is: { name: { contains: filters.search, mode: 'insensitive' } } } },
+          { user: { is: { email: { contains: filters.search, mode: 'insensitive' } } } },
+          { organization: { is: { name: { contains: filters.search, mode: 'insensitive' } } } },
+        ],
+      } : {}),
+    };
+    const [total, members] = await Promise.all([
+      prisma.membership.count({ where }),
+      prisma.membership.findMany({
+        where,
+        orderBy: [{ organization: { name: 'asc' } }, { user: { name: 'asc' } }, { userId: 'asc' }],
+        skip: paginationOffset(filters.page, filters.pageSize),
+        take: filters.pageSize,
+        select: {
+          userId: true, organizationId: true, role: true, active: true, createdAt: true,
+          user: { select: { name: true, email: true, isPlatformAdmin: true } },
+          organization: { select: { name: true } },
+        },
+      }),
+    ]);
+    res.set(paginationHeaders(filters.page, filters.pageSize, total));
+    res.json(members.map(({ userId, organizationId, role, active, createdAt, user, organization }) => ({
+      userId, organizationId, role, active, createdAt,
+      isPlatformAdmin: user.isPlatformAdmin,
+      name: user.name, email: user.email, organizationName: organization.name,
+    })));
+  } catch (error) { next(error); } });
+  app.patch('/api/platform/members/:organizationId/:userId', authenticate, authorizePlatformAdmin, async (req: AuthRequest, res, next) => { try {
+    const organizationId = String(req.params.organizationId);
+    const userId = String(req.params.userId);
+    if (!isUuid(organizationId) || !isUuid(userId)) return res.status(400).json({ error: 'Valid organization and user IDs are required.' });
+    const data = z.object({
+      role: z.enum(['institute_admin', 'teacher', 'proctor', 'student']),
+      active: z.boolean(),
+      reason: z.string().trim().min(3).max(1000),
+    }).parse(req.body);
+    const result = await prisma.$transaction(async tx => {
+      const existing = await tx.membership.findUnique({
+        where: { userId_organizationId: { userId, organizationId } },
+        include: { user: { select: { isPlatformAdmin: true } } },
+      });
+      if (!existing) return { kind: 'not_found' as const };
+      if (!memberCanBeManaged(req.auth!.userId, userId, existing.role, existing.user.isPlatformAdmin)) return { kind: 'forbidden' as const };
+      const activeAdminCount = await tx.membership.count({ where: { organizationId, role: 'institute_admin', active: true } });
+      if (wouldRemoveLastActiveAdmin(existing.role, existing.active, data.role, data.active, activeAdminCount)) return { kind: 'last_admin' as const };
+      const membership = await tx.membership.update({
+        where: { userId_organizationId: { userId, organizationId } },
+        data: { role: data.role, active: data.active },
+      });
+      await tx.auditLog.create({
+        data: {
+          organizationId,
+          actorId: req.auth!.userId,
+          action: 'platform.member_updated',
+          targetType: 'Membership',
+          targetId: userId,
+          metadata: { previousRole: existing.role, previousActive: existing.active, role: membership.role, active: membership.active, reason: data.reason },
+        },
+      });
+      return { kind: 'ok' as const, membership };
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    if (result.kind === 'not_found') return res.status(404).json({ error: 'Organization membership not found.' });
+    if (result.kind === 'forbidden') return res.status(403).json({ error: 'System administrator memberships cannot be changed here, and administrators cannot edit their own membership.' });
+    if (result.kind === 'last_admin') return res.status(409).json({ error: 'The institution must retain at least one active administrator.' });
+    res.json({ userId: result.membership.userId, organizationId: result.membership.organizationId, role: result.membership.role, active: result.membership.active });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      const known = prismaErrorResponse(error.code);
+      if (known) return res.status(known.status).json({ error: known.message });
+    }
+    next(error);
+  } });
+  app.get('/api/platform/institution-requests', authenticate, authorizePlatformAdmin, async (_req: AuthRequest, res, next) => { try {
+    const requests = await prisma.institutionRequest.findMany({ orderBy: { createdAt: 'desc' }, take: 200 });
+    res.json(requests.map(request => ({ id: request.id, name: request.name, requesterEmail: request.requesterEmail, status: request.status, createdAt: request.createdAt, documents: { governmentId: Boolean(request.governmentIdDocument), institutionId: Boolean(request.institutionIdDocument), authorizationLetter: Boolean(request.authorizationLetterDocument) } })));
+  } catch (error) { next(error); } });
+  app.get('/api/platform/institution-requests/:id/documents/:kind', authenticate, authorizePlatformAdmin, async (req: AuthRequest, res, next) => { try {
+    const kind = z.enum(['governmentIdDocument', 'institutionIdDocument', 'authorizationLetterDocument']).parse(req.params.kind);
+    const request = await prisma.institutionRequest.findUnique({ where: { id: String(req.params.id) }, select: { [kind]: true } });
+    const key = request?.[kind];
+    if (!key) return res.status(404).json({ error: 'Proof document not found.' });
+    const storage = req.app.get('storage') as StorageInterface;
+    const url = await storage.privateDocumentUrl(key);
+    await audit(req.auth!.organizationId!, req.auth!.userId, 'platform.institution_request.document_viewed', 'InstitutionRequest', String(req.params.id), { kind });
+    res.json({ url });
+  } catch (error) { next(error); } });
+  app.post('/api/platform/institution-requests/:id/decision', authenticate, authorizePlatformAdmin, async (req: AuthRequest, res, next) => { try {
+    const id = String(req.params.id);
+    const data = z.object({ action: z.enum(['approve', 'reject', 'under_review']), reason: z.string().min(3).max(1000).optional() }).parse(req.body);
+    const request = await prisma.institutionRequest.findUnique({ where: { id } });
+    if (!request) return res.status(404).json({ error: 'Institution request not found' });
+    if (data.action === 'approve' && (!request.governmentIdDocument || !request.institutionIdDocument || !request.authorizationLetterDocument)) {
+      return res.status(409).json({ error: 'Government ID, institution ID, and authorization letter are required before approval.' });
+    }
+    const applicant = data.action === 'approve'
+      ? await prisma.user.findUnique({ where: { email: request.requesterEmail }, select: { id: true } })
+      : null;
+    if (data.action === 'approve' && !applicant) return res.status(409).json({ error: 'The institution contact account is missing. Ask them to submit a new application.' });
+    const updated = await prisma.$transaction(async tx => {
+      if (data.action === 'approve') {
+        const changed = await tx.institutionRequest.updateMany({
+          where: { id, status: { in: ['submitted', 'under_review'] } },
+          data: { status: 'approved', reviewerId: req.auth!.userId, reviewReason: data.reason ?? null },
+        });
+        if (!changed.count) return null;
+        const organization = await tx.organization.create({
+          data: {
+            name: request.name,
+            slug: `${request.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'institution'}-${crypto.randomUUID().slice(0, 8)}`,
+          },
+        });
+        await tx.membership.create({ data: { userId: applicant!.id, organizationId: organization.id, role: 'institute_admin' } });
+        await tx.auditLog.create({ data: { organizationId: req.auth!.organizationId!, actorId: req.auth!.userId, action: `platform.institution_request.${data.action}`, targetType: 'InstitutionRequest', targetId: id, metadata: { reason: data.reason ?? null } } });
+        return { ...(await tx.institutionRequest.findUniqueOrThrow({ where: { id } })), organization };
+      }
+      const changed = await tx.institutionRequest.updateMany({
+        where: { id, status: { in: ['submitted', 'under_review'] } },
+        data: { status: data.action === 'reject' ? 'rejected' : 'under_review', reviewerId: req.auth!.userId, reviewReason: data.reason ?? null },
+      });
+      if (!changed.count) return null;
+      const reviewed = await tx.institutionRequest.findUnique({ where: { id } });
+      await tx.auditLog.create({ data: { organizationId: req.auth!.organizationId!, actorId: req.auth!.userId, action: `platform.institution_request.${data.action}`, targetType: 'InstitutionRequest', targetId: id, metadata: { reason: data.reason ?? null } } });
+      return reviewed;
+    });
+    if (!updated) return res.status(409).json({ error: 'This institution application was already reviewed. Reload the queue.' });
+    res.json(updated);
+  } catch (error) { next(error); } });
+  app.get('/api/platform/staff-verifications', authenticate, authorizePlatformAdmin, async (_req: AuthRequest, res, next) => { try {
+    const requests = await prisma.staffVerificationRequest.findMany({ include: { organization: { select: { id: true, name: true } }, user: { select: { id: true, name: true, email: true } } }, orderBy: { createdAt: 'desc' }, take: 200 });
+    res.json(requests.map(request => ({ id: request.id, status: request.status, createdAt: request.createdAt, organization: request.organization, user: request.user, documents: { governmentId: Boolean(request.governmentIdDocument), institutionId: Boolean(request.institutionIdDocument), authorizationLetter: Boolean(request.authorizationDocument) } })));
+  } catch (error) { next(error); } });
+  app.get('/api/platform/staff-verifications/:id/documents/:kind', authenticate, authorizePlatformAdmin, async (req: AuthRequest, res, next) => { try {
+    const kind = z.enum(['governmentIdDocument', 'institutionIdDocument', 'authorizationDocument']).parse(req.params.kind);
+    const request = await prisma.staffVerificationRequest.findUnique({ where: { id: String(req.params.id) }, select: { [kind]: true } });
+    const key = request?.[kind];
+    if (!key) return res.status(404).json({ error: 'Proof document not found.' });
+    const storage = req.app.get('storage') as StorageInterface;
+    const url = await storage.privateDocumentUrl(key);
+    await audit(req.auth!.organizationId!, req.auth!.userId, 'platform.staff_verification.document_viewed', 'StaffVerificationRequest', String(req.params.id), { kind });
+    res.json({ url });
+  } catch (error) { next(error); } });
+  app.post('/api/platform/staff-verifications/:id/decision', authenticate, authorizePlatformAdmin, async (req: AuthRequest, res, next) => { try {
+    const id = String(req.params.id);
+    const data = z.object({ action: z.enum(['approve', 'reject', 'request_more_information']), reason: z.string().min(3).max(1000).optional() }).parse(req.body);
+    const request = await prisma.staffVerificationRequest.findUnique({ where: { id } });
+    if (!request) return res.status(404).json({ error: 'Staff verification request not found' });
+    if (data.action === 'approve' && (!request.governmentIdDocument || !request.institutionIdDocument || !request.authorizationDocument)) return res.status(409).json({ error: 'All required identity documents must be present before approval.' });
+    const updated = await prisma.$transaction(async tx => {
+      const changed = await tx.staffVerificationRequest.updateMany({
+        where: { id, status: { in: ['submitted', 'resubmission_required'] } },
+        data: { status: data.action === 'approve' ? 'approved' : data.action === 'reject' ? 'rejected' : 'resubmission_required', reviewReason: data.reason ?? null, reviewedAt: new Date(), reviewedById: req.auth!.userId },
+      });
+      if (!changed.count) return null;
+      const reviewed = await tx.staffVerificationRequest.findUniqueOrThrow({ where: { id } });
+      await tx.auditLog.create({ data: { organizationId: request.organizationId, actorId: req.auth!.userId, action: `platform.staff_verification.${data.action}`, targetType: 'StaffVerificationRequest', targetId: id, metadata: { reason: data.reason ?? null } } });
+      return reviewed;
+    });
+    if (!updated) return res.status(409).json({ error: 'This staff verification was already reviewed. Reload the queue.' });
+    res.json(updated);
+  } catch (error) { next(error); } });
+  app.post('/api/organizations/:organizationId/staff-verifications', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
+    const data = z.object({ userId: z.string().uuid().optional(), governmentIdDocument: z.string().max(512).optional(), institutionIdDocument: z.string().max(512).optional(), authorizationDocument: z.string().max(512).optional() }).parse(req.body);
+    const organizationId = req.auth!.organizationId!;
+    const userId = data.userId ?? req.auth!.userId;
+    const membership = await prisma.membership.findFirst({ where: { organizationId, userId, active: true, role: { in: ['teacher', 'proctor'] } } });
+    if (!membership) return res.status(404).json({ error: 'Active coordinator or proctor membership not found' });
+    if (userId !== req.auth!.userId && req.auth!.role !== 'institute_admin') return res.status(403).json({ error: 'Only an institute administrator can submit verification for another staff member' });
+    const request = await prisma.staffVerificationRequest.upsert({ where: { organizationId_userId: { organizationId, userId } }, update: { ...data, userId, status: 'submitted', reviewReason: null }, create: { organizationId, userId, ...data, status: 'submitted' } });
+    await audit(organizationId, req.auth!.userId, 'staff_verification.submitted', 'StaffVerificationRequest', request.id);
+    res.status(201).json(request);
+  } catch (error) { next(error); } });
+  app.get('/api/organizations/:organizationId/staff-applications', authenticate, authorize('institute_admin'), async (req: AuthRequest, res, next) => { try {
+    const requests = await prisma.staffVerificationRequest.findMany({ where: { organizationId: req.auth!.organizationId!, status: { in: ['submitted', 'resubmission_required'] } }, include: { user: { select: { id: true, name: true, email: true } } }, orderBy: { createdAt: 'asc' } });
+    res.json(requests.map(request => ({ id: request.id, status: request.status, createdAt: request.createdAt, reviewReason: request.reviewReason, user: request.user, documents: { governmentId: Boolean(request.governmentIdDocument), institutionId: Boolean(request.institutionIdDocument), authorizationLetter: Boolean(request.authorizationDocument) } })));
+  } catch (error) { next(error); } });
+  app.post('/api/organizations/:organizationId/staff-applications/:id/decision', authenticate, authorize('institute_admin'), async (req: AuthRequest, res, next) => { try {
+    const data = z.object({ action: z.enum(['approve', 'reject', 'request_more_information']), reason: z.string().trim().min(3).max(1000).optional() }).parse(req.body);
+    if (data.action !== 'approve' && !data.reason) return res.status(400).json({ error: 'A reason is required for this decision.' });
+    const organizationId = req.auth!.organizationId!;
+    const id = String(req.params.id);
+    const request = await prisma.staffVerificationRequest.findFirst({ where: { id, organizationId, status: { in: ['submitted', 'resubmission_required'] } } });
+    if (!request) return res.status(404).json({ error: 'Coordinator application not found.' });
+    if (data.action === 'approve' && (!request.governmentIdDocument || !request.institutionIdDocument || !request.authorizationDocument)) return res.status(409).json({ error: 'All three proof documents are required before approval.' });
+    const status = data.action === 'approve' ? 'approved' : data.action === 'reject' ? 'rejected' : 'resubmission_required';
+    const updated = await prisma.$transaction(async tx => {
+      const changed = await tx.staffVerificationRequest.updateMany({ where: { id, organizationId, status: { in: ['submitted', 'resubmission_required'] } }, data: { status, reviewReason: data.reason ?? null, reviewedAt: new Date(), reviewedById: req.auth!.userId } });
+      if (!changed.count) return null;
+      await tx.membership.update({ where: { userId_organizationId: { userId: request.userId, organizationId } }, data: { active: data.action === 'approve' } });
+      return tx.staffVerificationRequest.findUnique({ where: { id } });
+    });
+    if (!updated) return res.status(409).json({ error: 'This application was already reviewed. Reload the queue.' });
+    await audit(organizationId, req.auth!.userId, `staff_application.${data.action}`, 'StaffVerificationRequest', id, { reason: data.reason });
+    await notify(organizationId, request.userId, `staff_application_${data.action}`, data.action === 'approve' ? 'Coordinator access approved' : data.action === 'reject' ? 'Coordinator application declined' : 'More information required', data.action === 'approve' ? 'Your coordinator access is active. You can now sign in.' : data.reason ?? 'Please contact your institution administrator.');
+    res.json(updated);
+  } catch (error) { next(error); } });
+  app.get('/api/organizations/:organizationId/staff-applications/:id/documents/:kind', authenticate, authorize('institute_admin'), async (req: AuthRequest, res, next) => { try {
+    const kind = z.enum(['governmentIdDocument', 'institutionIdDocument', 'authorizationDocument']).parse(req.params.kind);
+    const request = await prisma.staffVerificationRequest.findFirst({ where: { id: String(req.params.id), organizationId: req.auth!.organizationId! }, select: { [kind]: true } });
+    const key = request?.[kind];
+    if (!key) return res.status(404).json({ error: 'Proof document not found.' });
+    const storage = req.app.get('storage') as StorageInterface;
+    res.json({ url: await storage.privateDocumentUrl(key) });
+  } catch (error) { next(error); } });
+  app.post('/api/auth/register', (_req, res) => res.status(410).json({ error: 'Direct institution registration is disabled. Submit an institution identity application for system-administrator approval.' }));
   app.post('/api/auth/login', async (req, res, next) => { try {
     const data = credentials.parse(req.body);
     const user = await prisma.user.findUnique({ where: { email: data.email } });
     if (!user || !(await bcrypt.compare(data.password, user.passwordHash))) return res.status(401).json({ error: 'Invalid email or password' });
     const membership = await prisma.membership.findFirst({ where: { userId: user.id, active: true }, include: { organization: true }, orderBy: { createdAt: 'asc' } });
-    if (!membership) return res.status(403).json({ error: 'No active organization membership' });
+    if (!membership) {
+      const application = await prisma.staffVerificationRequest.findFirst({ where: { userId: user.id, status: { in: ['submitted', 'resubmission_required'] } }, include: { organization: { select: { name: true } } } });
+      if (application) return res.status(403).json({ error: `Your coordinator application for ${application.organization.name} is awaiting university review.` });
+      const institutionApplication = await prisma.institutionRequest.findFirst({ where: { requesterEmail: user.email }, orderBy: { createdAt: 'desc' }, select: { name: true, status: true, reviewReason: true } });
+      if (institutionApplication?.status === 'submitted' || institutionApplication?.status === 'under_review') {
+        return res.status(403).json({ error: `Your application for ${institutionApplication.name} is awaiting system-administrator review.` });
+      }
+      if (institutionApplication?.status === 'rejected') {
+        return res.status(403).json({ error: `Your institution application was not approved${institutionApplication.reviewReason ? `: ${institutionApplication.reviewReason}` : '.'}` });
+      }
+      const candidate = await prisma.candidate.findFirst({ where: { userId: user.id }, include: { verificationRequests: { orderBy: { createdAt: 'desc' }, take: 1, select: { status: true, rejectionReason: true } } } });
+      const verification = candidate?.verificationRequests[0];
+      if (candidate && verification?.status !== 'approved') {
+        return res.status(403).json({ error: verification?.status === 'rejected'
+          ? `Your student application was not approved${verification.rejectionReason ? `: ${verification.rejectionReason}` : '.'}`
+          : 'Your student application is awaiting approval by your institution.' });
+      }
+      return res.status(403).json({ error: 'No active organization membership' });
+    }
     res.json({ token: signToken(user.id, user.updatedAt.getTime()), user: { id: user.id, name: user.name, email: user.email }, organization: { id: membership.organization.id, name: membership.organization.name }, role: membership.role });
+  } catch (error) { next(error); } });
+  app.get('/api/organizations/:organizationId/teacher-profile', authenticate, authorize('teacher'), async (req: AuthRequest, res, next) => { try {
+    const membership = await prisma.membership.findUnique({
+      where: { userId_organizationId: { userId: req.auth!.userId, organizationId: req.auth!.organizationId! } },
+      select: { subjects: true },
+    });
+    if (!membership) return res.status(404).json({ error: 'Teacher profile not found.' });
+    res.json({ subjects: membership.subjects });
+  } catch (error) { next(error); } });
+  app.patch('/api/organizations/:organizationId/teacher-profile', authenticate, authorize('teacher'), async (req: AuthRequest, res, next) => { try {
+    const data = z.object({ subjects: z.array(z.string().trim().min(1).max(80)).max(20) }).parse(req.body);
+    const subjects = [...new Map(data.subjects.map(subject => [subject.toLocaleLowerCase(), subject])).values()];
+    const organizationId = req.auth!.organizationId!;
+    const membership = await prisma.membership.update({
+      where: { userId_organizationId: { userId: req.auth!.userId, organizationId } },
+      data: { subjects },
+      select: { subjects: true },
+    });
+    await audit(organizationId, req.auth!.userId, 'teacher_profile.subjects_updated', 'Membership', req.auth!.userId, { subjects });
+    res.json({ subjects: membership.subjects });
   } catch (error) { next(error); } });
   app.post('/api/auth/password-reset/request', passwordResetLimiter, async (req, res, next) => { try {
     const { email } = resetRequest.parse(req.body);
-    const generic = { message: 'If an account exists, a verification code will be sent.' };
+    const generic = { message: 'If an account exists and email delivery is working, a verification code will be sent.' };
     const user = await prisma.user.findUnique({ where: { email } });
-    if (!user || process.env.EMAIL_PROVIDER !== 'webhook' || !process.env.EMAIL_URL || !process.env.EMAIL_FROM) return res.status(202).json(generic);
+    if (!user || !emailProviderFromEnv()) return res.status(202).json(generic);
     const now = new Date();
     const config = otpConfig();
     const active = await prisma.passwordResetToken.findFirst({ where: { userId: user.id, usedAt: null }, orderBy: { createdAt: 'desc' } });
@@ -258,7 +1068,10 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
       update: { tokenHash: hashResetToken(otp), expiresAt: new Date(now.getTime() + config.ttlMs), usedAt: null, otpAttempts: 0, lastSentAt: now, otpVerifiedAt: null },
       create: { userId: user.id, tokenHash: hashResetToken(otp), expiresAt: new Date(now.getTime() + config.ttlMs), lastSentAt: now },
     });
-    try { await sendPasswordOtpEmail(user.email, otp); } catch { await prisma.passwordResetToken.delete({ where: { id: reset.id } }); console.warn('Password reset OTP delivery failed'); }
+    try { await sendPasswordOtpEmail(user.email, otp); } catch (error) {
+      await prisma.passwordResetToken.delete({ where: { id: reset.id } });
+      console.warn('Password reset OTP delivery failed:', error instanceof Error ? error.message : 'Unknown email error');
+    }
     const membership = await prisma.membership.findFirst({ where: { userId: user.id, active: true } });
     if (membership) await audit(membership.organizationId, user.id, 'password_reset.requested', 'User', user.id);
     res.status(202).json(generic);
@@ -298,19 +1111,18 @@ app.post('/api/auth/password-reset/confirm', passwordResetLimiter, async (req, r
 } catch (error) { next(error); } });
 app.get('/api/organizations/:organizationId/dashboard', authenticate, authorize('institute_admin', 'teacher', 'proctor'), async (req: AuthRequest, res, next) => { try {
   const organizationId = req.auth!.organizationId!;
-  const [exams, candidates, verificationPending, openIncidents, incidents, activeSessions, pendingExplanations, awaitingEvaluation, pendingManual, readyToPublish] = await Promise.all([
-    prisma.exam.count({ where: { organizationId } }),
+  const [exams, candidates, openIncidents, incidents, activeSessions, pendingExplanations, awaitingEvaluation, pendingManual, readyToPublish] = await Promise.all([
+    prisma.exam.count({ where: { organizationId, isPractice: false } }),
     prisma.candidate.count({ where: { organizationId } }),
-    prisma.verificationRequest.count({ where: { organizationId, status: { in: ['submitted', 'resubmission_required'] } } }),
     prisma.incident.count({ where: { organizationId, status: 'open' } }),
     prisma.incident.findMany({ where: { organizationId, status: 'open' }, orderBy: { createdAt: 'desc' }, take: 5 }),
     prisma.examAttempt.count({ where: { organizationId, status: 'in_progress' } }),
     prisma.studentExplanation.count({ where: { organizationId, status: { in: ['requested', 'follow_up'] } } }),
-    prisma.examAttempt.count({ where: { organizationId, status: { in: ['submitted', 'expired'] }, grade: { is: null } } }),
-    prisma.grade.count({ where: { organizationId, status: 'pending_manual' } }),
-    prisma.grade.count({ where: { organizationId, status: 'graded' } })
+    prisma.examAttempt.count({ where: { organizationId, exam: { isPractice: false }, status: { in: ['submitted', 'expired'] }, grade: { is: null } } }),
+    prisma.grade.count({ where: { organizationId, exam: { isPractice: false }, status: 'pending_manual' } }),
+    prisma.grade.count({ where: { organizationId, exam: { isPractice: false }, status: 'graded' } })
   ]);
-  res.json({ stats: { exams, candidates, verificationPending, openIncidents, activeSessions, pendingExplanations, awaitingEvaluation, pendingManual, readyToPublish }, incidents });
+  res.json({ stats: { exams, candidates, openIncidents, activeSessions, pendingExplanations, awaitingEvaluation, pendingManual, readyToPublish }, incidents });
 } catch (error) { next(error); } });
 app.get('/api/system/status', authenticate, async (_req: AuthRequest, res) => {
   const storage = realStorage;
@@ -389,6 +1201,93 @@ app.get('/api/organizations/:organizationId/exams', authenticate, authorize('ins
   const exams = await prisma.exam.findMany({ where: tenantFilter(req.auth!.organizationId!), orderBy: { createdAt: 'desc' } });
   res.json(exams.map(examToJson));
 } catch (error) { next(error); } });
+app.get('/api/organizations/:organizationId/exam-templates', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
+  const templates = await prisma.examTemplate.findMany({
+    where: { organizationId: req.auth!.organizationId! },
+    orderBy: [{ name: 'asc' }, { createdAt: 'desc' }],
+    select: { id: true, name: true, description: true, createdAt: true },
+  });
+  res.json(templates);
+} catch (error) { next(error); } });
+app.get('/api/organizations/:organizationId/exam-templates/:templateId', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
+  const template = await prisma.examTemplate.findFirst({
+    where: { id: String(req.params.templateId), organizationId: req.auth!.organizationId! },
+    select: { id: true, name: true, description: true, settings: true, questions: true },
+  });
+  if (!template) return res.status(404).json({ error: 'Exam template not found' });
+  res.json(template);
+} catch (error) { next(error); } });
+app.post('/api/organizations/:organizationId/exam-templates', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
+  const data = z.object({
+    name: z.string().trim().min(2).max(160),
+    description: z.string().trim().max(1000).optional(),
+    sourceExamId: z.string().uuid(),
+  }).parse(req.body);
+  const organizationId = req.auth!.organizationId!;
+  const exam = await prisma.exam.findFirst({ where: { id: data.sourceExamId, organizationId, status: 'draft' } });
+  if (!exam) return res.status(404).json({ error: 'Only an editable draft exam can be saved as a template' });
+  const questions = await prisma.question.findMany({
+    where: { organizationId, examId: exam.id },
+    orderBy: [{ position: 'asc' }, { id: 'asc' }],
+    include: { codingQuestion: { include: { testCases: { orderBy: { position: 'asc' } } } } },
+  });
+  if (!questions.length) return res.status(400).json({ error: 'Add and save at least one question before creating a template' });
+  const questionSnapshot = questions.map(question => ({
+    type: question.type,
+    prompt: question.prompt,
+    options: question.options ?? [],
+    correctAnswer: question.correctAnswer,
+    marks: question.marks,
+    negativeMarks: question.negativeMarks,
+    ...(question.codingQuestion ? {
+      coding: {
+        title: question.codingQuestion.title,
+        description: question.codingQuestion.description,
+        difficulty: question.codingQuestion.difficulty,
+        mode: question.codingQuestion.mode,
+        inputFormat: question.codingQuestion.inputFormat,
+        outputFormat: question.codingQuestion.outputFormat,
+        constraints: question.codingQuestion.constraints,
+        explanation: question.codingQuestion.explanation,
+        languageIds: question.codingQuestion.languageIds,
+        starterCode: question.codingQuestion.starterCode,
+        timeLimitMs: question.codingQuestion.timeLimitMs,
+        memoryLimitKb: question.codingQuestion.memoryLimitKb,
+        comparisonMode: question.codingQuestion.comparisonMode,
+      },
+      codingTestCases: question.codingQuestion.testCases.map(({ input, expectedOutput, visibility, position }) => ({ input, expectedOutput, visibility, position })),
+    } : {}),
+  }));
+  const template = await prisma.examTemplate.create({
+    data: {
+      organizationId,
+      createdById: req.auth!.userId,
+      name: data.name,
+      description: data.description,
+      settings: {
+        title: exam.title,
+        instructions: exam.instructions,
+        durationMinutes: exam.durationMinutes,
+        isPractice: exam.isPractice,
+        randomizeQuestions: exam.randomizeQuestions,
+        randomizeOptions: exam.randomizeOptions,
+        interventionPolicy: policyOf(exam),
+      },
+      questions: questionSnapshot as Prisma.InputJsonValue,
+    },
+    select: { id: true, name: true, description: true, createdAt: true },
+  });
+  await audit(organizationId, req.auth!.userId, 'exam_template.created', 'ExamTemplate', template.id, { sourceExamId: exam.id, questionCount: questionSnapshot.length });
+  res.status(201).json(template);
+} catch (error) { next(error); } });
+app.delete('/api/organizations/:organizationId/exam-templates/:templateId', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
+  const organizationId = req.auth!.organizationId!;
+  const id = String(req.params.templateId);
+  const deleted = await prisma.examTemplate.deleteMany({ where: { id, organizationId } });
+  if (!deleted.count) return res.status(404).json({ error: 'Exam template not found' });
+  await audit(organizationId, req.auth!.userId, 'exam_template.deleted', 'ExamTemplate', id);
+  res.status(204).end();
+} catch (error) { next(error); } });
 app.post('/api/organizations/:organizationId/exams', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
   const { accessCode, interventionPolicy: policy, startsAt, endsAt, ...examData } = examInput.parse(req.body);
   const exam = await prisma.exam.create({
@@ -446,24 +1345,40 @@ app.get('/api/organizations/:organizationId/candidates', authenticate, authorize
   const orderBy = [{ [filters.sortBy]: filters.sortOrder }, { id: 'asc' }] as Prisma.CandidateOrderByWithRelationInput[];
   const [total, candidates] = await Promise.all([
     prisma.candidate.count({ where }),
-    prisma.candidate.findMany({ where, orderBy, skip: paginationOffset(filters.page, filters.pageSize), take: filters.pageSize })
+    prisma.candidate.findMany({
+      where,
+      orderBy,
+      skip: paginationOffset(filters.page, filters.pageSize),
+      take: filters.pageSize,
+      include: { verificationRequests: { where: { organizationId }, select: { status: true }, take: 1 } },
+    })
   ]);
   res.set(paginationHeaders(filters.page, filters.pageSize, total));
-  res.json(candidates);
+  res.json(candidates.map(({ verificationRequests, ...candidate }) => ({
+    ...candidate,
+    verificationStatus: verificationRequests[0]?.status ?? 'not_submitted',
+  })));
 } catch (error) { next(error); } });
 app.get('/api/organizations/:organizationId/candidates/:candidateId', authenticate, authorize('institute_admin', 'teacher', 'proctor'), async (req: AuthRequest, res, next) => { try {
   const organizationId = req.auth!.organizationId!;
   const candidate = await prisma.candidate.findFirst({ where: { id: String(req.params.candidateId), organizationId }, select: { id: true, name: true, email: true, phone: true, externalId: true, emailVerifiedAt: true, phoneVerifiedAt: true, userId: true } });
   if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
   const [verification, assignments, attempts, grades] = await Promise.all([
-    prisma.verificationRequest.findUnique({ where: { organizationId_candidateId: { organizationId, candidateId: candidate.id } }, select: { id: true, status: true, submittedAt: true, reviewedAt: true, rejectionReason: true } }),
-    prisma.examAssignment.findMany({ where: { organizationId, candidateId: candidate.id }, include: { exam: { select: { id: true, title: true, status: true, startsAt: true, endsAt: true, durationMinutes: true } } } }),
+    prisma.verificationRequest.findUnique({ where: { organizationId_candidateId: { organizationId, candidateId: candidate.id } }, select: { id: true, status: true, submittedAt: true, reviewedAt: true, rejectionReason: true, idDocument: true } }),
+    prisma.examAssignment.findMany({ where: { organizationId, candidateId: candidate.id }, include: { exam: { select: { id: true, title: true, status: true, startsAt: true, endsAt: true, durationMinutes: true, isPractice: true } } } }),
     prisma.examAttempt.findMany({ where: { organizationId, candidateId: candidate.id }, select: { id: true, examId: true, status: true, startedAt: true, submittedAt: true, deadlineAt: true, receiptCode: true } }),
-    prisma.grade.findMany({ where: { organizationId, candidateId: candidate.id }, select: { id: true, examId: true, totalMarks: true, maxMarks: true, status: true, publishedAt: true } })
+    prisma.grade.findMany({ where: { organizationId, candidateId: candidate.id, exam: { isPractice: false } }, select: { id: true, examId: true, totalMarks: true, maxMarks: true, status: true, publishedAt: true } })
   ]);
   res.json({
     candidate: { id: candidate.id, name: candidate.name, email: candidate.email, phone: candidate.phone, externalId: candidate.externalId, emailVerifiedAt: candidate.emailVerifiedAt, phoneVerifiedAt: candidate.phoneVerifiedAt, accountLinked: Boolean(candidate.userId) },
-    verification: verification ?? { status: 'not_submitted' },
+    verification: verification ? {
+      id: verification.id,
+      status: verification.status,
+      submittedAt: verification.submittedAt,
+      reviewedAt: verification.reviewedAt,
+      rejectionReason: verification.rejectionReason,
+      hasIdentityDocument: Boolean(verification.idDocument),
+    } : { status: 'not_submitted' },
     assessments: assignments.map(assignment => ({ exam: assignment.exam, attempt: attempts.find(attempt => attempt.examId === assignment.examId), grade: grades.find(grade => grade.examId === assignment.examId) }))
   });
 } catch (error) { next(error); } });
@@ -504,7 +1419,7 @@ app.post('/api/organizations/:organizationId/exams/:examId/questions', authentic
   const examId = String(req.params.examId);
   const exam = await prisma.exam.findFirst({ where: { id: examId, organizationId, status: 'draft' }, select: { id: true } });
   if (!exam) return res.status(404).json({ error: 'Draft exam not found' });
-  const question = await prisma.question.create({ data: { ...questionFields(data), organizationId, examId, position: await prisma.question.count({ where: { examId } }) } });
+  const question = await prisma.question.create({ data: { ...questionFields(data), organizationId, examId, position: await prisma.question.count({ where: { examId } }), ...(data.coding ? { codingQuestion: { create: { organizationId, ...codingQuestionFields(data.coding), testCases: { create: data.codingTestCases.map(testCase => ({ organizationId, ...testCase })) } } } } : {}) }, include: { codingQuestion: { include: { testCases: true } } } });
   res.status(201).json(question);
 } catch (error) { next(error); } });
 app.delete('/api/organizations/:organizationId/exams/:examId/questions/:questionId', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
@@ -520,7 +1435,7 @@ app.delete('/api/organizations/:organizationId/exams/:examId/questions/:question
 } catch (error) { next(error); } });
 app.get('/api/organizations/:organizationId/exams/:examId/questions', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
   const examId = String(req.params.examId);
-  res.json(await prisma.question.findMany({ where: { organizationId: req.auth!.organizationId!, examId }, orderBy: { position: 'asc' } }));
+  res.json(await prisma.question.findMany({ where: { organizationId: req.auth!.organizationId!, examId }, orderBy: { position: 'asc' }, include: { codingQuestion: { include: { testCases: true } } } }));
 } catch (error) { next(error); } });
 app.put('/api/organizations/:organizationId/exams/:examId/questions/order', authenticate, authorize(...organizationApiRoles.questionManage), async (req: AuthRequest, res, next) => { try {
   const data = questionOrderSchema.parse(req.body);
@@ -567,7 +1482,7 @@ app.post('/api/organizations/:organizationId/question-banks', authenticate, auth
   res.status(201).json(bank);
 } catch (error) { next(error); } });
 app.get('/api/organizations/:organizationId/question-banks/:bankId/questions', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
-  res.json(await prisma.question.findMany({ where: { organizationId: req.auth!.organizationId!, bankId: String(req.params.bankId), examId: null }, orderBy: { createdAt: 'desc' } }));
+  res.json(await prisma.question.findMany({ where: { organizationId: req.auth!.organizationId!, bankId: String(req.params.bankId), examId: null }, orderBy: { createdAt: 'desc' }, include: { codingQuestion: { include: { testCases: true } } } }));
 } catch (error) { next(error); } });
 app.post('/api/organizations/:organizationId/question-banks/:bankId/questions', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
   const data = questionInput.parse(req.body);
@@ -575,7 +1490,15 @@ app.post('/api/organizations/:organizationId/question-banks/:bankId/questions', 
   const bankId = String(req.params.bankId);
   const bank = await prisma.questionBank.findFirst({ where: { id: bankId, organizationId }, select: { id: true } });
   if (!bank) return res.status(404).json({ error: 'Question bank not found' });
-  const question = await prisma.question.create({ data: { ...questionFields(data), organizationId, bankId } });
+  const question = await prisma.question.create({
+    data: {
+      ...questionFields(data),
+      organizationId,
+      bankId,
+      ...(data.coding ? { codingQuestion: { create: { organizationId, ...codingQuestionFields(data.coding), testCases: { create: data.codingTestCases.map(testCase => ({ organizationId, ...testCase })) } } } } : {}),
+    },
+    include: { codingQuestion: { include: { testCases: true } } },
+  });
   await audit(organizationId, req.auth!.userId, 'question_bank.question_created', 'Question', question.id);
   res.status(201).json(question);
 } catch (error) { next(error); } });
@@ -583,9 +1506,22 @@ app.put('/api/organizations/:organizationId/question-banks/:bankId/questions/:qu
   const data = questionInput.parse(req.body);
   const organizationId = req.auth!.organizationId!;
   const questionId = String(req.params.questionId);
-  const updated = await prisma.question.updateMany({ where: { id: questionId, organizationId, bankId: String(req.params.bankId), examId: null }, data: questionFields(data, true) });
-  if (updated.count === 0) return res.status(404).json({ error: 'Editable question-bank question not found' });
-  const question = await prisma.question.findUniqueOrThrow({ where: { id: questionId } });
+  const question = await prisma.$transaction(async tx => {
+    const existing = await tx.question.findFirst({ where: { id: questionId, organizationId, bankId: String(req.params.bankId), examId: null }, select: { id: true } });
+    if (!existing) return null;
+    await tx.question.update({ where: { id: questionId }, data: questionFields(data, true) });
+    if (data.coding) {
+      await tx.codingQuestion.upsert({
+        where: { questionId },
+        create: { questionId, organizationId, ...codingQuestionFields(data.coding), testCases: { create: data.codingTestCases.map(testCase => ({ organizationId, ...testCase })) } },
+        update: { ...codingQuestionFields(data.coding), testCases: { deleteMany: {}, create: data.codingTestCases.map(testCase => ({ organizationId, ...testCase })) } },
+      });
+    } else {
+      await tx.codingQuestion.deleteMany({ where: { questionId } });
+    }
+    return tx.question.findUniqueOrThrow({ where: { id: questionId }, include: { codingQuestion: { include: { testCases: true } } } });
+  });
+  if (!question) return res.status(404).json({ error: 'Editable question-bank question not found' });
   await audit(organizationId, req.auth!.userId, 'question_bank.question_updated', 'Question', question.id);
   res.json(question);
 } catch (error) { next(error); } });
@@ -594,7 +1530,7 @@ app.post('/api/organizations/:organizationId/exams/:examId/questions/from-bank/:
   const examId = String(req.params.examId);
   const [exam, source] = await Promise.all([
     prisma.exam.findFirst({ where: { id: examId, organizationId, status: 'draft' }, select: { id: true } }),
-    prisma.question.findFirst({ where: { id: String(req.params.questionId), organizationId, bankId: { not: null }, examId: null } })
+    prisma.question.findFirst({ where: { id: String(req.params.questionId), organizationId, bankId: { not: null }, examId: null }, include: { codingQuestion: { include: { testCases: true } } } })
   ]);
   if (!exam || !source) return res.status(404).json({ error: 'Draft exam or question-bank question not found' });
   const question = await prisma.question.create({
@@ -603,8 +1539,26 @@ app.post('/api/organizations/:organizationId/exams/:examId/questions/from-bank/:
       options: (source.options ?? undefined) as Prisma.InputJsonValue | undefined,
       correctAnswer: (source.correctAnswer ?? undefined) as Prisma.InputJsonValue | undefined,
       marks: source.marks, negativeMarks: source.negativeMarks,
-      position: await prisma.question.count({ where: { examId } })
-    }
+      position: await prisma.question.count({ where: { examId } }),
+      ...(source.codingQuestion ? { codingQuestion: { create: {
+        organizationId,
+        title: source.codingQuestion.title,
+        description: source.codingQuestion.description,
+        difficulty: source.codingQuestion.difficulty,
+        mode: source.codingQuestion.mode,
+        inputFormat: source.codingQuestion.inputFormat,
+        outputFormat: source.codingQuestion.outputFormat,
+        constraints: source.codingQuestion.constraints,
+        explanation: source.codingQuestion.explanation,
+        languageIds: source.codingQuestion.languageIds,
+        starterCode: source.codingQuestion.starterCode as Prisma.InputJsonValue,
+        timeLimitMs: source.codingQuestion.timeLimitMs,
+        memoryLimitKb: source.codingQuestion.memoryLimitKb,
+        comparisonMode: source.codingQuestion.comparisonMode,
+        testCases: { create: source.codingQuestion.testCases.map(({ input, expectedOutput, visibility, position }) => ({ organizationId, input, expectedOutput, visibility, position })) },
+      } } } : {}),
+    },
+    include: { codingQuestion: { include: { testCases: true } } },
   });
   await audit(organizationId, req.auth!.userId, 'exam.question_added_from_bank', 'Question', question.id, { sourceQuestionId: source.id });
   res.status(201).json(question);
@@ -630,108 +1584,133 @@ app.get('/api/student/dashboard', authenticate, async (req: AuthRequest, res, ne
   const candidate = await prisma.candidate.findFirst({ where: { userId: req.auth!.userId, organizationId: { in: memberships.map(membership => membership.organizationId) } } });
   if (!candidate) return res.status(403).json({ error: 'Candidate access required' });
   const organizationId = candidate.organizationId;
-  const [assignments, attempts, grades, verification] = await Promise.all([
-    prisma.examAssignment.findMany({ where: { organizationId, candidateId: candidate.id }, include: { exam: { select: { id: true, title: true, status: true, startsAt: true, endsAt: true, durationMinutes: true, instructions: true, requireVerification: true } } } }),
+  const [assignments, attempts, grades] = await Promise.all([
+    prisma.examAssignment.findMany({ where: { organizationId, candidateId: candidate.id }, include: { exam: { select: { id: true, title: true, status: true, startsAt: true, endsAt: true, durationMinutes: true, instructions: true, isPractice: true, policyFullscreenRequired: true } } } }),
     prisma.examAttempt.findMany({ where: { organizationId, candidateId: candidate.id }, select: { id: true, examId: true, status: true, startedAt: true, submittedAt: true, deadlineAt: true, receiptCode: true } }),
-    prisma.grade.findMany({ where: { organizationId, candidateId: candidate.id, status: 'published' }, select: { id: true, examId: true, totalMarks: true, maxMarks: true, feedback: true, publishedAt: true } }),
-    prisma.verificationRequest.findUnique({ where: { organizationId_candidateId: { organizationId, candidateId: candidate.id } }, select: { id: true, status: true, submittedAt: true, reviewedAt: true, rejectionReason: true } })
+    prisma.grade.findMany({ where: { organizationId, candidateId: candidate.id, status: 'published', exam: { isPractice: false } }, select: { id: true, examId: true, totalMarks: true, maxMarks: true, feedback: true, publishedAt: true } })
   ]);
   res.json({
     candidate: { id: candidate.id, name: candidate.name },
-    verification: verification ?? { status: 'not_submitted' },
     assignments: assignments.map(assignment => ({ id: assignment.id, exam: assignment.exam, attempt: attempts.find(attempt => attempt.examId === assignment.examId), grade: grades.find(grade => grade.examId === assignment.examId) }))
   });
 } catch (error) { next(error); } });
-app.post('/api/organizations/:organizationId/candidates/:candidateId/verification', authenticate, async (req: AuthRequest, res, next) => { try {
-  const organizationId = String(req.params.organizationId);
-  const candidate = await prisma.candidate.findFirst({ where: { id: String(req.params.candidateId), organizationId, userId: req.auth!.userId } });
-  if (!candidate) return res.status(403).json({ error: 'Candidate access required' });
-  const verification = await prisma.verificationRequest.upsert({
-    where: { organizationId_candidateId: { organizationId, candidateId: candidate.id } },
-    update: { status: 'submitted', submittedAt: new Date(), rejectionReason: null },
-    create: { organizationId, candidateId: candidate.id, status: 'submitted', submittedAt: new Date() }
+app.get('/api/organizations/:organizationId/student-applications', authenticate, authorize('institute_admin'), async (req: AuthRequest, res, next) => { try {
+  const rows = await prisma.verificationRequest.findMany({
+    where: { organizationId: req.auth!.organizationId!, status: { in: ['submitted', 'rejected'] } },
+    select: { id: true, status: true, submittedAt: true, reviewedAt: true, rejectionReason: true, candidate: { select: { id: true, name: true, email: true, phone: true, userId: true } } },
   });
-  await audit(organizationId, req.auth!.userId, 'verification.submitted', 'VerificationRequest', verification.id);
-  res.json(verification);
+  const userIds = rows.map(row => row.candidate.userId).filter((userId): userId is string => Boolean(userId));
+  const inactiveStudentMemberships = userIds.length ? await prisma.membership.findMany({
+    where: { organizationId: req.auth!.organizationId!, userId: { in: userIds }, role: 'student', active: false },
+    select: { userId: true },
+  }) : [];
+  const requiresAdminReview = new Set(inactiveStudentMemberships.map(membership => membership.userId));
+  res.json(rows.map(({ candidate, ...row }) => ({
+    ...row,
+    candidateId: { id: candidate.id, name: candidate.name, email: candidate.email, phone: candidate.phone },
+    requiresAdminReview: Boolean(candidate.userId && requiresAdminReview.has(candidate.userId)),
+  })));
 } catch (error) { next(error); } });
-app.post('/api/organizations/:organizationId/candidates/:candidateId/documents/:kind', authenticate, upload.single('file'), validateFileContent, async (req: AuthRequest, res, next) => { try {
-  const organizationId = String(req.params.organizationId);
-  const kind = String(req.params.kind);
-  const candidate = await prisma.candidate.findFirst({ where: { id: String(req.params.candidateId), organizationId, userId: req.auth!.userId } });
-  if (!candidate || !req.file || !['photo', 'idDocument'].includes(kind)) return res.status(403).json({ error: 'Authorized file required' });
-  if (kind === 'photo' && !['image/jpeg', 'image/png', 'image/webp'].includes(req.file.mimetype)) return res.status(400).json({ error: 'A profile photo must be a JPEG, PNG, or WebP image' });
-  const key = `organizations/${organizationId}/candidates/${candidate.id}/${kind}-${Date.now()}`;
-  const storage = req.app.get('storage');
-  await storage.putPrivateDocument(key, req.file.buffer, req.file.mimetype);
-  const fileData = kind === 'photo' ? { profilePhoto: key } : { idDocument: key };
-  const verification = await prisma.verificationRequest.upsert({
-    where: { organizationId_candidateId: { organizationId, candidateId: candidate.id } },
-    update: { ...fileData, status: 'draft' },
-    create: { organizationId, candidateId: candidate.id, ...fileData, status: 'draft' }
+app.get('/api/organizations/:organizationId/student-applications/:id/documents/idDocument', authenticate, authorize('institute_admin'), async (req: AuthRequest, res, next) => { try {
+  const organizationId = req.auth!.organizationId!;
+  const verification = await prisma.verificationRequest.findFirst({
+    where: { id: String(req.params.id), organizationId },
+    select: { idDocument: true },
   });
-  await audit(organizationId, req.auth!.userId, 'verification.document_uploaded', 'VerificationRequest', verification.id, { kind });
-  res.json({ status: verification.status });
+  if (!verification?.idDocument) return res.status(404).json({ error: 'Student ID proof not found.' });
+  const storage = req.app.get('storage') as StorageInterface;
+  const url = await storage.privateDocumentUrl(verification.idDocument);
+  await audit(organizationId, req.auth!.userId, 'student_application.document_viewed', 'VerificationRequest', String(req.params.id));
+  res.json({ url });
 } catch (error) { next(error); } });
-app.get('/api/organizations/:organizationId/verifications', authenticate, authorize('institute_admin', 'teacher', 'proctor'), async (req: AuthRequest, res, next) => { try {
-  const rows = await prisma.verificationRequest.findMany({ where: { organizationId: req.auth!.organizationId! }, include: { candidate: { select: { id: true, name: true, email: true, phone: true } } } });
-  res.json(rows.map(({ candidate, ...row }) => ({ ...row, candidateId: candidate })));
-} catch (error) { next(error); } });
-app.post('/api/organizations/:organizationId/verifications/:id/review', authenticate, authorize('institute_admin', 'proctor'), async (req: AuthRequest, res, next) => { try {
-  const data = z.object({ approved: z.boolean().optional(), action: z.enum(['approve', 'reject', 'request_more_information']).optional(), reason: z.string().trim().min(3).max(1000).optional() }).refine(value => value.approved !== undefined || value.action !== undefined, { message: 'A review action is required' }).parse(req.body);
-  const action = data.action ?? (data.approved ? 'approve' : 'reject');
-  if (action !== 'approve' && !data.reason) return res.status(400).json({ error: 'A reason is required for this review action' });
+app.post('/api/organizations/:organizationId/student-applications/:id/decision', authenticate, authorize('institute_admin'), async (req: AuthRequest, res, next) => { try {
+  const data = z.object({ action: z.enum(['approve', 'reject']), reason: z.string().trim().min(3).max(1000).optional() }).parse(req.body);
+  const action = data.action;
+  if (action === 'reject' && !data.reason) return res.status(400).json({ error: 'A reason is required when rejecting an application.' });
   const organizationId = req.auth!.organizationId!;
   const id = String(req.params.id);
-  const reviewed = await prisma.verificationRequest.updateMany({
-    where: { id, organizationId, status: { in: ['submitted', 'resubmission_required'] } },
-    data: { status: action === 'approve' ? 'approved' : action === 'request_more_information' ? 'resubmission_required' : 'rejected', rejectionReason: action === 'approve' ? null : data.reason, reviewedAt: new Date(), reviewedById: req.auth!.userId }
+  const application = await prisma.verificationRequest.findFirst({
+    where: { id, organizationId },
+    include: { candidate: { select: { userId: true } } },
   });
-  if (reviewed.count === 0) return res.status(404).json({ error: 'Verification not found' });
-  const verification = await prisma.verificationRequest.findUniqueOrThrow({ where: { id } });
-  await audit(organizationId, req.auth!.userId, `verification.${action}`, 'VerificationRequest', verification.id, { reason: data.reason });
+  if (!application) return res.status(404).json({ error: 'Verification not found' });
+  if (action === 'approve' && !application.idDocument) return res.status(409).json({ error: 'A government-issued ID document is required before approving this student application.' });
+  const verification = await prisma.$transaction(async tx => {
+    const reviewed = await tx.verificationRequest.updateMany({
+      where: { id, organizationId, status: { in: ['submitted', 'resubmission_required'] } },
+      data: { status: action === 'approve' ? 'approved' : 'rejected', rejectionReason: action === 'approve' ? null : data.reason, reviewedAt: new Date(), reviewedById: req.auth!.userId }
+    });
+    if (!reviewed.count) return null;
+    const updated = await tx.verificationRequest.findUniqueOrThrow({ where: { id } });
+    if (action === 'approve') {
+      const candidate = await tx.candidate.findUnique({ where: { id: updated.candidateId }, select: { userId: true } });
+      if (candidate?.userId) {
+        await tx.membership.updateMany({
+          where: { userId: candidate.userId, organizationId, role: 'student' },
+          data: { active: true },
+        });
+      }
+    }
+    return updated;
+  });
+  if (!verification) return res.status(404).json({ error: 'Verification not found' });
+  await audit(organizationId, req.auth!.userId, `student_application.${action}`, 'VerificationRequest', verification.id, { reason: data.reason });
   const candidate = await prisma.candidate.findUnique({ where: { id: verification.candidateId }, select: { userId: true } });
-  if (candidate?.userId) await notify(organizationId, candidate.userId, `verification_${action}`, action === 'approve' ? 'Identity verification approved' : action === 'request_more_information' ? 'More identity information is required' : 'Identity verification rejected', action === 'approve' ? 'Your identity verification was approved.' : `Your identity verification needs attention: ${data.reason}`);
+  if (candidate?.userId) await notify(organizationId, candidate.userId, `student_application_${action}`, action === 'approve' ? 'Student application approved' : 'Student application rejected', action === 'approve' ? 'Your institution approved your student application.' : `Your student application was rejected: ${data.reason}`);
   res.json(verification);
-} catch (error) { next(error); } });
-app.get('/api/organizations/:organizationId/verifications/:id/document/:kind', authenticate, authorize('institute_admin', 'proctor'), async (req: AuthRequest, res, next) => { try {
-  const kind = z.enum(['photo', 'idDocument']).parse(req.params.kind);
-  const verification = await prisma.verificationRequest.findFirst({ where: { id: String(req.params.id), organizationId: req.auth!.organizationId! }, select: { profilePhoto: true, idDocument: true } });
-  const key = kind === 'photo' ? verification?.profilePhoto : verification?.idDocument;
-  if (!key) return res.status(404).end();
-  const storage = req.app.get('storage') as StorageInterface;
-  if (!storage.getPrivateDocument) return res.status(404).end();
-  const bytes = await storage.getPrivateDocument(key);
-  if (!bytes) return res.status(404).end();
-  res.set({ 'Content-Type': kind === 'photo' ? 'image/jpeg' : 'application/octet-stream', 'Content-Length': String(bytes.length), 'Cache-Control': 'private, no-store', 'Content-Disposition': `inline; filename="${kind}"` });
-  return res.status(200).send(bytes);
 } catch (error) { next(error); } });
 app.post('/api/student/organizations/:organizationId/exams/:examId/start', authenticate, async (req: AuthRequest, res, next) => { try {
   const organizationId = String(req.params.organizationId);
   const examId = String(req.params.examId);
-  const startInput = z.object({ accessCode: z.string().optional(), monitoringConsentAccepted: z.literal(true), monitoringConsentVersion: z.literal('examguard-monitoring-v1') }).parse(req.body ?? {});
+  const startInput = z.object({ accessCode: z.string().optional(), monitoringConsentAccepted: z.literal(true), monitoringConsentVersion: z.literal('examguard-monitoring-v2') }).parse(req.body ?? {});
   const accessCode = startInput.accessCode;
   const candidate = await prisma.candidate.findFirst({ where: { organizationId, userId: req.auth!.userId } });
   const exam = await prisma.exam.findFirst({ where: { id: examId, organizationId, status: { in: ['published', 'scheduled', 'live'] } } });
   if (!candidate || !exam) return res.status(403).json({ error: 'Authorized candidate and published exam required' });
   const assignment = await prisma.examAssignment.findUnique({ where: { examId_candidateId: { examId: exam.id, candidateId: candidate.id } }, select: { id: true } });
   if (!assignment || !canStartExam(new Date(), exam.startsAt ?? undefined, exam.endsAt ?? undefined)) return res.status(403).json({ error: 'This exam is not currently available' });
-  if (exam.requireVerification) {
-    const verification = await prisma.verificationRequest.findFirst({ where: { organizationId, candidateId: candidate.id, status: 'approved' }, select: { id: true } });
-    if (!verification) return res.status(403).json({ error: 'Identity verification is required before starting' });
-  }
   if (exam.accessCodeHash && !(accessCode && await bcrypt.compare(accessCode, exam.accessCodeHash))) return res.status(403).json({ error: 'Valid access code required' });
-  let attempt = await prisma.examAttempt.findUnique({ where: { examId_candidateId: { examId: exam.id, candidateId: candidate.id } } });
-  if (!attempt) {
-    const questions = await prisma.question.findMany({ where: { organizationId, examId: exam.id }, select: { id: true }, orderBy: { position: 'asc' } });
+  const attemptResult = await prisma.$transaction(async tx => {
+    await tx.$queryRaw<Array<{ lock: string }>>`SELECT pg_advisory_xact_lock(hashtext(${req.auth!.userId})::bigint)::text AS lock`;
+    const now = new Date();
+    const anotherActiveAttempt = await tx.examAttempt.findFirst({
+      where: {
+        userId: req.auth!.userId,
+        status: { in: ['in_progress', 'paused'] },
+        deadlineAt: { gt: now },
+        examId: { not: exam.id },
+      },
+      select: { id: true },
+    });
+    if (anotherActiveAttempt) return { kind: 'another_active_attempt' as const };
+
+    const existing = await tx.examAttempt.findUnique({ where: { examId_candidateId: { examId: exam.id, candidateId: candidate.id } } });
+    if (existing) return { kind: 'attempt' as const, attempt: existing, created: false };
+
+    const questions = await tx.question.findMany({ where: { organizationId, examId: exam.id }, select: { id: true }, orderBy: { position: 'asc' } });
     const order = exam.randomizeQuestions ? shuffle(questions.map(q => q.id)) : questions.map(q => q.id);
     const startedAt = new Date();
-    try {
-      attempt = await prisma.examAttempt.create({ data: { organizationId, examId: exam.id, candidateId: candidate.id, userId: req.auth!.userId, startedAt, deadlineAt: deadlineFor(startedAt, exam.durationMinutes, exam.endsAt ?? undefined), monitoringConsentAt: startedAt, monitoringConsentVersion: startInput.monitoringConsentVersion, questionOrder: order } });
-      await audit(organizationId, req.auth!.userId, 'attempt.started', 'ExamAttempt', attempt.id, { monitoringConsentVersion: startInput.monitoringConsentVersion });
-    } catch (error) {
-      if (!(error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002')) throw error;
-      attempt = await prisma.examAttempt.findUniqueOrThrow({ where: { examId_candidateId: { examId: exam.id, candidateId: candidate.id } } });
-    }
+    const created = await tx.examAttempt.create({
+      data: {
+        organizationId,
+        examId: exam.id,
+        candidateId: candidate.id,
+        userId: req.auth!.userId,
+        startedAt,
+        deadlineAt: deadlineFor(startedAt, exam.durationMinutes, exam.endsAt ?? undefined),
+        monitoringConsentAt: startedAt,
+        monitoringConsentVersion: startInput.monitoringConsentVersion,
+        questionOrder: order,
+      },
+    });
+    return { kind: 'attempt' as const, attempt: created, created: true };
+  });
+  if (attemptResult.kind === 'another_active_attempt') {
+    return res.status(409).json({ error: 'You already have an active examination. Resume or submit it before starting another.' });
+  }
+  let attempt = attemptResult.attempt;
+  if (attemptResult.created) {
+    await audit(organizationId, req.auth!.userId, 'attempt.started', 'ExamAttempt', attempt.id, { monitoringConsentVersion: startInput.monitoringConsentVersion });
   }
   if (!isAttemptOpen(attempt.status, attempt.deadlineAt)) return res.status(409).json({ error: 'Attempt is no longer open' });
   if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== startInput.monitoringConsentVersion) {
@@ -742,11 +1721,42 @@ app.post('/api/student/organizations/:organizationId/exams/:examId/start', authe
   const companionReady = Boolean(companionHeartbeat);
   // Do not release exam questions until the required Windows Companion has
   // authenticated this attempt and sent its first active heartbeat.
-  const rows = companionReady ? await prisma.question.findMany({ where: { id: { in: attempt.questionOrder }, organizationId } }) : [];
+  const rows = companionReady ? await prisma.question.findMany({
+    where: { id: { in: attempt.questionOrder }, organizationId },
+    include: { codingQuestion: { include: { testCases: { where: { visibility: 'sample' }, orderBy: { position: 'asc' } } } } },
+  }) : [];
   const byId = new Map(rows.map(q => [q.id, q]));
-  const questions = companionReady ? attempt.questionOrder.flatMap(id => { const q = byId.get(id); if (!q) return []; const options = Array.isArray(q.options) ? q.options : []; return [{ id: q.id, type: q.type, prompt: q.prompt, options: exam.randomizeOptions ? shuffle(options) : options, marks: q.marks }]; }) : [];
+  const questions = companionReady ? attempt.questionOrder.flatMap(id => {
+    const q = byId.get(id);
+    if (!q) return [];
+    const options = Array.isArray(q.options) ? q.options : [];
+    return [{
+      id: q.id,
+      type: q.type,
+      prompt: q.prompt,
+      options: exam.randomizeOptions ? shuffle(options) : options,
+      marks: q.marks,
+      ...(q.type === 'coding' && q.codingQuestion ? {
+        coding: {
+          title: q.codingQuestion.title,
+          description: q.codingQuestion.description,
+          difficulty: q.codingQuestion.difficulty,
+          inputFormat: q.codingQuestion.inputFormat,
+          outputFormat: q.codingQuestion.outputFormat,
+          constraints: q.codingQuestion.constraints,
+          languageIds: q.codingQuestion.languageIds,
+          starterCode: q.codingQuestion.starterCode,
+          samples: q.codingQuestion.testCases.map(({ id: sampleId, input, expectedOutput }) => ({
+            id: sampleId,
+            input,
+            output: expectedOutput,
+          })),
+        },
+      } : {}),
+    }];
+  }) : [];
   const answers = companionReady ? await prisma.attemptAnswer.findMany({ where: { attemptId: attempt.id } }) : [];
-  res.json({ attempt: { id: attempt.id, candidateId: candidate.id, examId: exam.id, deadlineAt: attempt.deadlineAt, status: attempt.status }, exam: { title: exam.title, instructions: exam.instructions }, questions, answers, companionRequired: !companionReady });
+  res.json({ attempt: { id: attempt.id, candidateId: candidate.id, examId: exam.id, deadlineAt: attempt.deadlineAt, status: attempt.status }, exam: { title: exam.title, instructions: exam.instructions, isPractice: exam.isPractice, fullscreenRequired: exam.policyFullscreenRequired }, questions, answers, companionRequired: !companionReady });
 } catch (error) { next(error); } });
 app.put('/api/student/attempts/:attemptId/answers/:questionId', authenticate, async (req: AuthRequest, res, next) => { try {
   const attemptId = String(req.params.attemptId);
@@ -778,6 +1788,123 @@ app.put('/api/student/attempts/:attemptId/answers/:questionId', authenticate, as
   if (result.kind === 'question_not_found') return res.status(404).json({ error: 'Question not found' });
   res.json({ savedAt: result.savedAt });
 } catch (error) { next(error); } });
+app.get('/api/student/attempts/:attemptId/coding-executions', authenticate, async (req: AuthRequest, res, next) => { try {
+  const attempt = await prisma.examAttempt.findFirst({ where: { id: String(req.params.attemptId), userId: req.auth!.userId }, select: { id: true } });
+  if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
+  let available = false;
+  let unavailableReason = 'The isolated code execution service is not configured.';
+  if (codeRunner) {
+    try {
+      await codeRunner.checkReady();
+      available = true;
+      unavailableReason = '';
+    } catch (error) {
+      unavailableReason = 'Judge0 is configured but not reachable. Contact your exam organizer.';
+      console.error('Judge0 readiness check failed', error instanceof Error ? error.message : String(error));
+    }
+  }
+  const history = await prisma.codeSubmission.findMany({
+    where: { attemptId: attempt.id, candidate: { userId: req.auth!.userId } },
+    orderBy: { submittedAt: 'desc' },
+    take: 20,
+    select: { id: true, kind: true, status: true, submittedAt: true },
+  });
+  res.json({ available, unavailableReason: unavailableReason || undefined, languageIds: Object.keys(judge0LanguageIds), history: history.map(item => ({ id: item.id, kind: item.kind, status: item.status, createdAt: item.submittedAt })) });
+} catch (error) { next(error); } });
+const executeCoding = (kind: 'run' | 'submit'): express.RequestHandler => async (request, res, next) => { try {
+  const req = request as AuthRequest;
+  if (!codeRunner) return res.status(503).json({ error: 'The isolated code execution service is not configured.' });
+  const data = codingExecutionRequest.parse(req.body);
+  const attemptId = String(req.params.attemptId);
+  const attempt = await prisma.examAttempt.findFirst({ where: { id: attemptId, userId: req.auth!.userId, status: 'in_progress', deadlineAt: { gt: new Date() } } });
+  if (!attempt) return res.status(409).json({ error: 'An active authorized attempt is required.' });
+  if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v2') return res.status(403).json({ error: 'Monitoring consent is not recorded for this attempt.' });
+  const heartbeat = await prisma.radioObservation.findFirst({
+    where: { organizationId: attempt.organizationId, attemptId, source: 'scanner_health', kind: 'heartbeat', scannerStatus: 'active', observedAt: { gt: new Date(Date.now() - 90_000) } },
+    select: { id: true },
+  });
+  if (!heartbeat) return res.status(409).json({ error: 'The required Windows Companion is not reporting. Reconnect it to continue monitoring.' });
+  const codingQuestion = await prisma.codingQuestion.findFirst({
+    where: {
+      organizationId: attempt.organizationId,
+      questionId: data.questionId,
+      question: { examId: attempt.examId, type: 'coding' },
+      languageIds: { has: data.languageId },
+    },
+    include: { testCases: { where: { ...(kind === 'run' ? { visibility: 'sample' as const } : {}) }, orderBy: { position: 'asc' } } },
+  });
+  if (!codingQuestion) return res.status(404).json({ error: 'Coding question or requested language was not found for this attempt.' });
+  const testCases = codingQuestion.testCases;
+  if (!testCases.length) return res.status(409).json({ error: kind === 'run' ? 'This coding question has no visible sample cases.' : 'This coding question has no test cases.' });
+  const runnerLanguageId = judge0LanguageIds[data.languageId];
+  if (!runnerLanguageId) return res.status(400).json({ error: 'This programming language is not mapped to a Judge0 language.' });
+  const submission = await prisma.codeSubmission.create({
+    data: {
+      organizationId: attempt.organizationId,
+      attemptId: attempt.id,
+      candidateId: attempt.candidateId,
+      questionId: data.questionId,
+      codingQuestionId: codingQuestion.id,
+      languageId: data.languageId,
+      sourceCode: data.sourceCode,
+      kind,
+      executionJob: { create: { organizationId: attempt.organizationId } },
+    },
+    include: { executionJob: { select: { id: true } } },
+  });
+  const executionJobId = submission.executionJob?.id;
+  if (!executionJobId) throw new Error('Judge0 execution job was not created.');
+  await audit(attempt.organizationId, req.auth!.userId, `coding.${kind}_queued`, 'CodeSubmission', submission.id, { questionId: data.questionId, languageId: data.languageId });
+  try {
+    const results = await executeCodingCases({
+      runner: codeRunner,
+      cases: testCases,
+      languageId: runnerLanguageId,
+      sourceCode: data.sourceCode,
+      cpuTimeLimitSeconds: Math.max(1, Math.ceil(codingQuestion.timeLimitMs / 1000)),
+      memoryLimitKb: codingQuestion.memoryLimitKb,
+      comparisonMode: codingQuestion.comparisonMode,
+      onToken: token => prisma.executionJob.update({ where: { id: executionJobId }, data: { runnerToken: token, status: 'running', startedAt: new Date() } }).then(() => undefined),
+    });
+    const status = aggregateExecutionStatus(results);
+    await prisma.$transaction([
+      prisma.executionResult.createMany({
+        data: results.map(result => ({
+          jobId: executionJobId,
+          testCaseId: result.id,
+          status: result.status,
+          passed: result.passed,
+          executionTimeMs: result.executionTimeMs,
+          memoryKb: result.memoryKb,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          compileOutput: result.compileOutput,
+          score: result.passed ? 1 : 0,
+        })),
+      }),
+      prisma.executionJob.update({ where: { id: executionJobId }, data: { status, completedAt: new Date() } }),
+      prisma.codeSubmission.update({ where: { id: submission.id }, data: { status, completedAt: new Date() } }),
+    ]);
+    const candidateResults = candidateExecutionResults(results);
+    res.status(201).json({
+      submissionId: submission.id,
+      kind,
+      status,
+      createdAt: submission.submittedAt,
+      ...candidateResults,
+      message: kind === 'submit' ? 'Submission completed. Private test details are not returned.' : undefined,
+    });
+  } catch (error) {
+    await prisma.$transaction([
+      prisma.executionJob.update({ where: { id: executionJobId }, data: { status: 'runner_unavailable', completedAt: new Date() } }),
+      prisma.codeSubmission.update({ where: { id: submission.id }, data: { status: 'runner_unavailable', completedAt: new Date() } }),
+    ]);
+    console.error('Judge0 execution failed', error instanceof Error ? error.message : String(error));
+    res.status(503).json({ error: 'The isolated code execution service could not complete this request. Check the Judge0 service and retry.' });
+  }
+} catch (error) { next(error); } };
+app.post('/api/student/attempts/:attemptId/coding-executions/run', authenticate, codingRunLimiter, executeCoding('run'));
+app.post('/api/student/attempts/:attemptId/coding-executions/submit', authenticate, codingSubmitLimiter, executeCoding('submit'));
 app.post('/api/student/attempts/:attemptId/submit', authenticate, async (req: AuthRequest, res, next) => { try {
   const attemptId = String(req.params.attemptId);
   const result = await prisma.$transaction(async tx => {
@@ -825,17 +1952,65 @@ app.post('/api/student/attempts/:attemptId/evidence', authenticate, upload.singl
   await audit(attempt.organizationId, req.auth!.userId, `evidence.${source}_captured`, 'ExamAttempt', attempt.id, { evidenceKey: key, capturedAt: new Date().toISOString() });
   res.status(201).json({ evidenceKey: key });
 } catch (error) { next(error); } });
+app.post('/api/student/attempts/:attemptId/screen-capture', authenticate, upload.single('file'), validateFileContent, async (req: AuthRequest, res, next) => { try {
+  const attempt = await prisma.examAttempt.findFirst({
+    where: { id: String(req.params.attemptId), userId: req.auth!.userId, status: 'in_progress', deadlineAt: { gt: new Date() } },
+  });
+  if (!attempt || !req.file || !['image/jpeg', 'image/png', 'image/webp'].includes(req.file.mimetype)) {
+    return res.status(403).json({ error: 'An active attempt and a valid full-display image are required.' });
+  }
+  if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v2') {
+    return res.status(403).json({ error: 'Screen capture consent is not recorded for this attempt.' });
+  }
+  const capturedAt = z.string().datetime().safeParse(req.body?.capturedAt);
+  if (!capturedAt.success || req.body?.displaySurface !== 'monitor') {
+    return res.status(400).json({ error: 'A timestamp and verified full-display capture are required.' });
+  }
+  const storage = req.app.get('storage') as StorageInterface;
+  if (!storage.storageConfigured()) return res.status(503).json({ error: 'Private evidence storage is not configured.' });
+  const used = (await prisma.evidenceObject.aggregate({ where: { organizationId: attempt.organizationId }, _sum: { sizeBytes: true } }))._sum.sizeBytes ?? 0;
+  const quota = evaluateQuota({ usedBytes: used, incomingBytes: req.file.size, quotaBytes: parseQuotaBytes(process.env.EVIDENCE_ORG_QUOTA_MB) });
+  if (!quota.allowed) return res.status(507).json({ error: 'Private evidence storage is full; this screen image was not recorded.' });
+  const evidenceKey = `organizations/${attempt.organizationId}/attempts/${attempt.id}/evidence/${crypto.randomUUID()}`;
+  await storage.putPrivateDocument(evidenceKey, req.file.buffer, req.file.mimetype);
+  await prisma.evidenceObject.create({
+    data: { organizationId: attempt.organizationId, attemptId: attempt.id, objectKey: evidenceKey, sizeBytes: req.file.size, mimeType: req.file.mimetype },
+  });
+  const event = await prisma.proctoringEvent.create({
+    data: {
+      organizationId: attempt.organizationId,
+      examId: attempt.examId,
+      candidateId: attempt.candidateId,
+      attemptId: attempt.id,
+      type: 'screen_capture',
+      occurredAt: new Date(capturedAt.data),
+      source: 'browser',
+      evidenceKey,
+      fingerprint: crypto.randomUUID(),
+      policyAction: 'recorded',
+      details: {
+        captureMode: 'periodic_full_display_still',
+        displaySurface: 'monitor',
+        reviewOnly: true,
+        disclosure: 'Consent-based still image; not continuous video and not proof of misconduct.',
+      },
+    },
+  });
+  await audit(attempt.organizationId, req.auth!.userId, 'evidence.screen_capture_recorded', 'ProctoringEvent', event.id, { capturedAt: capturedAt.data });
+  res.status(201).json({ evidenceKey, eventId: event.id });
+} catch (error) { next(error); } });
 app.post('/api/student/attempts/:attemptId/ai-frame', authenticate, aiFrameLimiter, upload.single('frame'), validateFileContent, async (req: AuthRequest, res, next) => { try {
   const attemptId = String(req.params.attemptId);
+  const frameReceivedAt = new Date();
   const attempt = await prisma.examAttempt.findFirst({ where: { id: attemptId, userId: req.auth!.userId, status: 'in_progress', deadlineAt: { gt: new Date() } } });
   if (!attempt) return res.status(409).json({ error: 'An active authorized attempt is required' });
-  if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v1') return res.status(403).json({ error: 'Monitoring consent is not recorded for this attempt' });
+  if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v2') return res.status(403).json({ error: 'Monitoring consent is not recorded for this attempt' });
   if (!req.file || !['image/jpeg', 'image/png', 'image/webp'].includes(req.file.mimetype)) return res.status(415).json({ error: 'A JPEG, PNG, or WebP camera frame is required' });
   const companionHeartbeat = await prisma.radioObservation.findFirst({ where: { organizationId: attempt.organizationId, attemptId, source: 'scanner_health', kind: 'heartbeat', scannerStatus: 'active', observedAt: { gt: new Date(Date.now() - 90_000) } }, select: { id: true } });
   if (!companionHeartbeat) return res.status(409).json({ error: 'The required Windows Companion is not reporting. Reconnect it to continue monitoring.' });
   const serviceUrl = process.env.AI_SERVICE_URL;
   const serviceToken = process.env.AI_SERVICE_TOKEN;
-  if (!serviceUrl || !serviceToken || serviceToken.length < 32) return res.status(503).json({ error: 'The local AI service is not securely configured. Set AI_SERVICE_URL and a 32-character AI_SERVICE_TOKEN.' });
+  if (!serviceUrl || !serviceToken || serviceToken.length < 32) return res.status(503).json({ error: 'The AI service is not securely configured. Set AI_SERVICE_URL and the same 32-character AI_SERVICE_TOKEN on the API and AI service.' });
   let analyzeUrl: URL;
   try {
     const base = new URL(serviceUrl);
@@ -849,17 +2024,63 @@ app.post('/api/student/attempts/:attemptId/ai-frame', authenticate, aiFrameLimit
   try {
     inferenceResponse = await fetch(analyzeUrl, { method: 'POST', headers: { Authorization: `Bearer ${serviceToken}` }, body: form, signal: AbortSignal.timeout(12_000) });
   } catch {
-    return res.status(503).json({ error: 'The local AI service did not respond. Check that it is running on the configured address.' });
+    return res.status(503).json({ error: 'The AI service did not respond. Check its health and the private API-to-AI network connection.' });
   }
-  if (!inferenceResponse.ok) return res.status(503).json({ error: `The local AI service returned HTTP ${inferenceResponse.status}.` });
+  if (!inferenceResponse.ok) return res.status(503).json({ error: `The AI service returned HTTP ${inferenceResponse.status}.` });
   let analysis: z.infer<typeof aiFrameSchema>;
   try { analysis = aiFrameSchema.parse(await inferenceResponse.json()); }
   catch { return res.status(502).json({ error: 'The AI service returned an invalid analysis response.' }); }
+  const visuallyReadable = analysis.readability_assessment?.status === 'potentially_readable';
+  const nearbyRadioResult = visuallyReadable ? await withAdvertisedNameCompatibility(includeAdvertisedName =>
+    prisma.radioObservation.findMany({
+    where: {
+      organizationId: attempt.organizationId,
+      attemptId: attempt.id,
+      source: { in: ['bluetooth_le', 'wifi'] },
+      kind: { in: ['advertisement', 'access_point'] },
+      scannerStatus: 'active',
+      rssi: { not: null },
+      observedAt: { gte: new Date(frameReceivedAt.getTime() - 45_000), lte: frameReceivedAt },
+    },
+    orderBy: { observedAt: 'desc' },
+    take: 20,
+    select: { ...radioObservationSelect(includeAdvertisedName), source: true, kind: true, rssi: true, pseudonym: true, observedAt: true },
+  })) : undefined;
+  const nearbyRadioRows = nearbyRadioResult?.result ?? [];
+  const proximityContext = nearbyRadioRows.flatMap(observation => {
+    if ((observation.source !== 'bluetooth_le' && observation.source !== 'wifi') ||
+        (observation.kind !== 'advertisement' && observation.kind !== 'access_point')) return [];
+    return [{
+      source: observation.source,
+      kind: observation.kind,
+      rssi: observation.rssi,
+      pseudonym: observation.pseudonym,
+      advertisedName: observation.advertisedName,
+      advertisedNameAvailable: nearbyRadioResult?.advertisedNameAvailable ?? false,
+      observedAt: observation.observedAt.toISOString(),
+      proximity: radioProximity(observation.source, observation.rssi),
+      association: 'temporal_only_device_not_linked' as const,
+    }];
+  });
+  const proximitySupported = proximityContext.some(observation =>
+    supportsPotentialVisualAssistance(observation.source, observation.kind, observation.proximity.band),
+  );
+  analysis.proximity_context = proximityContext;
+  if (nearbyRadioResult) analysis.advertised_name_storage_available = nearbyRadioResult.advertisedNameAvailable;
+  analysis.potential_visual_assistance = {
+    flagged: visuallyReadable && proximitySupported,
+    confidence: 'low',
+    rationale: visuallyReadable && proximitySupported
+      ? 'A screen was estimated as potentially readable and a near/medium BLE advertisement was recorded in the same attempt within 45 seconds. No evidence links that advertisement to the visible screen.'
+      : 'A Potential Visual Assistance flag requires both a potentially readable visible screen and a recent near/medium BLE advertisement; no device identity is inferred.',
+  };
   const qualified = aiSignalsForFrame(attempt.id, {
     face_missing: !analysis.face_presence,
     multiple_faces: analysis.multiple_faces,
     looking_away: analysis.looking_away === 'looking_away',
-    phone_detected: analysis.phone_detection === 'detected'
+    phone_detected: analysis.phone_detection === 'detected',
+    camera_obstructed: analysis.camera_health === 'obstructed',
+    potential_visual_assistance: analysis.potential_visual_assistance.flagged,
   });
   if (!qualified.length) return res.json({ analysis, recorded: [], temporalRule: '3_of_5_frames' });
 
@@ -885,7 +2106,7 @@ app.post('/api/student/attempts/:attemptId/ai-frame', authenticate, aiFrameLimit
   await storage.putPrivateDocument(evidenceKey, req.file.buffer, req.file.mimetype);
   await prisma.evidenceObject.create({ data: { organizationId: attempt.organizationId, attemptId: attempt.id, objectKey: evidenceKey, sizeBytes: req.file.size, mimeType: req.file.mimetype } });
 
-  const recorded: Array<{ type: string; incidentId?: string; eventId?: string; deduplicated?: boolean }> = [...duplicates];
+  const recorded: Array<{ type: string; incidentId?: string; eventId?: string; occurredAt?: string; deduplicated?: boolean }> = [...duplicates];
   for (const { type, occurredAt, fingerprint } of freshSignals) {
     const windowStart = new Date(occurredAt.getTime() - policy.windowSeconds * 1000);
     const eventCount = await prisma.proctoringEvent.count({ where: { organizationId: attempt.organizationId, attemptId: attempt.id, type, occurredAt: { gte: windowStart } } }) + 1;
@@ -897,13 +2118,24 @@ app.post('/api/student/attempts/:attemptId/ai-frame', authenticate, aiFrameLimit
         faceCount: analysis.face_count,
         lookingAway: analysis.looking_away,
         headPose: analysis.head_pose ?? null,
+        facePoseEstimates: analysis.face_pose_estimates,
         phoneConfidence: analysis.phone_confidence ?? null,
+        faceBoxes: analysis.face_boxes,
+        phoneBoxes: analysis.phone_boxes,
+        visibleDevices: analysis.visible_devices,
+        readabilityAssessment: analysis.readability_assessment ?? null,
+        potentialVisualAssistance: analysis.potential_visual_assistance,
+        proximityObservations: proximityContext,
+        advertisedNameStorageAvailable: analysis.advertised_name_storage_available ?? null,
+        cameraHealth: analysis.camera_health,
+        frameQuality: analysis.frame_quality ?? null,
+        inferenceMs: analysis.inference_ms ?? null,
         modelVersion: analysis.service_version ?? 'unknown',
         temporalConfirmation: '3_of_5_frames',
         disclosure: 'AI signal for human review only; approximate head orientation is not eye-gaze tracking.'
       } as Prisma.InputJsonValue
     } });
-    const weight = Number((config.signalWeights as Record<string, number>)[type] ?? 0);
+    const weight = Number((config.signalWeights as Record<string, number>)[type] ?? (type === 'potential_visual_assistance' ? 10 : 0));
     const priority = reviewPriority([{ type, weight }]);
     const incident = await prisma.incident.create({ data: {
       organizationId: attempt.organizationId, examId: attempt.examId, candidateId: attempt.candidateId,
@@ -915,9 +2147,64 @@ app.post('/api/student/attempts/:attemptId/ai-frame', authenticate, aiFrameLimit
     await audit(attempt.organizationId, req.auth!.userId, 'proctoring.ai_signal_recorded', 'Incident', incident.id, { eventId: event.id, temporalConfirmation: '3_of_5_frames' });
     const broadcast = req.app.get('broadcast') as undefined | ((room: string, payload: unknown) => void);
     broadcast?.(`org:${attempt.organizationId}:exam:${attempt.examId}`, { incidentId: incident.id, attemptId: attempt.id, type, action: 'recorded', warningCount: eventCount, occurredAt });
-    recorded.push({ type, incidentId: incident.id, eventId: event.id });
+    recorded.push({ type, incidentId: incident.id, eventId: event.id, occurredAt: occurredAt.toISOString() });
   }
   res.status(recorded.some(item => item.incidentId) ? 201 : 202).json({ analysis, recorded, evidenceAttached: true, temporalRule: '3_of_5_frames' });
+} catch (error) { next(error); } });
+
+app.post('/api/student/attempts/:attemptId/ai-context-frame', authenticate, aiFrameLimiter, upload.single('frame'), validateFileContent, async (req: AuthRequest, res, next) => { try {
+  const contextInput = z.object({
+    parentEventId: z.string().uuid(),
+    contextType: z.enum(['before', 'after']),
+    sequence: z.coerce.number().int().min(0).max(20),
+    capturedAt: z.string().datetime(),
+  }).parse(req.body);
+  const attempt = await prisma.examAttempt.findFirst({ where: { id: String(req.params.attemptId), userId: req.auth!.userId, status: 'in_progress', deadlineAt: { gt: new Date() } } });
+  if (!attempt) return res.status(409).json({ error: 'An active authorized attempt is required' });
+  if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v2') return res.status(403).json({ error: 'Monitoring consent is not recorded for this attempt' });
+  if (!req.file || !['image/jpeg', 'image/png', 'image/webp'].includes(req.file.mimetype)) return res.status(415).json({ error: 'A JPEG, PNG, or WebP context frame is required' });
+  const capturedAt = new Date(contextInput.capturedAt);
+  const now = new Date();
+  if (capturedAt.getTime() > now.getTime() + 10_000 || capturedAt.getTime() < now.getTime() - 30_000) return res.status(400).json({ error: 'Context frame timestamp is outside the permitted capture window' });
+  const parentEvent = await prisma.proctoringEvent.findFirst({
+    where: { id: contextInput.parentEventId, organizationId: attempt.organizationId, attemptId: attempt.id, source: 'ai_service', evidenceKey: { not: null }, incidents: { some: {} } },
+    include: { incidents: { select: { incidentId: true } } },
+  });
+  if (!parentEvent) return res.status(404).json({ error: 'The incident event is not associated with this attempt' });
+  if (contextInput.contextType === 'before' && (capturedAt.getTime() > parentEvent.occurredAt.getTime() || capturedAt.getTime() < parentEvent.occurredAt.getTime() - 5_000)) return res.status(400).json({ error: 'A before-context frame must precede the incident and remain within five seconds' });
+  if (contextInput.contextType === 'after' && (capturedAt.getTime() < parentEvent.occurredAt.getTime() || capturedAt.getTime() > parentEvent.occurredAt.getTime() + 5_000)) return res.status(400).json({ error: 'An after-context frame must follow the incident and remain within five seconds' });
+  const storage = req.app.get('storage') as StorageInterface;
+  if (!storage.storageConfigured()) return res.status(503).json({ error: 'Private evidence storage is not configured' });
+  const used = (await prisma.evidenceObject.aggregate({ where: { organizationId: attempt.organizationId }, _sum: { sizeBytes: true } }))._sum.sizeBytes ?? 0;
+  const quota = evaluateQuota({ usedBytes: used, incomingBytes: req.file.size, quotaBytes: parseQuotaBytes(process.env.EVIDENCE_ORG_QUOTA_MB) });
+  if (!quota.allowed) return res.status(507).json({ error: 'Private evidence storage is full for this organization' });
+  const key = `organizations/${attempt.organizationId}/attempts/${attempt.id}/evidence/${crypto.randomUUID()}`;
+  await storage.putPrivateDocument(key, req.file.buffer, req.file.mimetype);
+  await prisma.evidenceObject.create({ data: { organizationId: attempt.organizationId, attemptId: attempt.id, objectKey: key, sizeBytes: req.file.size, mimeType: req.file.mimetype } });
+  const contextEvent = await prisma.proctoringEvent.create({
+    data: {
+      organizationId: attempt.organizationId,
+      examId: attempt.examId,
+      candidateId: attempt.candidateId,
+      attemptId: attempt.id,
+      type: 'ai_context_frame',
+      occurredAt: capturedAt,
+      source: 'ai_service',
+      evidenceKey: key,
+      fingerprint: fingerprintFor(attempt.organizationId, attempt.candidateId, `ai_context_frame:${parentEvent.id}:${contextInput.contextType}:${contextInput.sequence}`, capturedAt.getTime()),
+      policyAction: 'recorded',
+      details: {
+        parentEventId: parentEvent.id,
+        contextType: contextInput.contextType,
+        sequence: contextInput.sequence,
+        capturedAt: capturedAt.toISOString(),
+        temporalConfirmation: 'linked_to_confirmed_incident',
+      } as Prisma.InputJsonValue,
+    },
+  });
+  await prisma.incidentEvent.createMany({ data: parentEvent.incidents.map(({ incidentId }) => ({ incidentId, eventId: contextEvent.id })), skipDuplicates: true });
+  await audit(attempt.organizationId, req.auth!.userId, 'evidence.ai_context_captured', 'ProctoringEvent', contextEvent.id, { parentEventId: parentEvent.id, contextType: contextInput.contextType, sequence: contextInput.sequence, capturedAt: capturedAt.toISOString() });
+  res.status(201).json({ evidenceKey: key, eventId: contextEvent.id });
 } catch (error) { next(error); } });
 
 app.post('/api/organizations/:organizationId/proctoring/events', authenticate, async (req: AuthRequest, res, next) => { try {
@@ -969,7 +2256,7 @@ app.post('/api/organizations/:organizationId/attempts/:attemptId/resume', authen
 app.post('/api/student/attempts/:attemptId/companion-pairing', authenticate, async (req: AuthRequest, res, next) => { try {
   const attempt = await prisma.examAttempt.findFirst({ where: { id: String(req.params.attemptId), userId: req.auth!.userId, status: 'in_progress', deadlineAt: { gt: new Date() } } });
   if (!attempt) return res.status(409).json({ error: 'An active exam attempt is required before a companion can be paired.' });
-  if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v1') return res.status(403).json({ error: 'Explicit monitoring consent must be recorded before Companion connection.' });
+  if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v2') return res.status(403).json({ error: 'Explicit monitoring consent must be recorded before Companion connection.' });
   const candidate = await prisma.candidate.findFirst({ where: { id: attempt.candidateId, organizationId: attempt.organizationId, userId: req.auth!.userId } });
   if (!candidate) return res.status(403).json({ error: 'Candidate authorization is required' });
   const token = signCompanionToken({ userId: req.auth!.userId, organizationId: attempt.organizationId, examId: attempt.examId, candidateId: candidate.id, attemptId: attempt.id });
@@ -989,17 +2276,26 @@ app.post('/api/student/radio-observations', authenticateCompanion, radioObservat
   const candidate = await prisma.candidate.findFirst({ where: { id: data.candidateId, organizationId: companion.organizationId, userId: companion.userId } });
   const attempt = candidate && await prisma.examAttempt.findFirst({ where: { id: data.attemptId, organizationId: candidate.organizationId, candidateId: candidate.id, examId: data.examId, userId: companion.userId, status: 'in_progress', deadlineAt: { gt: new Date() } } });
   if (!candidate || !attempt) return res.status(403).json({ error: 'An active authorized attempt is required' });
-  if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v1') return res.status(403).json({ error: 'Monitoring consent is not recorded for this attempt' });
+  if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v2') return res.status(403).json({ error: 'Monitoring consent is not recorded for this attempt' });
   const organizationId = candidate.organizationId;
   const observedAt = new Date();
   const fingerprint = fingerprintFor(organizationId, attempt.id, `${data.source}:${data.kind}:${data.pseudonym ?? data.errorCode ?? 'health'}`, dedupeWindow(observedAt, 30));
   const limitations = data.source === 'bluetooth_le' ? 'BLE advertisements do not identify a device type; addresses may rotate and many phones do not advertise.' : data.source === 'wifi' ? 'Wi-Fi scans observe access points, not nearby clients or every phone; a hotspot is not proof of a prohibited device.' : 'Scanner health is technical telemetry and is not evidence of student conduct.';
   const fields = { examId: data.examId, candidateId: candidate.id, attemptId: attempt.id, source: data.source, kind: data.kind, rssi: data.rssi, pseudonym: data.pseudonym, scannerStatus: data.scannerStatus, errorCode: data.errorCode, observedAt, limitations, expiresAt: new Date(observedAt.getTime() + 30 * 24 * 60 * 60_000) };
-  const observation = await prisma.radioObservation.upsert({ where: { organizationId_fingerprint: { organizationId, fingerprint } }, update: fields, create: { ...fields, organizationId, fingerprint } });
+  const observationResult = await withAdvertisedNameCompatibility(includeAdvertisedName => {
+    const namedFields = includeAdvertisedName ? { ...fields, advertisedName: data.advertisedName } : fields;
+    return prisma.radioObservation.upsert({
+      where: { organizationId_fingerprint: { organizationId, fingerprint } },
+      update: namedFields,
+      create: { ...namedFields, organizationId, fingerprint },
+      select: radioObservationSelect(includeAdvertisedName),
+    });
+  });
+  const observation = observationResult.result;
   let signalId: string | undefined;
   if (data.kind === 'advertisement' || data.kind === 'access_point') {
     const windowStart = new Date(observedAt.getTime() - 5 * 60_000);
-    const recent = await prisma.radioObservation.findMany({ where: { organizationId, attemptId: attempt.id, source: data.source, kind: data.kind, observedAt: { gte: windowStart } }, orderBy: { observedAt: 'desc' }, take: 3 });
+    const recent = await prisma.radioObservation.findMany({ where: { organizationId, attemptId: attempt.id, source: data.source, kind: data.kind, observedAt: { gte: windowStart } }, orderBy: { observedAt: 'desc' }, take: 3, select: { id: true } });
     if (recent.length >= 3) {
       const rule = `repeated_${data.source}_observation`;
       const existing = await prisma.radioCandidateSignal.findFirst({ where: { organizationId, attemptId: attempt.id, rule, status: 'pending_review' } });
@@ -1008,16 +2304,28 @@ app.post('/api/student/radio-observations', authenticateCompanion, radioObservat
     }
   }
   await audit(organizationId, companion.userId, 'radio.observation_recorded', 'RadioObservation', observation.id, { source: data.source, kind: data.kind, signalId });
-  res.status(201).json({ observationId: observation.id, candidateSignalId: signalId, disposition: data.kind === 'advertisement' || data.kind === 'access_point' ? 'recorded_for_possible_review' : 'technical_status_recorded' });
+  res.status(201).json({ observationId: observation.id, candidateSignalId: signalId, advertisedNameStored: observationResult.advertisedNameAvailable && Boolean(data.advertisedName), ...(data.advertisedName && !observationResult.advertisedNameAvailable ? { warning: 'The current database schema does not yet store BLE advertised names. Apply the pending radio advertised-name migration to enable this field.' } : {}), disposition: data.kind === 'advertisement' || data.kind === 'access_point' ? 'recorded_for_possible_review' : 'technical_status_recorded' });
 } catch (error) { next(error); } });
 app.get('/api/organizations/:organizationId/radio-observations', authenticate, authorize('institute_admin', 'teacher', 'proctor'), async (req: AuthRequest, res, next) => { try {
   const organizationId = req.auth!.organizationId!;
   const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
-  const [observations, signals] = await Promise.all([
-    prisma.radioObservation.findMany({ where: { organizationId }, orderBy: { observedAt: 'desc' }, take: limit }),
-    prisma.radioCandidateSignal.findMany({ where: { organizationId }, orderBy: { createdAt: 'desc' }, take: limit, include: { observations: { include: { observation: true } } } })
+  const [observationResult, signalResult] = await Promise.all([
+    withAdvertisedNameCompatibility(includeAdvertisedName =>
+      prisma.radioObservation.findMany({
+        where: { organizationId },
+        orderBy: { observedAt: 'desc' },
+        take: limit,
+        select: radioObservationSelect(includeAdvertisedName),
+      })),
+    withAdvertisedNameCompatibility(includeAdvertisedName =>
+      prisma.radioCandidateSignal.findMany({
+        where: { organizationId },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        include: { observations: { include: { observation: { select: radioObservationSelect(includeAdvertisedName) } } } },
+      })),
   ]);
-  res.json({ observations, signals: signals.map(({ observations: links, ...signal }) => ({ ...signal, observationIds: links.map(link => link.observation) })) });
+  res.json({ observations: observationResult.result, advertisedNameAvailable: observationResult.advertisedNameAvailable, signals: signalResult.result.map(({ observations: links, ...signal }) => ({ ...signal, observationIds: links.map(link => link.observation) })) });
 } catch (error) { next(error); } });
 app.post('/api/organizations/:organizationId/radio-signals/:signalId/review', authenticate, authorize('institute_admin', 'teacher', 'proctor'), async (req: AuthRequest, res, next) => { try {
   const data = z.object({ status: z.enum(['reviewed_no_concern', 'reviewed_concern_retained', 'insufficient_evidence']), notes: z.string().min(3).max(2000) }).parse(req.body);
@@ -1090,6 +2398,7 @@ app.get('/api/organizations/:organizationId/evidence', authenticate, authorize(.
   const radioSearchOr: any[] | undefined = filters.search ? [
     ...relationSearch.OR,
     { pseudonym: { contains: filters.search, mode: 'insensitive' as const } },
+    { advertisedName: { contains: filters.search, mode: 'insensitive' as const } },
     { errorCode: { contains: filters.search, mode: 'insensitive' as const } },
     ...(['bluetooth_le', 'wifi', 'scanner_health'].includes(filters.search) ? [{ source: filters.search }] : []),
     ...(['advertisement', 'access_point', 'scan_unavailable', 'permission_denied', 'scan_error', 'scan_stopped'].includes(filters.search) ? [{ kind: filters.search }] : []),
@@ -1146,22 +2455,35 @@ app.get('/api/organizations/:organizationId/evidence', authenticate, authorize(.
   const includeRadio = !filters.type || filters.type === 'radio_observation';
   const includeCode = !filters.type || filters.type === 'coding_submission';
   const offset = evidenceOffset(filters.page, filters.pageSize);
-  const [eventCount, radioCount, codeCount, events, radios, codeSubmissions] = await Promise.all([
+  const [eventCount, radioCount, codeCount, events, radiosResult, codeSubmissions] = await Promise.all([
     includeEvents ? prisma.proctoringEvent.count({ where: eventWhere }) : 0,
     includeRadio ? prisma.radioObservation.count({ where: radioWhere }) : 0,
     includeCode && !filters.reviewStatus ? prisma.codeSubmission.count({ where: codeWhere }) : 0,
     includeEvents ? prisma.proctoringEvent.findMany({ where: eventWhere, orderBy: [{ occurredAt: 'desc' }, { id: 'desc' }], take: offset + filters.pageSize, include: { candidate: { select: { id: true, name: true, email: true } }, exam: { select: { id: true, title: true } }, attempt: { select: { id: true, status: true } }, incidents: { include: { incident: { select: { id: true, status: true, decisionReason: true, reviewerNotes: true, createdAt: true, updatedAt: true } } } } } }) : [],
-    includeRadio ? prisma.radioObservation.findMany({ where: radioWhere, orderBy: [{ observedAt: 'desc' }, { id: 'desc' }], take: offset + filters.pageSize, include: { candidate: { select: { id: true, name: true, email: true } }, exam: { select: { id: true, title: true } }, attempt: { select: { id: true, status: true } }, signals: { include: { signal: { select: { id: true, status: true, reviewerNotes: true, reviewerId: true, createdAt: true, updatedAt: true } } } } } }) : [],
+    includeRadio ? withAdvertisedNameCompatibility(includeAdvertisedName =>
+      prisma.radioObservation.findMany({
+        where: radioWhere,
+        orderBy: [{ observedAt: 'desc' }, { id: 'desc' }],
+        take: offset + filters.pageSize,
+        select: {
+          ...radioObservationSelect(includeAdvertisedName),
+          candidate: { select: { id: true, name: true, email: true } },
+          exam: { select: { id: true, title: true } },
+          attempt: { select: { id: true, status: true } },
+          signals: { select: { signal: { select: { id: true, status: true, reviewerNotes: true, reviewerId: true, createdAt: true, updatedAt: true } } } },
+        },
+      })) : Promise.resolve({ result: [], advertisedNameAvailable: false }),
     includeCode && !filters.reviewStatus ? prisma.codeSubmission.findMany({ where: codeWhere, orderBy: [{ submittedAt: 'desc' }, { id: 'desc' }], take: offset + filters.pageSize, include: { candidate: { select: { id: true, name: true, email: true } }, attempt: { select: { id: true, status: true, exam: { select: { id: true, title: true } } } }, codingQuestion: { select: { id: true, title: true } } } }) : [],
   ]);
+  const radios = radiosResult.result;
   const items: Array<Record<string, any>> = [];
   for (const event of events as any[]) {
     const reviewStatus = incidentReviewStatus(event.incidents.map((link: any) => link.incident.status));
-    items.push({ id: event.id, kind: event.evidenceKey ? 'image' : event.source === 'ai_service' ? 'ai_signal' : 'browser_event', type: event.type, source: event.source, occurredAt: event.occurredAt, organizationId, candidate: event.candidate, exam: event.exam, attempt: event.attempt, hasBinary: Boolean(event.evidenceKey), reviewStatus, incidents: event.incidents.map((link: any) => ({ id: link.incident.id, status: link.incident.status, decisionReason: link.incident.decisionReason, reviewerNotes: link.incident.reviewerNotes })) });
+    items.push({ id: event.id, kind: event.evidenceKey ? 'image' : event.source === 'ai_service' ? 'ai_signal' : 'browser_event', type: event.type, source: event.source, occurredAt: event.occurredAt, organizationId, candidate: event.candidate, exam: event.exam, attempt: event.attempt, hasBinary: Boolean(event.evidenceKey), reviewStatus, details: sanitizeEvidenceDetails(event.details) as Record<string, unknown> | undefined, incidents: event.incidents.map((link: any) => ({ id: link.incident.id, status: link.incident.status, decisionReason: link.incident.decisionReason, reviewerNotes: link.incident.reviewerNotes })) });
   }
   for (const observation of radios as any[]) {
     const statuses = observation.signals.map((link: any) => link.signal.status);
-    items.push({ id: observation.id, kind: 'radio_observation', type: `${observation.source}:${observation.kind}`, source: observation.source, occurredAt: observation.observedAt, organizationId, candidate: observation.candidate, exam: observation.exam, attempt: observation.attempt, hasBinary: false, reviewStatus: radioReviewStatus(statuses), details: { kind: observation.kind, rssi: observation.rssi, pseudonym: observation.pseudonym, scannerStatus: observation.scannerStatus, errorCode: observation.errorCode, limitations: observation.limitations }, signals: observation.signals.map((link: any) => ({ id: link.signal.id, status: link.signal.status, reviewerNotes: link.signal.reviewerNotes })) });
+    items.push({ id: observation.id, kind: 'radio_observation', type: `${observation.source}:${observation.kind}`, source: observation.source, occurredAt: observation.observedAt, organizationId, candidate: observation.candidate, exam: observation.exam, attempt: observation.attempt, hasBinary: false, reviewStatus: radioReviewStatus(statuses), details: { kind: observation.kind, rssi: observation.rssi, proximity: radioProximity(observation.source, observation.rssi), pseudonym: observation.pseudonym, advertisedName: observation.advertisedName ?? null, advertisedNameAvailable: radiosResult.advertisedNameAvailable, scannerStatus: observation.scannerStatus, errorCode: observation.errorCode, limitations: observation.limitations }, signals: observation.signals.map((link: any) => ({ id: link.signal.id, status: link.signal.status, reviewerNotes: link.signal.reviewerNotes })) });
   }
   for (const submission of codeSubmissions as any[]) {
     items.push({ id: submission.id, kind: 'coding_submission', type: `${submission.kind}:${submission.status}`, source: 'coding', occurredAt: submission.submittedAt, organizationId, candidate: submission.candidate, exam: submission.attempt.exam, attempt: { id: submission.attempt.id, status: submission.attempt.status }, hasBinary: false, reviewStatus: 'not_available', details: { languageId: submission.languageId, question: submission.codingQuestion.title, executionStatus: submission.status } });
@@ -1208,15 +2530,31 @@ app.get('/api/organizations/:organizationId/evidence/:kind/:evidenceId/details',
     await audit(organizationId, req.auth!.userId, 'evidence.detail_viewed', 'ProctoringEvent', event.id, { kind });
     const incidentIds = event.incidents.map(link => link.incident.id);
     const reviewHistory = incidentIds.length ? await prisma.auditLog.findMany({ where: { organizationId, targetType: 'Incident', targetId: { in: incidentIds }, action: { startsWith: 'incident.' } }, orderBy: { createdAt: 'desc' }, take: 50, select: { id: true, action: true, metadata: true, createdAt: true, actor: { select: { name: true } } } }) : [];
-    return res.json({ item: { id: event.id, kind: event.evidenceKey ? 'image' : kind, type: event.type, source: event.source, occurredAt: event.occurredAt, candidate: event.candidate, exam: event.exam, attempt: event.attempt, details: sanitizeEvidenceDetails(event.details), incidents: event.incidents.map(link => link.incident) }, reviewHistory });
+    const contextFrames = event.type === 'ai_context_frame' ? [] : await prisma.proctoringEvent.findMany({
+      where: { organizationId, attemptId: event.attempt.id, details: { path: ['parentEventId'], equals: event.id } },
+      orderBy: [{ occurredAt: 'asc' }, { id: 'asc' }],
+      select: { id: true, type: true, source: true, occurredAt: true, evidenceKey: true, details: true },
+    });
+    return res.json({ item: { id: event.id, kind: event.evidenceKey ? 'image' : kind, type: event.type, source: event.source, occurredAt: event.occurredAt, candidate: event.candidate, exam: event.exam, attempt: event.attempt, details: sanitizeEvidenceDetails(event.details), contextFrames: contextFrames.map(frame => ({ id: frame.id, kind: 'image', type: frame.type, source: frame.source, occurredAt: frame.occurredAt, hasBinary: Boolean(frame.evidenceKey), details: sanitizeEvidenceDetails(frame.details) })), incidents: event.incidents.map(link => link.incident) }, reviewHistory });
   }
   if (kind === 'radio_observation') {
-    const observation = await prisma.radioObservation.findFirst({ where: { id: evidenceId, organizationId }, include: { candidate: { select: { id: true, name: true, email: true, organizationId: true } }, exam: { select: { id: true, title: true, organizationId: true } }, attempt: { select: { id: true, status: true, organizationId: true, examId: true, candidateId: true } }, signals: { include: { signal: { select: { id: true, status: true, reviewerNotes: true, reviewerId: true, createdAt: true, updatedAt: true } } } } } });
+    const observationResult = await withAdvertisedNameCompatibility(includeAdvertisedName =>
+      prisma.radioObservation.findFirst({
+        where: { id: evidenceId, organizationId },
+        select: {
+          ...radioObservationSelect(includeAdvertisedName),
+          candidate: { select: { id: true, name: true, email: true, organizationId: true } },
+          exam: { select: { id: true, title: true, organizationId: true } },
+          attempt: { select: { id: true, status: true, organizationId: true, examId: true, candidateId: true } },
+          signals: { select: { signal: { select: { id: true, status: true, reviewerNotes: true, reviewerId: true, createdAt: true, updatedAt: true } } } },
+        },
+      }));
+    const observation = observationResult.result;
     if (!observation || !evidenceAttemptScopeMatches(observation.attempt, observation, organizationId) || observation.exam.organizationId !== organizationId || observation.candidate.organizationId !== organizationId) return res.status(404).json({ error: 'Evidence not found' });
     await audit(organizationId, req.auth!.userId, 'evidence.detail_viewed', 'RadioObservation', observation.id);
     const signalIds = observation.signals.map(link => link.signal.id);
     const reviewHistory = signalIds.length ? await prisma.auditLog.findMany({ where: { organizationId, targetType: 'RadioCandidateSignal', targetId: { in: signalIds } }, orderBy: { createdAt: 'desc' }, take: 50, select: { id: true, action: true, metadata: true, createdAt: true, actor: { select: { name: true } } } }) : [];
-    return res.json({ item: { id: observation.id, kind, type: `${observation.source}:${observation.kind}`, occurredAt: observation.observedAt, candidate: observation.candidate, exam: observation.exam, attempt: observation.attempt, details: { kind: observation.kind, rssi: observation.rssi, pseudonym: observation.pseudonym, scannerStatus: observation.scannerStatus, errorCode: observation.errorCode, limitations: observation.limitations }, signals: observation.signals.map(link => link.signal) }, reviewHistory });
+    return res.json({ item: { id: observation.id, kind, type: `${observation.source}:${observation.kind}`, occurredAt: observation.observedAt, candidate: observation.candidate, exam: observation.exam, attempt: observation.attempt, details: { kind: observation.kind, rssi: observation.rssi, proximity: radioProximity(observation.source, observation.rssi), pseudonym: observation.pseudonym, advertisedName: observation.advertisedName ?? null, advertisedNameAvailable: observationResult.advertisedNameAvailable, scannerStatus: observation.scannerStatus, errorCode: observation.errorCode, limitations: observation.limitations }, signals: observation.signals.map(link => link.signal) }, reviewHistory });
   }
   const submission = await prisma.codeSubmission.findFirst({ where: { id: evidenceId, organizationId }, include: { candidate: { select: { id: true, name: true, email: true, organizationId: true } }, attempt: { select: { id: true, status: true, organizationId: true, examId: true, candidateId: true, exam: { select: { id: true, title: true, organizationId: true } } } }, codingQuestion: { select: { id: true, title: true } } } });
   if (!submission || !evidenceAttemptScopeMatches(submission.attempt, { organizationId: submission.organizationId, examId: submission.attempt.examId, candidateId: submission.candidateId }, organizationId) || submission.attempt.exam.organizationId !== organizationId || submission.candidate.organizationId !== organizationId) return res.status(404).json({ error: 'Evidence not found' });
@@ -1412,6 +2750,9 @@ app.post('/api/organizations/:organizationId/attempts/:attemptId/grade', authent
   const organizationId = req.auth!.organizationId!;
   const attempt = await prisma.examAttempt.findFirst({ where: { id: String(req.params.attemptId), organizationId, status: { in: ['submitted', 'expired'] } } });
   if (!attempt) return res.status(404).json({ error: 'Submitted attempt not found' });
+  const exam = await prisma.exam.findFirst({ where: { id: attempt.examId, organizationId }, select: { isPractice: true } });
+  if (!exam) return res.status(404).json({ error: 'Submitted attempt not found' });
+  if (exam.isPractice) return res.status(409).json({ error: 'Practice attempts are not included in official grading' });
   const [questions, answers] = await Promise.all([
     prisma.question.findMany({ where: { organizationId, examId: attempt.examId } }),
     prisma.attemptAnswer.findMany({ where: { attemptId: attempt.id } })
@@ -1433,7 +2774,7 @@ app.post('/api/organizations/:organizationId/attempts/:attemptId/grade', authent
 app.put('/api/organizations/:organizationId/grades/:gradeId/manual', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
   const data = z.object({ manualMarks: z.number().min(0), feedback: z.string().max(4000).optional() }).parse(req.body);
   const organizationId = req.auth!.organizationId!;
-  const existing = await prisma.grade.findFirst({ where: { id: String(req.params.gradeId), organizationId } });
+  const existing = await prisma.grade.findFirst({ where: { id: String(req.params.gradeId), organizationId, exam: { isPractice: false } } });
   if (!existing || existing.status === 'published') return res.status(404).json({ error: 'Editable grade not found' });
   if (!manualMarksWithinBounds(existing.autoMarks, data.manualMarks, existing.maxMarks)) return res.status(400).json({ error: `Manual marks must keep the total within the maximum of ${existing.maxMarks}` });
   const grade = await prisma.grade.update({ where: { id: existing.id }, data: { manualMarks: data.manualMarks, totalMarks: existing.autoMarks + data.manualMarks, feedback: data.feedback, status: 'graded' } });
@@ -1443,7 +2784,7 @@ app.put('/api/organizations/:organizationId/grades/:gradeId/manual', authenticat
 app.post('/api/organizations/:organizationId/grades/:gradeId/publish', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
   const organizationId = req.auth!.organizationId!;
   const gradeId = String(req.params.gradeId);
-  const published = await prisma.grade.updateMany({ where: { id: gradeId, organizationId, status: 'graded' }, data: { status: 'published', publishedAt: new Date(), publishedById: req.auth!.userId } });
+  const published = await prisma.grade.updateMany({ where: { id: gradeId, organizationId, status: 'graded', exam: { isPractice: false } }, data: { status: 'published', publishedAt: new Date(), publishedById: req.auth!.userId } });
   if (published.count === 0) return res.status(404).json({ error: 'Graded result not found' });
   const grade = await prisma.grade.findUniqueOrThrow({ where: { id: gradeId } });
   const candidate = await prisma.candidate.findUnique({ where: { id: grade.candidateId } });
@@ -1451,20 +2792,78 @@ app.post('/api/organizations/:organizationId/grades/:gradeId/publish', authentic
   await audit(organizationId, req.auth!.userId, 'grade.published', 'Grade', grade.id);
   res.json(grade);
 } catch (error) { next(error); } });
+app.post('/api/organizations/:organizationId/exams/:examId/grades/publish', authenticate, authorize('institute_admin', 'teacher'), async (req: AuthRequest, res, next) => { try {
+  const organizationId = req.auth!.organizationId!;
+  const examId = String(req.params.examId);
+  const exam = await prisma.exam.findFirst({ where: { id: examId, organizationId }, select: { id: true, isPractice: true } });
+  if (!exam) return res.status(404).json({ error: 'Exam not found' });
+  if (exam.isPractice) return res.status(409).json({ error: 'Practice exam results cannot be published' });
+
+  const result = await prisma.$transaction(async tx => {
+    const [readyGrades, pendingManualCount] = await Promise.all([
+      tx.grade.findMany({
+        where: { organizationId, examId, status: 'graded' },
+        select: { id: true, candidate: { select: { userId: true } } },
+      }),
+      tx.grade.count({ where: { organizationId, examId, status: 'pending_manual' } }),
+    ]);
+    const publishedAt = new Date();
+    let publishedCount = 0;
+    let notifiedCount = 0;
+    for (const grade of readyGrades) {
+      const updated = await tx.grade.updateMany({
+        where: { id: grade.id, organizationId, examId, status: 'graded' },
+        data: { status: 'published', publishedAt, publishedById: req.auth!.userId },
+      });
+      if (updated.count !== 1) continue;
+      publishedCount++;
+      await tx.auditLog.create({ data: { organizationId, actorId: req.auth!.userId, action: 'grade.published', targetType: 'Grade', targetId: grade.id } });
+      if (grade.candidate.userId) {
+        await tx.notification.create({ data: {
+          organizationId,
+          userId: grade.candidate.userId,
+          type: 'result_published',
+          title: 'Result published',
+          body: 'Your exam result is now available.',
+          metadata: { gradeId: grade.id } as Prisma.InputJsonValue,
+          delivery: 'email_unconfigured',
+        } });
+        notifiedCount++;
+      }
+    }
+    await tx.auditLog.create({
+      data: {
+        organizationId,
+        actorId: req.auth!.userId,
+        action: 'results.declared',
+        targetType: 'Exam',
+        targetId: examId,
+        metadata: { publishedCount, pendingManualCount } as Prisma.InputJsonValue,
+      },
+    });
+    return { publishedCount, pendingManualCount, notifiedCount };
+  });
+
+  res.json({
+    publishedCount: result.publishedCount,
+    pendingManualCount: result.pendingManualCount,
+    notifiedCount: result.notifiedCount,
+  });
+} catch (error) { next(error); } });
 app.get('/api/organizations/:organizationId/reports/summary', authenticate, authorize('institute_admin', 'teacher', 'proctor'), async (req: AuthRequest, res, next) => { try {
   const organizationId = req.auth!.organizationId!;
   if (req.query.examId !== undefined && !isUuid(req.query.examId)) return res.status(400).json({ error: 'Invalid examId' });
   const examId = isUuid(req.query.examId) ? req.query.examId : undefined;
   const since = typeof req.query.from === 'string' ? new Date(req.query.from) : undefined;
   const byExam = examId ? { examId } : {};
-  const attemptWhere = { organizationId, ...byExam, ...(since && !Number.isNaN(+since) ? { createdAt: { gte: since } } : {}) };
+  const attemptWhere = { organizationId, ...byExam, exam: { isPractice: false }, ...(since && !Number.isNaN(+since) ? { createdAt: { gte: since } } : {}) };
   const [assigned, attempts, submitted, incidents, verificationApproved, grades] = await Promise.all([
-    prisma.examAssignment.count({ where: { organizationId, ...byExam } }),
+    prisma.examAssignment.count({ where: { organizationId, ...byExam, exam: { isPractice: false } } }),
     prisma.examAttempt.count({ where: attemptWhere }),
     prisma.examAttempt.count({ where: { ...attemptWhere, status: { in: ['submitted', 'expired'] } } }),
-    prisma.incident.count({ where: { organizationId, ...byExam } }),
+    prisma.incident.count({ where: { organizationId, ...byExam, exam: { isPractice: false } } }),
     prisma.verificationRequest.count({ where: { organizationId, status: 'approved' } }),
-    prisma.grade.findMany({ where: { organizationId, ...byExam } })
+    prisma.grade.findMany({ where: { organizationId, ...byExam, exam: { isPractice: false } } })
   ]);
   res.json({ completionRate: assigned ? submitted / assigned : 0, submission: { assigned, attempts, submitted }, incidents, verificationApproved, grades: grades.map(g => ({ candidateId: g.candidateId, totalMarks: g.totalMarks, maxMarks: g.maxMarks, status: g.status })) });
 } catch (error) { next(error); } });
@@ -1472,7 +2871,7 @@ app.get('/api/organizations/:organizationId/reports/export.csv', authenticate, a
   const organizationId = req.auth!.organizationId!;
   if (req.query.examId !== undefined && !isUuid(req.query.examId)) return res.status(400).json({ error: 'Invalid examId' });
   const examId = isUuid(req.query.examId) ? req.query.examId : undefined;
-  const grades = await prisma.grade.findMany({ where: { organizationId, ...(examId ? { examId } : {}) }, include: { candidate: { select: { name: true } } }, orderBy: { createdAt: 'asc' }, take: 10_000 });
+  const grades = await prisma.grade.findMany({ where: { organizationId, exam: { isPractice: false }, ...(examId ? { examId } : {}) }, include: { candidate: { select: { name: true } } }, orderBy: { createdAt: 'asc' }, take: 10_000 });
   // Results contain personal data: every export is audited.
   await audit(organizationId, req.auth!.userId, 'reports.exported', 'Report', organizationId, { rows: grades.length, examId: examId ?? null, format: 'csv' });
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -1481,7 +2880,7 @@ app.get('/api/organizations/:organizationId/reports/export.csv', authenticate, a
 } catch (error) { next(error); } });
 app.get('/api/notifications', authenticate, async (req: AuthRequest, res, next) => { try {
   const emailConfigured = !!emailProviderFromEnv();
-  res.json({ emailConfigured, emailStatus: emailConfigured ? 'configured' : 'unavailable: set EMAIL_PROVIDER, EMAIL_URL and EMAIL_FROM to enable email', notifications: await prisma.notification.findMany({ where: { userId: req.auth!.userId }, orderBy: { createdAt: 'desc' }, take: 50 }) });
+  res.json({ emailConfigured, emailStatus: emailConfigured ? 'configured' : 'unavailable: configure SMTP or webhook email delivery', notifications: await prisma.notification.findMany({ where: { userId: req.auth!.userId }, orderBy: { createdAt: 'desc' }, take: 50 }) });
 } catch (error) { next(error); } });
 app.post('/api/notifications/:id/read', authenticate, async (req: AuthRequest, res, next) => { try {
   const id = String(req.params.id);
@@ -1493,7 +2892,9 @@ registerOpsRoutes(app);
 registerAnalyticsRoutes(app);
 registerReviewRoutes(app);
 registerEmailRoutes(app);
-app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+registerStudentInvitationRoutes(app);
+registerSupportRoutes(app);
+app.use((error: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
   if (error instanceof z.ZodError) return res.status(400).json({ error: 'Invalid input', details: error.flatten() });
   if (error instanceof multer.MulterError) return res.status(uploadErrorHttpStatus(error.code)).json({ error: error.code === 'LIMIT_FILE_SIZE' ? 'File exceeds the 5 MB upload limit' : 'Invalid upload' });
   if (error instanceof Error && error.message === 'Unexpected end of form') return res.status(400).json({ error: 'Malformed multipart upload' });
@@ -1501,8 +2902,9 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
     const mapped = prismaErrorResponse(error.code);
     if (mapped) return res.status(mapped.status).json({ error: mapped.message });
   }
-  console.error(error);
-  res.status(500).json({ error: 'Unexpected server error' });
+  const requestId = crypto.randomUUID();
+  console.error(`[${requestId}] ${req.method} ${req.originalUrl}`, error);
+  res.status(500).json({ error: 'Unexpected server error', requestId });
 });
 
   return app;

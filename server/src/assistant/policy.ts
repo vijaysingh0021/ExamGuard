@@ -10,8 +10,8 @@ const RULES: Array<[string, RegExp]> = [
   ['records_lookup', /\b(result|score|grade|marks|incident|evidence)s?\b.*\b(of|for)\s+\S+/i],
   ['authoring', /\b(draft|generate|create|write)\b.*\b(question|rubric|template|exam)/i],
   ['analytics', /\b(analytics|report|summar(y|ise|ize)|statistics|audit)\b/i],
-  ['device_readiness', /\b(camera|microphone|mic|permission|companion|bluetooth|wi-?fi|network|connection|internet|device)\b/i],
-  ['platform_support', /\b(login|log in|sign in|password|account|register|registration|examguard|platform|help|support|certificate|receipt|result release|notification|accessib\w*|screen reader|keyboard)\b/i],
+  ['device_readiness', /\b(camera|microphone|mic|permission|companion|bluetooth|wi-?fi|network|connection|internet|device|display|screen|tab|fullscreen|full screen)\b/i],
+  ['platform_support', /\b(login|log in|sign in|password|account|register|registration|examguard|platform|help|support|certificate|receipt|result release|notification|accessib\w*|screen reader|keyboard|checklist|walk me through|step-by-step)\b/i],
   ['logistics', /\b(when|deadline|start|submit|submission|duration|instructions?|autosave|time)\b/i],
 ];
 const ROLE_INTENTS: Record<AssistantRole, Set<string>> = {

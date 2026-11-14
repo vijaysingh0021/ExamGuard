@@ -16,23 +16,26 @@ export function registerAnalyticsRoutes(app: Express) {
     const from = parseDateParam(req.query.from), to = parseDateParam(req.query.to);
     if (from === 'invalid' || to === 'invalid') return res.status(400).json({ error: 'from and to must be ISO dates' });
     if (from && to && from > to) return res.status(400).json({ error: 'from must not be after to' });
-    if (examId && !(await prisma.exam.findFirst({ where: { id: examId, organizationId }, select: { id: true } }))) return res.status(404).json({ error: 'Exam not found' });
+    const selectedExam = examId ? await prisma.exam.findFirst({ where: { id: examId, organizationId }, select: { id: true, isPractice: true } }) : null;
+    if (examId && !selectedExam) return res.status(404).json({ error: 'Exam not found' });
+    if (selectedExam?.isPractice) return res.status(400).json({ error: 'Practice exams are excluded from official analytics' });
     const byExam = examId ? { examId } : {};
+    const officialExam = { exam: { isPractice: false } };
     const range = from || to ? { createdAt: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } : {};
     const isAdmin = req.auth!.role === 'institute_admin';
 
     const [assigned, attempts, grades, incidentRows, evidenceItems, jobRows] = await Promise.all([
-      prisma.examAssignment.count({ where: { organizationId, ...byExam } }),
-      prisma.examAttempt.findMany({ where: { organizationId, ...byExam, ...range }, select: { status: true, startedAt: true, submittedAt: true }, take: ROW_CAP }),
-      prisma.grade.findMany({ where: { organizationId, ...byExam, ...range }, select: { totalMarks: true, maxMarks: true, status: true }, take: ROW_CAP }),
-      prisma.incident.groupBy({ by: ['status'], where: { organizationId, ...byExam, ...range }, _count: { _all: true } }),
+      prisma.examAssignment.count({ where: { organizationId, ...byExam, ...officialExam } }),
+      prisma.examAttempt.findMany({ where: { organizationId, ...byExam, ...officialExam, ...range }, select: { status: true, startedAt: true, submittedAt: true }, take: ROW_CAP }),
+      prisma.grade.findMany({ where: { organizationId, ...byExam, ...officialExam, ...range }, select: { totalMarks: true, maxMarks: true, status: true }, take: ROW_CAP }),
+      prisma.incident.groupBy({ by: ['status'], where: { organizationId, ...byExam, ...officialExam, ...range }, _count: { _all: true } }),
       isAdmin ? prisma.proctoringEvent.count({ where: { organizationId, evidenceKey: { not: null } } }) : Promise.resolve(null),
       isAdmin ? prisma.backgroundJob.groupBy({ by: ['status'], _count: { _all: true } }) : Promise.resolve(null),
     ]);
 
     let questions: ReturnType<typeof questionPerformance> | null = null; let questionsTruncated = false;
     if (examId) {
-      const finishedWhere = { examId, organizationId, status: { in: ['submitted', 'expired'] as Array<'submitted' | 'expired'> }, ...range };
+      const finishedWhere = { examId, organizationId, exam: { isPractice: false }, status: { in: ['submitted', 'expired'] as Array<'submitted' | 'expired'> }, ...range };
       const [questionRows, answerRows, finished] = await Promise.all([
         prisma.question.findMany({ where: { organizationId, examId }, select: { id: true, type: true, prompt: true, position: true, correctAnswer: true } }),
         prisma.attemptAnswer.findMany({ where: { organizationId, attempt: finishedWhere }, select: { questionId: true, value: true }, take: ANSWER_CAP }),

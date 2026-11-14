@@ -80,19 +80,17 @@ const testStorage: StorageInterface = {
 
 async function cleanup() {
   storageCalls = [];
+  const attemptIds = [TEST_ATTEMPT_ID, SECOND_ATTEMPT_ID, OTHER_ATTEMPT_ID, EXPIRED_ATTEMPT_ID, SUBMITTED_ATTEMPT_ID];
+  const examIds = [TEST_EXAM_ID, OTHER_EXAM_ID, EXPIRED_EXAM_ID, SUBMITTED_EXAM_ID];
+  const eventScope = { OR: [{ attemptId: { in: attemptIds } }, { examId: { in: examIds } }] };
+
+  await prisma.incidentEvent.deleteMany({ where: { event: eventScope } });
+  await prisma.proctoringEvent.deleteMany({ where: eventScope });
+  await prisma.evidenceObject.deleteMany({ where: { attemptId: { in: attemptIds } } });
 
   // Delete all exam attempts first (including for other exams)
   await prisma.examAttempt.deleteMany({
-    where: {
-      OR: [
-        { id: TEST_ATTEMPT_ID },
-        { examId: TEST_EXAM_ID },
-        { id: SECOND_ATTEMPT_ID },
-        { id: OTHER_ATTEMPT_ID },
-        { id: EXPIRED_ATTEMPT_ID },
-        { id: SUBMITTED_ATTEMPT_ID }
-      ]
-    }
+    where: { OR: [{ id: { in: attemptIds } }, { examId: TEST_EXAM_ID }] }
   });
 
   await prisma.attemptAnswer.deleteMany({ where: { attemptId: TEST_ATTEMPT_ID } });
@@ -112,6 +110,7 @@ async function cleanup() {
   });
 
   await prisma.candidate.deleteMany({ where: { organizationId: TEST_ORG_ID } });
+  await prisma.auditLog.deleteMany({ where: { organizationId: TEST_ORG_ID } });
   await prisma.user.deleteMany({ where: { id: TEST_USER_ID } });
   await prisma.organization.deleteMany({ where: { id: TEST_ORG_ID } });
 
@@ -121,6 +120,7 @@ async function cleanup() {
   await prisma.membership.deleteMany({ where: { OR: [{ userId: SECOND_USER_ID }, { userId: OTHER_USER_ID }] } });
   await prisma.user.deleteMany({ where: { OR: [{ id: SECOND_USER_ID }, { id: OTHER_USER_ID }] } });
   await prisma.candidate.deleteMany({ where: { OR: [{ id: SECOND_CANDIDATE_ID }, { id: OTHER_CANDIDATE_ID }] } });
+  await prisma.auditLog.deleteMany({ where: { organizationId: { in: [TEST_ORG_ID, OTHER_ORG_ID] } } });
   await prisma.organization.deleteMany({ where: { OR: [{ id: TEST_ORG_ID }, { id: OTHER_ORG_ID }] } });
 }
 
@@ -160,6 +160,8 @@ async function setupTestData() {
       status: 'in_progress',
       startedAt: new Date(),
       deadlineAt: new Date(Date.now() + 60 * 60 * 1000),
+      monitoringConsentAt: new Date(),
+      monitoringConsentVersion: 'examguard-monitoring-v2',
       questionOrder: [TEST_Q1_ID, TEST_Q2_ID]
     }
   });
@@ -351,6 +353,79 @@ test('evidence upload - candidate own active attempt succeeds with mocked storag
     const evidenceKey = (responseBody as { evidenceKey: string }).evidenceKey;
     assert.equal(storageCalls.length, 1, 'Successful uploads must invoke private storage exactly once');
     assert.deepEqual(storageCalls[0], { key: evidenceKey, contentType: 'image/jpeg' }, 'Storage must receive the exact key returned by the API');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+test('screen capture - consented full-display image is stored and indexed as image evidence', async () => {
+  storageCalls = [];
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const token = signToken(TEST_USER_ID);
+    const { body, contentType } = createMultipartBody({
+      capturedAt: new Date().toISOString(),
+      displaySurface: 'monitor',
+    }, {
+      name: 'file',
+      filename: 'full-display-still.jpg',
+      contentType: 'image/jpeg',
+      buffer: VALID_JPEG,
+    });
+    const { status, body: responseBody } = await makeRequest(
+      `/api/student/attempts/${TEST_ATTEMPT_ID}/screen-capture`,
+      'POST',
+      { authorization: `Bearer ${token}`, 'Content-Type': contentType },
+      body,
+    );
+
+    assert.equal(status, 201);
+    assert.ok(responseBody && typeof responseBody === 'object' && 'eventId' in responseBody && 'evidenceKey' in responseBody);
+    const { eventId, evidenceKey } = responseBody as { eventId: string; evidenceKey: string };
+    const event = await prisma.proctoringEvent.findUnique({ where: { id: eventId } });
+    assert.equal(storageCalls.length, 1);
+    assert.equal(storageCalls[0].key, evidenceKey);
+    assert.equal(event?.type, 'screen_capture');
+    assert.equal(event?.evidenceKey, evidenceKey);
+    assert.equal(event?.details && typeof event.details === 'object' && 'captureMode' in event.details ? event.details.captureMode : null, 'periodic_full_display_still');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+test('screen capture - rejects non-monitor display submissions before storage', async () => {
+  storageCalls = [];
+  const app = createApp(testStorage);
+  const server = http.createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(TEST_PORT, (err?: Error) => err ? reject(err) : resolve());
+  });
+
+  try {
+    const token = signToken(TEST_USER_ID);
+    const { body, contentType } = createMultipartBody({
+      capturedAt: new Date().toISOString(),
+      displaySurface: 'browser',
+    }, {
+      name: 'file',
+      filename: 'full-display-still.jpg',
+      contentType: 'image/jpeg',
+      buffer: VALID_JPEG,
+    });
+    const { status } = await makeRequest(
+      `/api/student/attempts/${TEST_ATTEMPT_ID}/screen-capture`,
+      'POST',
+      { authorization: `Bearer ${token}`, 'Content-Type': contentType },
+      body,
+    );
+
+    assert.equal(status, 400);
+    assert.equal(storageCalls.length, 0);
   } finally {
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   }
@@ -701,5 +776,3 @@ test('evidence upload - malformed multipart rejection', async () => {
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   }
 });
-
-

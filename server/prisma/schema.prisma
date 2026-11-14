@@ -38,6 +38,14 @@ enum ExamStatus {
   completed
 }
 
+enum SupportTicketStatus {
+  open
+  in_progress
+  awaiting_requester
+  resolved
+  closed
+}
+
 enum QuestionType {
   mcq
   multiple_select
@@ -195,6 +203,7 @@ model Organization {
   memberships           Membership[]
   exams                 Exam[]
   questionBanks         QuestionBank[]
+  examTemplates         ExamTemplate[]
   questions             Question[]
   candidates            Candidate[]
   examAssignments       ExamAssignment[]
@@ -203,6 +212,7 @@ model Organization {
   examSessions          ExamSession[]
   grades                Grade[]
   verificationRequests  VerificationRequest[]
+  staffVerificationRequests StaffVerificationRequest[]
   proctoringConfig      ProctoringConfig?
   notifications         Notification[]
   auditLogs             AuditLog[]
@@ -216,6 +226,8 @@ model Organization {
   attemptCodes          AttemptCode[]
   codingSubmissions     CodeSubmission[]
   executionJobs         ExecutionJob[]
+  studentInvitations    StudentInvitation[]
+  supportTickets        SupportTicket[]
 
   @@map("organizations")
 }
@@ -235,6 +247,7 @@ model User {
   reviewedRequests      InstitutionRequest[]
   createdExams          Exam[]
   createdQuestionBanks  QuestionBank[]
+  createdExamTemplates  ExamTemplate[]
   candidates            Candidate[]
   attempts              ExamAttempt[]
   publishedGrades       Grade[]
@@ -245,6 +258,11 @@ model User {
   emailPreference       EmailPreference?
   requestedExplanations StudentExplanation[] @relation("ExplanationRequestedBy")
   decidedExplanations   StudentExplanation[] @relation("ExplanationDecidedBy")
+  staffVerificationRequests StaffVerificationRequest[] @relation("StaffVerificationUser")
+  reviewedStaffVerifications StaffVerificationRequest[] @relation("StaffVerificationReviewer")
+  createdStudentInvitations StudentInvitation[] @relation("StudentInvitationCreator")
+  requestedSupportTickets SupportTicket[] @relation("SupportTicketRequester")
+  authoredSupportMessages SupportMessage[]
 
   @@map("users")
 }
@@ -254,6 +272,7 @@ model Membership {
   organizationId String   @db.Uuid
   role           Role
   active         Boolean  @default(true)
+  subjects       String[] @default([])
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
@@ -263,6 +282,57 @@ model Membership {
   @@id([userId, organizationId])
   @@index([organizationId])
   @@map("memberships")
+}
+
+model StudentInvitation {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @db.Uuid
+  createdById    String    @db.Uuid
+  email          String
+  name           String
+  tokenHash      String    @unique
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy    User         @relation("StudentInvitationCreator", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([organizationId, email, expiresAt])
+  @@index([organizationId, acceptedAt, expiresAt])
+  @@map("student_invitations")
+}
+
+model SupportTicket {
+  id             String              @id @default(uuid()) @db.Uuid
+  organizationId String              @db.Uuid
+  requesterId    String              @db.Uuid
+  subject        String
+  status         SupportTicketStatus @default(open)
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  requester    User             @relation("SupportTicketRequester", fields: [requesterId], references: [id], onDelete: Restrict)
+  messages     SupportMessage[]
+
+  @@index([organizationId, status, updatedAt])
+  @@index([requesterId, updatedAt])
+  @@map("support_tickets")
+}
+
+model SupportMessage {
+  id        String   @id @default(uuid()) @db.Uuid
+  ticketId  String   @db.Uuid
+  authorId  String   @db.Uuid
+  body      String
+  createdAt DateTime @default(now())
+
+  ticket SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author User          @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  @@index([ticketId, createdAt])
+  @@map("support_messages")
 }
 
 model AuthIdentity {
@@ -300,6 +370,25 @@ model PasswordResetToken {
   @@map("password_reset_tokens")
 }
 
+model SignupEmailChallenge {
+  id                    String    @id @default(uuid()) @db.Uuid
+  email                 String
+  purpose               String
+  organizationId        String?   @db.Uuid
+  codeHash              String
+  verificationTokenHash String?
+  expiresAt             DateTime
+  lastSentAt            DateTime  @default(now())
+  attempts              Int       @default(0)
+  verifiedAt            DateTime?
+  consumedAt            DateTime?
+  createdAt             DateTime  @default(now())
+
+  @@index([email, purpose, organizationId, createdAt])
+  @@index([expiresAt])
+  @@map("signup_email_challenges")
+}
+
 model OAuthAuthorization {
   id           String       @id @default(uuid()) @db.Uuid
   provider     AuthProvider
@@ -321,6 +410,10 @@ model InstitutionRequest {
   website        String?
   details        String?
   requesterEmail String
+  governmentIdDocument String?
+  institutionIdDocument String?
+  authorizationLetterDocument String?
+  institutionEmailVerifiedAt DateTime?
   status         InstitutionRequestStatus @default(submitted)
   reviewerId     String?                  @db.Uuid
   reviewReason   String?
@@ -333,12 +426,36 @@ model InstitutionRequest {
   @@map("institution_requests")
 }
 
+model StaffVerificationRequest {
+  id                    String             @id @default(uuid()) @db.Uuid
+  organizationId        String             @db.Uuid
+  userId                String             @db.Uuid
+  governmentIdDocument  String?
+  institutionIdDocument String?
+  authorizationDocument String?
+  status                VerificationStatus @default(draft)
+  reviewReason          String?
+  reviewedAt            DateTime?
+  reviewedById          String?            @db.Uuid
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  user         User         @relation("StaffVerificationUser", fields: [userId], references: [id])
+  reviewedBy   User?        @relation("StaffVerificationReviewer", fields: [reviewedById], references: [id])
+
+  @@unique([organizationId, userId])
+  @@index([organizationId, status])
+  @@map("staff_verification_requests")
+}
+
 model Exam {
   id                  String     @id @default(uuid()) @db.Uuid
   organizationId      String     @db.Uuid
   title               String
   instructions        String     @default("")
   status              ExamStatus @default(draft)
+  isPractice          Boolean    @default(false)
   startsAt            DateTime?
   endsAt              DateTime?
   durationMinutes     Int
@@ -372,6 +489,24 @@ model Exam {
 
   @@index([organizationId])
   @@map("exams")
+}
+
+model ExamTemplate {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  createdById    String   @db.Uuid
+  name           String
+  description    String?
+  settings       Json
+  questions      Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy    User         @relation(fields: [createdById], references: [id])
+
+  @@index([organizationId, name])
+  @@map("exam_templates")
 }
 
 model QuestionBank {
@@ -923,6 +1058,7 @@ model RadioObservation {
   observedAt     DateTime
   rssi           Int?
   pseudonym      String?
+  advertisedName String?
   scannerStatus  ScannerStatus
   errorCode      String?
   fingerprint    String

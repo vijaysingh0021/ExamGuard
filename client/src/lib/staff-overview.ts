@@ -1,7 +1,7 @@
-import { canDecideIncidents, canManageExams, canReviewVerifications } from "./permissions";
+import { canDecideIncidents, canManageExams } from "./permissions";
 
 /** Pure rules for the staff overview: which real, actionable items to surface for a role, and a summary of the exam list. */
-export interface Stats { exams: number; candidates: number; verificationPending: number; openIncidents: number; activeSessions: number; pendingExplanations: number; awaitingEvaluation?: number; pendingManual?: number; readyToPublish?: number }
+export interface Stats { exams: number; candidates: number; openIncidents: number; activeSessions: number; pendingExplanations: number; awaitingEvaluation?: number; pendingManual?: number; readyToPublish?: number }
 export interface AttentionItem { id: string; label: string; count: number; path: string; urgent: boolean }
 
 /** Only items with something to do, and only those the role can act on (the server remains authoritative). */
@@ -15,8 +15,7 @@ export function attentionItems(stats: Stats, role: string): AttentionItem[] {
   }
   add("incidents", "Incidents awaiting review", stats.openIncidents, "/app/incidents", true);
   add("explanations", "Candidate explanations to read", stats.pendingExplanations, "/app/incidents");
-  if (canReviewVerifications(role)) add("verification", "Identity verifications to review", stats.verificationPending, "/app/verification");
-  if (canDecideIncidents(role) || canManageExams(role)) add("sessions", "Exams in progress right now", stats.activeSessions, "/app/monitoring");
+  if (canDecideIncidents(role) || canManageExams(role)) add("sessions", "Exams in progress right now", stats.activeSessions, "/app/exams");
   return items;
 }
 

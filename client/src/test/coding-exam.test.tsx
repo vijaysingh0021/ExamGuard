@@ -27,6 +27,36 @@ describe('coding examination workspace', () => {
     expect(screen.getByLabelText('Code editor')).toHaveValue('print(42)');
     expect(screen.queryByText(/private input|private output|secret/i)).not.toBeInTheDocument();
   });
+  it('runs through the configured service, shows only public outputs, and adds server history', async () => {
+    const user = userEvent.setup();
+    const run = vi.fn().mockResolvedValue({
+      submissionId: 'submission-1',
+      createdAt: '2026-11-13T00:00:00.000Z',
+      status: 'accepted',
+      cases: [{ id: 'sample-1', status: 'accepted', passed: true, actualOutput: '4' }],
+      privateTests: { passed: 1, total: 1 },
+    });
+    render(
+      <CodingExamWorkspace
+        assessment={{ title: 'Programming fundamentals', deadlineAt: '2099-01-01T00:00:00.000Z' }}
+        attemptId="attempt-runner"
+        questions={questions}
+        execution={{ available: true, run, submit: vi.fn(), history: [] }}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Run samples' }));
+    expect(await screen.findByText('Private tests passed: 1 / 1. Private inputs and expected outputs are not shown.')).toBeInTheDocument();
+    expect(screen.getByText('Run')).toBeInTheDocument();
+    expect(screen.queryByText(/private-input|private-output/i)).not.toBeInTheDocument();
+    expect(run).toHaveBeenCalledWith({ questionId: 'q1', languageId: 'python', sourceCode: 'print(2)' });
+  });
+  it('clearly reports a question with no supported language configured', () => {
+    const question = { ...questions[0], languageIds: [], starterCode: {} };
+    render(<CodingExamWorkspace assessment={{ title: 'Programming fundamentals', deadlineAt: '2099-01-01T00:00:00.000Z' }} attemptId="attempt-no-language" questions={[question]} />);
+    expect(screen.getByRole('combobox', { name: 'Programming language' })).toBeDisabled();
+    expect(screen.getByRole('alert')).toHaveTextContent('No programming language is configured for this question.');
+  });
   it('saves code before leaving a question and flushes answers before finishing', async () => {
     const user = userEvent.setup();
     const save = vi.fn().mockResolvedValue(undefined);

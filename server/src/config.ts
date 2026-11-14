@@ -3,13 +3,13 @@ import { existsSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { z } from 'zod';
 
-// Workspace scripts execute under `server/`; root scripts execute under the
-// repository root. Prefer the repository .env in either case. Values supplied
-// by the OS retain precedence because dotenv never overrides them.
+// The Node and Python AI processes share one repository-root .env. Never load a
+// server-local .env here, because that could silently give the services different
+// AI credentials. Deployment environment variables still take precedence.
 const cwd = process.cwd();
-const repositoryEnv = basename(cwd) === 'server' ? resolve(cwd, '..', '.env') : resolve(cwd, '.env');
-const envFile = [repositoryEnv, resolve(cwd, '.env')].find(existsSync);
-if (envFile) dotenv.config({ path: envFile, override: false });
+const repositoryRoot = basename(cwd) === 'server' ? resolve(cwd, '..') : cwd;
+const repositoryEnv = resolve(repositoryRoot, '.env');
+if (existsSync(repositoryEnv)) dotenv.config({ path: repositoryEnv, override: false });
 
 const schema = z.object({
   DATABASE_URL: z.string().url().startsWith('postgres'),

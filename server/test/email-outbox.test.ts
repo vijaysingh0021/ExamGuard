@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { EmailPermanentError, EmailTransientError, WebhookEmailProvider, emailProviderFromEnv, type EmailProvider } from '../src/email.js';
+import { BrevoEmailProvider, EmailPermanentError, EmailTransientError, SmtpEmailProvider, WebhookEmailProvider, emailProviderFromEnv, type EmailProvider } from '../src/email.js';
 import { composeEmail, fanoutNotificationEmails, sendQueuedEmails, signUnsubscribe, verifyUnsubscribe, type OutboxDb } from '../src/email-outbox.js';
 
 const now = new Date('2026-11-07T10:00:00Z'); const at = (ms: number) => new Date(now.getTime() + ms);
@@ -87,6 +87,26 @@ test('provider: classifies errors, sends the idempotency key, never leaks creden
   const down = new WebhookEmailProvider('https://mail.example.test/send', 'f', undefined, 1000, (async () => { throw new Error('ECONNREFUSED mail.example.test'); }) as typeof fetch);
   await assert.rejects(down.send({ to: 'a', subject: 's', text: 't', idempotencyKey: 'k' }), (e: Error) => e instanceof EmailTransientError && !e.message.includes('mail.example'));
 });
+test('Brevo provider sends transactional mail over HTTPS and classifies retryable failures', async () => {
+  const calls: any[] = []; let status = 201;
+  const f = (async (url: string, init: any) => { calls.push({ url, init }); return { ok: status < 300, status, json: async () => ({ messageId: '<brevo-1>' }) } as Response; }) as unknown as typeof fetch;
+  const provider = new BrevoEmailProvider('BREVO_TEST_KEY', { email: 'no-reply@example.test', name: 'ExamGuard' }, 1000, f);
+  assert.deepEqual(await provider.send({ to: 'student@example.test', subject: 'Verify', text: 'Your code', idempotencyKey: 'signup:1' }), { messageId: '<brevo-1>' });
+  assert.equal(calls[0].url, 'https://api.brevo.com/v3/smtp/email');
+  assert.equal(calls[0].init.headers['api-key'], 'BREVO_TEST_KEY');
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    sender: { email: 'no-reply@example.test', name: 'ExamGuard' },
+    to: [{ email: 'student@example.test' }],
+    subject: 'Verify',
+    textContent: 'Your code',
+  });
+  status = 429;
+  await assert.rejects(provider.send({ to: 'a', subject: 's', text: 't', idempotencyKey: 'k' }), EmailTransientError);
+  status = 400;
+  await assert.rejects(provider.send({ to: 'a', subject: 's', text: 't', idempotencyKey: 'k' }), (error: Error) => error instanceof EmailPermanentError && !error.message.includes('BREVO_TEST_KEY'));
+  assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'brevo', EMAIL_API_KEY: 'key', EMAIL_FROM: 'ExamGuard <no-reply@example.test>' })?.name, 'brevo');
+  assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'brevo', EMAIL_API_KEY: 'key', EMAIL_FROM: 'not-an-email' }), null);
+});
 test('provider configuration is fail-closed and requires https (or localhost)', () => {
   assert.equal(emailProviderFromEnv({}), null);
   assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'webhook', EMAIL_URL: 'http://mail.example.test/send', EMAIL_FROM: 'a@x.test' }), null);
@@ -94,4 +114,29 @@ test('provider configuration is fail-closed and requires https (or localhost)', 
   assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'smtp', EMAIL_URL: 'https://x.test', EMAIL_FROM: 'a@x.test' }), null);
   assert.ok(emailProviderFromEnv({ EMAIL_PROVIDER: 'webhook', EMAIL_URL: 'https://mail.example.test/send', EMAIL_FROM: 'a@x.test' }));
   assert.ok(emailProviderFromEnv({ EMAIL_PROVIDER: 'webhook', EMAIL_URL: 'http://localhost:8025/send', EMAIL_FROM: 'a@x.test' }));
+});
+test('SMTP provider requires complete settings and sends with the configured sender', async () => {
+  assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'smtp', SMTP_HOST: 'smtp.example.test', SMTP_PORT: '587', SMTP_USER: 'user', SMTP_PASS: 'pass', MAIL_FROM: 'ExamGuard <no-reply@example.test>' })?.name, 'smtp');
+  assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'smtp', SMTP_HOST: 'smtp.example.test', SMTP_PORT: 'not-a-port', SMTP_USER: 'user', SMTP_PASS: 'pass', MAIL_FROM: 'no-reply@example.test' }), null);
+  assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'smtp', SMTP_HOST: 'smtp.example.test', SMTP_PORT: '587', SMTP_USER: 'user', MAIL_FROM: 'no-reply@example.test' }), null);
+
+  const sent: any[] = [];
+  const transport = { sendMail: async (message: any) => { sent.push(message); return { messageId: '<message@example.test>' }; } };
+  const provider = new SmtpEmailProvider('smtp.example.test', 587, 'user', 'pass', 'ExamGuard <no-reply@example.test>', transport as any);
+  assert.deepEqual(await provider.send({ to: 'person@example.test', subject: 'Reset code', text: '123456', idempotencyKey: 'reset:1' }), { messageId: '<message@example.test>' });
+  assert.equal(sent[0].from, 'ExamGuard <no-reply@example.test>');
+  assert.equal(sent[0].to, 'person@example.test');
+  assert.equal(sent[0].text, '123456');
+  assert.equal(sent[0].headers['X-ExamGuard-Idempotency-Key'], 'reset:1');
+});
+test('SMTP provider maps temporary transport failures without exposing SMTP details', async () => {
+  const provider = new SmtpEmailProvider('smtp.example.test', 587, 'user', 'secret-value', 'no-reply@example.test', {
+    sendMail: async () => { throw Object.assign(new Error('private SMTP response'), { code: 'ETIMEDOUT' }); },
+  } as any);
+  await assert.rejects(provider.send({ to: 'person@example.test', subject: 's', text: 't', idempotencyKey: 'reset:2' }), (error: unknown) => {
+    assert.ok(error instanceof EmailTransientError);
+    assert.ok(!String(error).includes('secret-value'));
+    assert.ok(!String(error).includes('private SMTP response'));
+    return true;
+  });
 });

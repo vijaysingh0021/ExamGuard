@@ -13,4 +13,27 @@ server/src/generated
 
 # Local-only private proctoring evidence (never commit captured frames)
 .local-evidence/
+ai-service/camera_test.jpg
+ai-service/test-phone*.jpg
+ai-service/test-faces.jpg
+ai-service/test-no-phone.jpg
+ai-service/test-no-faces.jpg
+ai-service/test-one-face.jpg
+ai-service/test-many-faces.jpg
+ai-service/test-looking-*.jpg
 data/private-evidence/
+
+# Sensitive local files
+.env
+.env.*
+!.env.example
+*.dump
+admin-auth-inspection.txt
+server/test-brevo.cjs
+
+# Dependencies and generated files
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+dist/

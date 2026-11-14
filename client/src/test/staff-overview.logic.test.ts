@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { attentionItems, examOverview, type Stats } from "../lib/staff-overview";
 
-const base: Stats = { exams: 3, candidates: 20, verificationPending: 0, openIncidents: 0, activeSessions: 0, pendingExplanations: 0, awaitingEvaluation: 0, pendingManual: 0, readyToPublish: 0 };
+const base: Stats = { exams: 3, candidates: 20, openIncidents: 0, activeSessions: 0, pendingExplanations: 0, awaitingEvaluation: 0, pendingManual: 0, readyToPublish: 0 };
 const ids = (s: Partial<Stats>, role: string) => attentionItems({ ...base, ...s }, role).map((i) => i.id);
 
 describe("attention items", () => {
@@ -9,9 +9,6 @@ describe("attention items", () => {
   it("shows grading work to teachers and administrators only", () => {
     const s = { awaitingEvaluation: 4, pendingManual: 2, readyToPublish: 1 };
     expect(ids(s, "teacher")).toEqual(["evaluate", "mark", "publish"]); expect(ids(s, "institute_admin")).toEqual(["evaluate", "mark", "publish"]); expect(ids(s, "proctor")).toEqual([]);
-  });
-  it("shows verification to administrators and reviewers, not teachers", () => {
-    expect(ids({ verificationPending: 2 }, "proctor")).toEqual(["verification"]); expect(ids({ verificationPending: 2 }, "institute_admin")).toEqual(["verification"]); expect(ids({ verificationPending: 2 }, "teacher")).toEqual([]);
   });
   it("shows incidents to every staff role and flags them urgent", () => {
     for (const role of ["institute_admin", "teacher", "proctor"]) expect(ids({ openIncidents: 3 }, role)).toEqual(["incidents"]);

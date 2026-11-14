@@ -1,0 +1,2 @@
+ALTER TABLE "memberships"
+  ADD COLUMN "subjects" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];

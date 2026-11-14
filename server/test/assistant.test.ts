@@ -39,6 +39,15 @@ test('grounded answers carry sources and work without any provider', async () =>
   const r = await mk().respond({ role: 'candidate', userId: 'u', message: 'camera permission blocked in browser' });
   assert.equal(r.mode, 'knowledge'); assert.ok(r.sources.length); assert.equal(r.aiGenerated, false);
 });
+test('candidate gets grounded guidance for display sharing and Companion checklists', async () => {
+  const display = await mk().respond({ role: 'candidate', userId: 'u', message: 'What does full-display sharing capture?' });
+  assert.equal(display.mode, 'knowledge');
+  assert.match(display.answer, /15 seconds|periodic/i);
+  assert.ok(display.sources.length);
+  const checklist = await mk().respond({ role: 'candidate', userId: 'v', message: 'Make a device-readiness checklist' });
+  assert.equal(checklist.mode, 'knowledge');
+  assert.match(checklist.answer, /Companion|camera|display/i);
+});
 test('active exam: technical help allowed, subject help refused, provider never called', async () => {
   const p = echo(); const a = mk(p);
   assert.equal((await a.respond({ role: 'candidate', userId: 'u1', message: 'my camera permission is blocked', examActive: true })).mode, 'model');

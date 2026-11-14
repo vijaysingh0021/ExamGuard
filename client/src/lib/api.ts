@@ -1,7 +1,7 @@
 import axios from "axios";
 
 /** Authenticated API client shared by all protected ExamGuard workflows. */
-export const api = axios.create();
+export const api = axios.create({ baseURL: import.meta.env.VITE_API_URL || undefined });
 
 /** Public authentication client intentionally does not attach a stale bearer token. */
 export const publicApi = axios.create();

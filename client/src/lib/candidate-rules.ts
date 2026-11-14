@@ -1,5 +1,5 @@
 /** Pure rules for the candidate dashboard. Times use the device clock for DISPLAY only; the server enforces the real start window and deadline. */
-export interface ExamLite { id: string; title: string; status: string; startsAt?: string | null; endsAt?: string | null; durationMinutes?: number; instructions?: string | null; requireVerification?: boolean }
+export interface ExamLite { id: string; title: string; status: string; startsAt?: string | null; endsAt?: string | null; durationMinutes?: number; instructions?: string | null; isPractice?: boolean; policyFullscreenRequired?: boolean }
 export interface AttemptLite { id: string; status: string; startedAt?: string; submittedAt?: string | null; deadlineAt?: string; receiptCode?: string | null }
 export interface GradeLite { id: string; totalMarks: number; maxMarks: number; feedback?: string | null; publishedAt?: string | null }
 export interface Assignment { id: string; exam: ExamLite | null; attempt?: AttemptLite | null; grade?: GradeLite | null }
@@ -34,6 +34,24 @@ export function sections(assignments: Assignment[], nowMs: number) {
     upcoming: by("upcoming").sort((x, y) => startsAt(x) - startsAt(y)),
     history: by("completed", "missed", "unavailable").sort((x, y) => recency(y) - recency(x)),
   };
+}
+
+export function calendarGrid(year: number, month: number): Date[] {
+  const first = new Date(year, month, 1);
+  const mondayOffset = (first.getDay() + 6) % 7;
+  const start = new Date(year, month, 1 - mondayOffset);
+  return Array.from({ length: 42 }, (_, index) => new Date(start.getFullYear(), start.getMonth(), start.getDate() + index));
+}
+
+export function calendarDayKey(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+export function assignmentsOnDay(assignments: Assignment[], day: string): Assignment[] {
+  return assignments.filter(({ exam }) => {
+    const scheduledAt = exam?.startsAt ?? exam?.endsAt;
+    return scheduledAt ? calendarDayKey(new Date(scheduledAt)) === day : false;
+  });
 }
 
 export function formatStartsIn(ms: number): string {

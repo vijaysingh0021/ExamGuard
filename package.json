@@ -2,9 +2,12 @@
   "name": "examguard",
   "private": true,
   "version": "0.1.0",
+  "engines": {
+    "node": "22.x || 24.x"
+  },
   "workspaces": ["client", "server"],
   "scripts": {
-    "dev": "concurrently \"npm run dev -w server\" \"npm run dev -w client\"",
+    "dev": "concurrently -k \"npm run dev -w server\" \"npm run dev -w client\" \"node scripts/start-ai-service.mjs\"",
     "build": "npm run build -w server && npm run build -w client",
     "typecheck": "npm run typecheck -w server && npm run typecheck -w client",
     "lint": "npm run lint -w server && npm run lint -w client",

@@ -11,3 +11,4 @@ export * from "./alert";
 export * from "./checkbox";
 export * from "./select";
 export * from "./textarea";
+export * from "./copyable-id";

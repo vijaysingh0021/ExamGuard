@@ -2,6 +2,9 @@
 import { describe, expect, it } from "vitest";
 import {
   formatStartsIn,
+  assignmentsOnDay,
+  calendarDayKey,
+  calendarGrid,
   phaseOf,
   readinessItems,
   resultText,
@@ -130,6 +133,23 @@ describe("dashboard sections", () => {
     ]);
     expect(s.upcoming.map((x) => x.a.id)).toEqual(["soon", "later"]);
     expect(s.history.map((x) => x.a.id)).toEqual(["recent", "old"]);
+  });
+});
+
+describe("candidate exam calendar", () => {
+  it("builds a complete Monday-first month grid", () => {
+    const days = calendarGrid(2026, 10);
+    expect(days).toHaveLength(42);
+    expect(days[0].getDay()).toBe(1);
+    expect(days.find(day => day.getMonth() === 10)?.getDate()).toBe(1);
+  });
+
+  it("shows assigned exams on their local scheduled day", () => {
+    const exam = a({ id: "scheduled", exam: { startsAt: "2026-11-12T08:30:00.000Z" } });
+    const key = calendarDayKey(new Date("2026-11-12T08:30:00.000Z"));
+    expect(assignmentsOnDay([exam], key)).toEqual([exam]);
+    expect(assignmentsOnDay([exam], "2026-11-13")).toEqual([]);
+    expect(calendarDayKey(new Date(2026, 10, 12))).toBe("2026-11-12");
   });
 });
 

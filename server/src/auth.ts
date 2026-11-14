@@ -69,3 +69,14 @@ export function authorize(...allowed: Role[]) {
     } catch (error) { next(error); }
   };
 }
+
+export async function authorizePlatformAdmin(req: AuthRequest, res: Response, next: NextFunction) {
+  try {
+    if (!req.auth) return res.status(401).json({ error: 'Authentication required' });
+    const membership = await prisma.membership.findFirst({ where: { userId: req.auth.userId, role: 'platform_admin', active: true } });
+    if (!membership) return res.status(403).json({ error: 'System administrator permission required' });
+    req.auth.organizationId = membership.organizationId;
+    req.auth.role = 'platform_admin';
+    next();
+  } catch (error) { next(error); }
+}

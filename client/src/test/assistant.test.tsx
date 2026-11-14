@@ -21,6 +21,7 @@ describe("assistant client helpers", () => {
   });
   it("shows role-appropriate suggestions and friendly errors", () => {
     expect(suggestionsFor("student").join(" ")).toMatch(/camera/i);
+    expect(suggestionsFor("student").join(" ")).toMatch(/Companion|display|exam/i);
     expect(suggestionsFor("institute_admin").join(" ")).toMatch(/analytics/i);
     expect(errorText(429)).toMatch(/too quickly/);
     expect(errorText(500)).not.toMatch(/500|stack/i);

@@ -10,6 +10,17 @@ test('AI signals require three positive frames in the rolling five-frame window'
   assert.deepEqual(aiSignalsForFrame(attempt, { phone_detected: true }), ['phone_detected']);
 });
 
+test('a mixed five-frame sequence qualifies on its third positive frame', () => {
+  clearAiSignalHistory();
+  const attempt = 'attempt-mixed-window';
+  const frames = [true, false, true, false, true];
+  const results = frames.map(positive =>
+    aiSignalsForFrame(attempt, { multiple_faces: positive }),
+  );
+
+  assert.deepEqual(results, [[], [], [], [], ['multiple_faces']]);
+});
+
 test('negative frames count in the five-frame window and prevent stale positives', () => {
   clearAiSignalHistory();
   const attempt = 'attempt-two';

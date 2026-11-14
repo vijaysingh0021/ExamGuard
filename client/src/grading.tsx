@@ -6,11 +6,11 @@ import { ArrowLeft, CheckCircle2, Lock } from "lucide-react";
 import { api } from "./lib/api";
 import { readPagination } from "./lib/pagination";
 import { ATTEMPT_STATUS_LABEL, GRADE_STATUS_LABEL, describeAnswer, formatScore, gradeActions, gradeTone, maxManualMarks, parseManualMarks, percent, sameAnswer, type GradeLite } from "./lib/grading-rules";
-import { Alert, Badge, Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Select, Skeleton, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea } from "./components/ui";
+import { Alert, Badge, Button, CopyableId, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Select, Skeleton, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea } from "./components/ui";
 
 type StaffSession = { organization: { id: string; name: string }; role: string };
 type SubmissionRow = { id: string; status: string; startedAt: string; submittedAt: string | null; receiptCode: string | null; candidate: { id: string; name: string }; grade: GradeLite | null };
-type Summary = { assigned: number; attempts: Record<string, number>; grades: Record<string, number>; awaitingEvaluation: number };
+type Summary = { assigned: number; attempts: Record<string, number>; grades: Record<string, number>; awaitingEvaluation: number; isPractice?: boolean };
 type ReviewQuestion = { id: string; type: string; prompt: string; options: Array<{ id: string; text: string }> | null; marks: number; objective: boolean; correctAnswer: unknown; answer: unknown; position: number | null };
 type Review = { attempt: { id: string; status: string; submittedAt: string | null; receiptCode: string | null; candidate: { id: string; name: string }; examTitle: string }; grade: (GradeLite & { feedback?: string | null }) | null; questions: ReviewQuestion[] };
 
@@ -27,20 +27,39 @@ export function SubmissionsPage({ session }: { session: StaffSession }) {
   const [searchText, setSearchText] = useState(search);
   const [reviewId, setReviewId] = useState<string | null>(null);
   const [bulk, setBulk] = useState<{ done: number; total: number; failed: number } | null>(null);
+  const [confirmDeclare, setConfirmDeclare] = useState(false);
+  const [declareNotice, setDeclareNotice] = useState("");
+  const [declareError, setDeclareError] = useState("");
   const base = `/api/organizations/${session.organization.id}/exams/${examId}`;
   const qc = useQueryClient();
   const setParam = (key: string, value: string) => { const next = new URLSearchParams(params); if (value) next.set(key, value); else next.delete(key); if (key !== "page") next.delete("page"); setParams(next, { replace: true }); };
 
-  const exam = useQuery({ queryKey: ["exam", session.organization.id, examId], queryFn: async () => (await api.get<{ title: string }>(base)).data });
+  const exam = useQuery({ queryKey: ["exam", session.organization.id, examId], queryFn: async () => (await api.get<{ title: string; isPractice?: boolean }>(base)).data });
   const summary = useQuery({ queryKey: ["submissions-summary", examId], queryFn: async () => (await api.get<Summary>(`${base}/submissions/summary`)).data });
   const list = useQuery({
     queryKey: ["submissions", examId, page, status, search], placeholderData: (p) => p,
     queryFn: async () => { const r = await api.get<SubmissionRow[]>(`${base}/submissions`, { params: { page, pageSize: 25, ...(status ? { status } : {}), ...(search ? { search } : {}) } }); return { rows: r.data, pagination: readPagination(r) }; },
   });
   const refresh = () => { void qc.invalidateQueries({ queryKey: ["submissions", examId] }); void qc.invalidateQueries({ queryKey: ["submissions-summary", examId] }); };
+  const declareResults = useMutation({
+    mutationFn: async () => (await api.post<{ publishedCount: number; pendingManualCount: number }>(`${base}/grades/publish`)).data,
+    onSuccess: (result) => {
+      setConfirmDeclare(false);
+      setDeclareError("");
+      setDeclareNotice(result.publishedCount
+        ? `Declared results for ${result.publishedCount} candidate${result.publishedCount === 1 ? "" : "s"}. ${result.pendingManualCount} still need marking.`
+        : "No ready-to-publish results were available. Nothing was changed.");
+      refresh();
+    },
+    onError: (error) => {
+      setConfirmDeclare(false);
+      setDeclareError(errorMessage(error, "Results could not be declared."));
+    },
+  });
 
   const rows = list.data?.rows ?? [];
-  const unevaluated = rows.filter((r) => ["submitted", "expired"].includes(r.status) && !r.grade);
+  const isPractice = exam.data?.isPractice === true || summary.data?.isPractice === true;
+  const unevaluated = isPractice ? [] : rows.filter((r) => ["submitted", "expired"].includes(r.status) && !r.grade);
   const evaluateAll = async () => {
     setBulk({ done: 0, total: unevaluated.length, failed: 0 });
     let done = 0, failed = 0;
@@ -53,17 +72,28 @@ export function SubmissionsPage({ session }: { session: StaffSession }) {
 
   const s = summary.data;
   const finished = (s?.attempts.submitted ?? 0) + (s?.attempts.expired ?? 0);
-  const tiles: Array<[string, number | string]> = s ? [["Assigned", s.assigned], ["Started", Object.values(s.attempts).reduce((a, b) => a + b, 0)], ["Finished", finished], ["Awaiting evaluation", s.awaitingEvaluation], ["Needs marking", s.grades.pending_manual ?? 0], ["Ready to publish", s.grades.graded ?? 0], ["Published", s.grades.published ?? 0]] : [];
+  const readyToPublish = s?.grades.graded ?? 0;
+  const pendingManual = s?.grades.pending_manual ?? 0;
+  const tiles: Array<[string, number | string]> = s ? isPractice
+    ? [["Assigned", s.assigned], ["Started", Object.values(s.attempts).reduce((a, b) => a + b, 0)], ["Finished", finished]]
+    : [["Assigned", s.assigned], ["Started", Object.values(s.attempts).reduce((a, b) => a + b, 0)], ["Finished", finished], ["Awaiting evaluation", s.awaitingEvaluation], ["Needs marking", s.grades.pending_manual ?? 0], ["Ready to publish", s.grades.graded ?? 0], ["Published", s.grades.published ?? 0]] : [];
 
   return (
     <div className="space-y-5">
       <div><Link to="/app/exams" className="inline-flex items-center gap-1 text-sm font-medium text-stone-600 hover:text-stone-950"><ArrowLeft size={14} aria-hidden="true" /> Examinations</Link>
         <h2 className="mt-2 text-xl font-semibold tracking-tight">Submissions{exam.data ? ` · ${exam.data.title}` : ""}</h2>
-        <p className="mt-1 text-sm text-stone-500">Track who has finished, evaluate answers, mark descriptive questions, and publish results.</p></div>
+        <p className="mt-1 text-sm text-stone-500">Track who has finished, evaluate answers, mark descriptive questions, and publish results.</p><CopyableId id={examId} label="Examination UUID" /></div>
+      {isPractice && <Alert role="status">Practice exam: attempts are ungraded and excluded from official results and reports.</Alert>}
 
       {summary.isError ? <Alert variant="destructive">Summary couldn't be loaded.</Alert> : !s ? <div className="grid grid-cols-2 gap-3 sm:grid-cols-4"><Skeleton className="h-20" /><Skeleton className="h-20" /><Skeleton className="h-20" /><Skeleton className="h-20" /></div> : (
         <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">{tiles.map(([k, v]) => <div key={k} className="rounded-xl border border-stone-200 bg-white p-3"><dt className="text-[11px] uppercase tracking-wide text-stone-500">{k}</dt><dd className="mt-1 text-2xl font-semibold">{v}</dd></div>)}</dl>
       )}
+      {!isPractice && readyToPublish > 0 && <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 p-4">
+        <div><p className="font-semibold text-emerald-950">Ready to declare {readyToPublish} result{readyToPublish === 1 ? "" : "s"}</p><p className="mt-1 text-sm text-emerald-900">This applies to the whole exam, not only the current page. Results needing marking are excluded.</p></div>
+        <Button type="button" onClick={() => { setDeclareNotice(""); setDeclareError(""); setConfirmDeclare(true); }}>Declare results</Button>
+      </div>}
+      {declareNotice && <Alert variant="success" role="status">{declareNotice}</Alert>}
+      {declareError && <Alert variant="destructive" role="alert">{declareError}</Alert>}
 
       <form className="flex flex-wrap items-end gap-3" onSubmit={(e) => { e.preventDefault(); setParam("search", searchText.trim()); }} aria-label="Filter submissions">
         <label className="text-sm">Status<Select value={status} onChange={(e) => setParam("status", e.target.value)} className="mt-1 min-w-44"><option value="">All</option>{Object.entries(ATTEMPT_STATUS_LABEL).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</Select></label>
@@ -82,8 +112,8 @@ export function SubmissionsPage({ session }: { session: StaffSession }) {
             <TableHeader><TableRow><TableHead scope="col">Candidate</TableHead><TableHead scope="col">Attempt</TableHead><TableHead scope="col">Submitted</TableHead><TableHead scope="col">Score</TableHead><TableHead scope="col">Result</TableHead><TableHead scope="col"><span className="sr-only">Actions</span></TableHead></TableRow></TableHeader>
             <TableBody>{rows.map((r) => (
               <TableRow key={r.id}>
-                <TableCell className="font-medium text-stone-900">{r.candidate.name}</TableCell>
-                <TableCell><Badge variant={r.status === "terminated" ? "danger" : r.status === "in_progress" || r.status === "paused" ? "warning" : "outline"}>{ATTEMPT_STATUS_LABEL[r.status] ?? r.status}</Badge></TableCell>
+                <TableCell className="font-medium text-stone-900">{r.candidate.name}<CopyableId id={r.candidate.id} label="Candidate UUID" compact /></TableCell>
+                <TableCell><Badge variant={r.status === "terminated" ? "danger" : r.status === "in_progress" || r.status === "paused" ? "warning" : "outline"}>{ATTEMPT_STATUS_LABEL[r.status] ?? r.status}</Badge><CopyableId id={r.id} label="Attempt UUID" compact /></TableCell>
                 <TableCell className="text-stone-500">{when(r.submittedAt)}</TableCell>
                 <TableCell>{r.grade ? <>{formatScore(r.grade)} <span className="text-xs text-stone-400">({percent(r.grade.totalMarks, r.grade.maxMarks)}%)</span></> : "—"}</TableCell>
                 <TableCell>{r.grade ? <Badge variant={gradeTone(r.grade.status)}>{GRADE_STATUS_LABEL[r.grade.status]}</Badge> : <span className="text-xs text-stone-400">{["submitted", "expired"].includes(r.status) ? "Not evaluated" : "—"}</span>}</TableCell>
@@ -96,13 +126,26 @@ export function SubmissionsPage({ session }: { session: StaffSession }) {
             </nav>)}
         </div>
       )}
-      <AttemptReviewDialog session={session} attemptId={reviewId} onClose={() => setReviewId(null)} onChanged={refresh} />
+      <Dialog open={confirmDeclare} onOpenChange={(open) => { if (!declareResults.isPending) setConfirmDeclare(open); }} ariaLabel="Confirm exam result declaration">
+        <DialogContent>
+          <DialogHeader><div><DialogTitle>Declare exam results?</DialogTitle><DialogDescription>This publishes every fully graded result for this exam at once. Pending manual marking and unevaluated attempts will be skipped.</DialogDescription></div></DialogHeader>
+          <Alert variant="warning">
+            <p className="font-medium">This action is final.</p>
+            <p className="mt-1">Candidates will be notified, and published grades cannot be edited or re-graded. {readyToPublish} ready to publish · {pendingManual} still need marking · {s?.awaitingEvaluation ?? 0} finished attempts not yet evaluated.</p>
+          </Alert>
+          <div className="mt-5 flex justify-end gap-2">
+            <Button type="button" variant="outline" disabled={declareResults.isPending} onClick={() => setConfirmDeclare(false)}>Cancel</Button>
+            <Button type="button" disabled={declareResults.isPending || readyToPublish === 0} onClick={() => declareResults.mutate()}>{declareResults.isPending ? "Declaring…" : "Declare results"}</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      <AttemptReviewDialog session={session} examId={examId} attemptId={reviewId} onClose={() => setReviewId(null)} onChanged={refresh} />
     </div>
   );
 }
 
 /** One attempt: the candidate's answers, automatic and manual marks, re-grading and publishing. */
-export function AttemptReviewDialog({ session, attemptId, onClose, onChanged }: { session: StaffSession; attemptId: string | null; onClose: () => void; onChanged: () => void }) {
+export function AttemptReviewDialog({ session, examId, attemptId, onClose, onChanged }: { session: StaffSession; examId: string; attemptId: string | null; onClose: () => void; onChanged: () => void }) {
   const orgBase = `/api/organizations/${session.organization.id}`;
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["attempt-review", attemptId], enabled: !!attemptId, queryFn: async () => (await api.get<Review>(`${orgBase}/attempts/${attemptId}/review`)).data });
@@ -132,7 +175,7 @@ export function AttemptReviewDialog({ session, attemptId, onClose, onChanged }: 
         {q.isLoading && <div className="space-y-3" aria-busy="true"><Skeleton className="h-8 w-1/2" /><Skeleton className="h-24" /><Skeleton className="h-40" /></div>}
         {q.isError && <Alert variant="destructive">This attempt couldn't be loaded. It may not be finished yet. <Button size="sm" variant="outline" onClick={onClose}>Close</Button></Alert>}
         {q.data && a && (<>
-          <DialogHeader><div><DialogTitle>{q.data.attempt.candidate.name}</DialogTitle><DialogDescription>{q.data.attempt.examTitle} · {ATTEMPT_STATUS_LABEL[q.data.attempt.status] ?? q.data.attempt.status} · {when(q.data.attempt.submittedAt)}{q.data.attempt.receiptCode ? ` · Receipt ${q.data.attempt.receiptCode}` : ""}</DialogDescription></div><Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>Close</Button></DialogHeader>
+          <DialogHeader><div><DialogTitle>{q.data.attempt.candidate.name}</DialogTitle><DialogDescription>{q.data.attempt.examTitle} · {ATTEMPT_STATUS_LABEL[q.data.attempt.status] ?? q.data.attempt.status} · {when(q.data.attempt.submittedAt)}{q.data.attempt.receiptCode ? ` · Receipt ${q.data.attempt.receiptCode}` : ""}</DialogDescription><div className="mt-2 grid gap-1"><CopyableId id={examId} label="Examination UUID" compact /><CopyableId id={q.data.attempt.candidate.id} label="Candidate UUID" compact /><CopyableId id={q.data.attempt.id} label="Attempt UUID" compact /></div></div><Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>Close</Button></DialogHeader>
 
           <section className="rounded-xl border border-stone-200 bg-stone-50 p-4" aria-label="Result">
             <div className="flex flex-wrap items-center justify-between gap-3">

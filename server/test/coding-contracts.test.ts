@@ -5,7 +5,7 @@ import { RunnerUnavailableError, UnavailableRunnerAdapter } from '../src/judge0-
 import { canWriteCodingSubmission } from '../src/coding-submission-service.js';
 
 test('coding question validation rejects duplicate languages and unsafe execution limits', () => {
-  const base = { title: 'Add two numbers', description: 'Return the sum.', difficulty: 'easy', mode: 'stdin_stdout', languageIds: ['python'], marks: 5 };
+  const base = { title: 'Add two numbers', description: 'Return the sum.', difficulty: 'easy', mode: 'stdin_stdout', languageIds: ['python'] };
   assert.equal(codingQuestionInput.parse(base).timeLimitMs, 2000);
   assert.throws(() => codingQuestionInput.parse({ ...base, languageIds: ['python', 'python'] }));
   assert.throws(() => codingQuestionInput.parse({ ...base, timeLimitMs: 30_001 }));

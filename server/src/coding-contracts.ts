@@ -18,9 +18,7 @@ export const codingQuestionInput = z.object({
   starterCode: z.record(codingLanguageId, z.string().max(200_000)).default({}),
   timeLimitMs: z.number().int().min(100).max(30_000).default(2_000),
   memoryLimitKb: z.number().int().min(16_384).max(1_048_576).default(262_144),
-  comparisonMode: outputComparisonMode.default('exact'),
-  marks: z.number().positive(),
-  negativeMarks: z.number().min(0).default(0)
+  comparisonMode: outputComparisonMode.default('exact')
 });
 
 export const codingTestCaseInput = z.object({
