@@ -6,3 +6,6 @@ numpy==1.26.4
 opencv-python==4.11.0.86
 mediapipe==0.10.20
 ultralytics==8.3.57
+
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu
