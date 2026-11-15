@@ -142,7 +142,7 @@ export async function checkEvidenceStorage(
   checkedAt = new Date(),
 ): Promise<ReadinessCheck> {
   if (!storage.storageConfigured()) {
-    return readinessCheck('evidence_storage', 'unavailable', 'Private evidence storage is not configured.', 'Configure private object storage for production or enable local evidence storage in development.', checkedAt);
+    return readinessCheck('evidence_storage', 'unavailable', 'Private evidence storage is not configured.', 'Configure SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and a private evidence bucket, or enable local evidence storage in development.', checkedAt);
   }
   if (!storage.verifyReadiness) {
     return readinessCheck('evidence_storage', 'unavailable', 'Storage configuration exists, but storage reachability cannot be verified.', 'Use a storage provider that supports a live readiness check.', checkedAt);

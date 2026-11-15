@@ -24,9 +24,9 @@ pilot, not for a high-stakes exam service:
   project after one week of inactivity. It does not include downloadable
   database backups. Do not use Render Free Postgres for retained exam data; it
   expires 30 days after creation.
-- Cloudflare R2 currently includes a monthly free allowance for standard
-  storage and operations. Keep the bucket private, configure a usage alert,
-  and apply the institution's evidence-retention policy.
+- Supabase Storage plan limits and overage terms vary. Keep the evidence bucket
+  private, monitor usage in the project dashboard, and apply the institution's
+  evidence-retention policy.
 - Free-plan quotas, availability, and provider terms can change. Check each
   provider's dashboard and current terms before inviting candidates.
 
@@ -48,12 +48,12 @@ pilot, not for a high-stakes exam service:
    `APP_BASE_URL` to that exact HTTPS origin, and `API_BASE_URL` to the
    Render HTTPS origin. Redeploy the API. These origins also secure CORS,
    OAuth callbacks, Socket.IO, and email links.
-5. Add `OBJECT_STORAGE_ENDPOINT`, `OBJECT_STORAGE_REGION`,
-   `OBJECT_STORAGE_BUCKET`, `OBJECT_STORAGE_ACCESS_KEY_ID`, and
-   `OBJECT_STORAGE_SECRET_ACCESS_KEY` to the Render API environment. Keep the
-   bucket private and grant the credentials permission for the bucket metadata
-   check (`HeadBucket`; the AWS S3 equivalent is `s3:ListBucket`). Never put
-   these values in `VITE_*` variables.
+5. In Supabase, create the private `examguard-evidence` Storage bucket. In
+   Render, set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and
+   `OBJECT_STORAGE_BUCKET=examguard-evidence`. The service role key bypasses
+   Row Level Security, so keep it only in the backend secret store; never put
+   it in `VITE_*` variables. Evidence keeps its existing organization-scoped
+   object keys and is retrieved through short-lived API URLs.
 6. Configure an active, verified sender and API key in Brevo, then set
    `EMAIL_PROVIDER=brevo`, `EMAIL_API_KEY`, and `MAIL_FROM` in Render.
    `MAIL_FROM` must be the verified address, optionally formatted as
@@ -122,11 +122,18 @@ cryptographically attested by a website, so do not treat a client readiness
 response as server proof of camera or display state.
 
 The storage probe creates and removes a temporary local directory in local
-development, or sends `HeadBucket` to the configured private bucket in
-production. Verify that the storage provider's credentials permit this check
-as well as the application's object read/write operations. Readiness reports
+development, or calls Supabase Storage's bucket-info endpoint in production.
+Verify that the service role key permits this check as well as the application's
+object read/write operations. Readiness reports
 service availability; test the complete candidate flow against the production
 services and a physical Windows machine before inviting candidates.
+
+Run the end-to-end Supabase check from the repository root with
+`npm run storage:smoke -w @examguard/server`. It loads the root `.env`, uses a
+unique `smoke-tests/` key, checks private access and an SDK download, then
+attempts deletion even after a failure. The smoke test never prints credentials
+or the short-lived API URL; a cleanup failure is reported separately and fails
+the command. Run it only against the intended Supabase project.
 
 The backend already publishes incident events through Socket.IO. The incident
 timeline now subscribes when an authorized staff member filters by a valid
@@ -139,7 +146,7 @@ connection.
 ### Infrastructure Requirements
 - PostgreSQL 17+ database
 - Redis (optional, for session caching)
-- S3-compatible object storage (AWS S3, Cloudflare R2, MinIO)
+- Supabase Storage private bucket
 - SMTP/Webhook email provider
 - OAuth credentials (Google, Microsoft)
 
@@ -165,12 +172,11 @@ CLIENT_URL=https://examguard.example.com
 APP_BASE_URL=https://examguard.example.com
 API_BASE_URL=https://api.examguard.example.com
 
-# Object Storage (S3-compatible)
-OBJECT_STORAGE_ENDPOINT=https://your-account.r2.cloudflarestorage.com
-OBJECT_STORAGE_REGION=auto
-OBJECT_STORAGE_BUCKET=examguard-private
-OBJECT_STORAGE_ACCESS_KEY_ID=your-access-key
-OBJECT_STORAGE_SECRET_ACCESS_KEY=your-secret-key
+# Private Supabase Storage API. Copy the project URL and service role key from
+# the Supabase project settings. Bucket visibility must remain PRIVATE.
+SUPABASE_URL=https://<project-ref>.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=<server-only-service-role-key>
+OBJECT_STORAGE_BUCKET=examguard-evidence
 
 # Email (local SMTP example; Render Free must use the Brevo HTTPS API below)
 EMAIL_PROVIDER=smtp
@@ -560,7 +566,7 @@ npm install pino pino-pretty
 ### Pre-Deployment
 - [ ] All secrets in secure vault (not in repo)
 - [ ] Database SSL/TLS enforced
-- [ ] S3 bucket: public access blocked, encryption enabled
+- [ ] Supabase evidence bucket: private access enabled
 - [ ] CORS origins restricted to production domains
 - [ ] Rate limits configured for production traffic
 - [ ] Security headers verified (CSP, HSTS, etc.)
@@ -598,7 +604,7 @@ npm install pino pino-pretty
 | Prisma migrate fails | Shadow DB permissions | Grant `CREATEDB` to DB user |
 | JWT verification fails | Secret mismatch | Ensure same `JWT_SECRET` across services |
 | CORS errors | Origin not allowed | Add the exact production frontend origin to `CLIENT_URL`; set `VITE_API_URL` at frontend build time |
-| File upload fails | S3 credentials/bucket policy | Verify keys, bucket exists, policy allows PUT |
+| File upload fails | Supabase service role key or bucket configuration | Verify `SUPABASE_URL`, the server-only service role key, and private bucket name |
 | AI service 503 | Model not loaded | Check `YOLO_MODEL_PATH`, GPU availability |
 | Exam start returns HTTP 500 | API error or database not migrated | Share the displayed request reference with the operator; inspect matching API logs and run `npx prisma migrate deploy` before retrying |
 
@@ -610,8 +616,8 @@ curl https://api.examguard.example.com/health
 # Test DB connection
 npx tsx -e "import { PrismaClient } from './server/generated/prisma/client.js'; const p = new PrismaClient(); await p.\$queryRaw\`SELECT version()\`; console.log('OK');"
 
-# Verify S3 access
-aws s3 ls s3://examguard-private --endpoint-url https://...
+# Verify Supabase Storage access without printing credentials or signed URLs
+npm run storage:smoke -w @examguard/server
 
 # Check AI service
 curl https://ai.examguard.example.com/health

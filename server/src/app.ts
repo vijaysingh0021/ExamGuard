@@ -7,7 +7,7 @@ import multer from 'multer';
 import rateLimit from 'express-rate-limit';
 import { authenticate, authenticateCompanion, authorize, authorizePlatformAdmin, signCompanionToken, signToken, tenantFilter, type AuthRequest, type CompanionClaims } from './auth.js';
 import { canStartExam, deadlineFor, isAttemptOpen, submissionStatusAt } from './exam.js';
-import { StorageInterface, realStorage, verifyLocalEvidenceToken } from './storage.js';
+import { StorageInterface, realStorage, verifyPrivateEvidenceToken } from './storage.js';
 import { dedupeWindow, fingerprintFor, reviewPriority } from './proctor.js';
 import { aiSignalsForFrame } from './ai-monitoring.js';
 import { radioProximity, supportsPotentialVisualAssistance } from './radio-proximity.js';
@@ -253,9 +253,14 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
     app.param(name, (_req, res, next, value) => (isUuid(value) ? next() : res.status(404).json({ error: 'Not found' })));
   }
   app.get('/health', (_req, res) => res.json({ status: 'ok' }));
-  app.get('/api/local-evidence/:token', async (req, res) => {
+  app.get(['/api/local-evidence/:token', '/api/private-evidence/:token'], async (req, res, next) => {
+    let key: string;
     try {
-      const key = verifyLocalEvidenceToken(String(req.params.token));
+      key = verifyPrivateEvidenceToken(String(req.params.token));
+    } catch {
+      return res.status(404).end();
+    }
+    try {
       if (!key.startsWith('organizations/')) return res.status(404).end();
       const object = await prisma.evidenceObject.findUnique({ where: { objectKey: key }, select: { organizationId: true, attemptId: true, mimeType: true, sizeBytes: true } });
       const staffDocument = object ? null : await prisma.staffVerificationRequest.findFirst({ where: { OR: [{ governmentIdDocument: key }, { institutionIdDocument: key }, { authorizationDocument: key }] }, select: { id: true } });
@@ -269,9 +274,7 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
       if (!bytes || (object && bytes.length !== object.sizeBytes) || (metadata?.contentLength !== undefined && bytes.length !== metadata.contentLength)) return res.status(404).end();
       res.set({ 'Content-Type': object?.mimeType ?? metadata?.contentType ?? 'application/octet-stream', 'Content-Length': String(bytes.length), 'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Content-Disposition': 'inline' });
       return res.status(200).send(bytes);
-    } catch {
-      return res.status(404).end();
-    }
+    } catch (error) { next(error); }
   });
 
   app.get('/api/student/monitoring-readiness', authenticate, async (req: AuthRequest, res) => {

@@ -1,5 +1,4 @@
-import { GetObjectCommand, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import jwt from 'jsonwebtoken';
 import { mkdir, mkdtemp, readFile, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, resolve, sep } from 'node:path';
@@ -13,8 +12,140 @@ export interface StorageInterface {
   getPrivateDocument?(key: string): Promise<Buffer | null>;
 }
 
-const required = ['OBJECT_STORAGE_ENDPOINT', 'OBJECT_STORAGE_BUCKET', 'OBJECT_STORAGE_ACCESS_KEY_ID', 'OBJECT_STORAGE_SECRET_ACCESS_KEY'] as const;
-const s3Configured = () => required.every(key => Boolean(process.env[key]));
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'OBJECT_STORAGE_BUCKET'] as const;
+
+interface SupabaseStorageConfig {
+  url: string;
+  projectHost: string;
+  bucket: string;
+  serviceRoleKey: string;
+}
+
+export interface StorageConfigurationSummary {
+  projectHost: string;
+  bucket: string;
+}
+
+function getSupabaseStorageConfig(env: Record<string, string | undefined> = process.env): SupabaseStorageConfig {
+  const missing = required.filter(key => !env[key]?.trim());
+  if (missing.length) throw new Error(`Missing required private Supabase Storage configuration: ${missing.join(', ')}`);
+
+  let url: URL;
+  try {
+    url = new URL(env.SUPABASE_URL!.trim());
+  } catch {
+    throw new Error('SUPABASE_URL must be a valid HTTPS URL.');
+  }
+  const localHttp = url.protocol === 'http:' &&
+    env.NODE_ENV !== 'production' &&
+    ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  if (url.protocol !== 'https:' && !localHttp) {
+    throw new Error('SUPABASE_URL must use HTTPS except for a local development endpoint.');
+  }
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error('SUPABASE_URL must be a project URL without credentials, a path, query parameters, or a fragment.');
+  }
+
+  return {
+    url: url.origin,
+    projectHost: url.host,
+    bucket: env.OBJECT_STORAGE_BUCKET!.trim(),
+    serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY!.trim(),
+  };
+}
+
+function createSupabaseStorageClient(config: SupabaseStorageConfig): SupabaseClient {
+  return createClient(config.url, config.serviceRoleKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+      detectSessionInUrl: false,
+    },
+  });
+}
+
+export function validateStorageConfiguration(env: Record<string, string | undefined> = process.env): StorageConfigurationSummary {
+  const config = getSupabaseStorageConfig(env);
+  return { projectHost: config.projectHost, bucket: config.bucket };
+}
+
+function isNotFound(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const failure = error as { name?: unknown; Code?: unknown; code?: unknown; status?: unknown; statusCode?: unknown; $metadata?: { httpStatusCode?: unknown } };
+  return failure.name === 'NotFound' ||
+    failure.name === 'NoSuchKey' ||
+    failure.Code === 'NoSuchKey' ||
+    failure.code === 'NotFound' ||
+    failure.code === 'NoSuchKey' ||
+    failure.status === 404 ||
+    failure.statusCode === 404 ||
+    failure.statusCode === '404' ||
+    failure.$metadata?.httpStatusCode === 404;
+}
+
+function logStorageFailure(operation: string, error: unknown) {
+  if (isNotFound(error)) return;
+  const failure = error && typeof error === 'object'
+    ? error as { name?: unknown; code?: unknown; error?: unknown; status?: unknown; statusCode?: unknown }
+    : {};
+  const name = typeof failure.name === 'string' ? failure.name.slice(0, 80) : 'UnknownError';
+  const codeValue = failure.error ?? failure.code;
+  const code = typeof codeValue === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(codeValue) ? codeValue : undefined;
+  const statusValue = failure.statusCode ?? failure.status;
+  const statusCode = typeof statusValue === 'number' ? statusValue : typeof statusValue === 'string' && /^\d{3}$/.test(statusValue) ? Number(statusValue) : undefined;
+  console.error('storage.operation.failed', {
+    operation,
+    name,
+    ...(code ? { code } : {}),
+    ...(statusCode ? { statusCode } : {}),
+  });
+}
+
+async function withStorageClient<T>(operation: string, action: (client: SupabaseClient, config: SupabaseStorageConfig) => Promise<T>): Promise<T> {
+  const config = getSupabaseStorageConfig();
+  const client = createSupabaseStorageClient(config);
+  try {
+    return await action(client, config);
+  } catch (error) {
+    logStorageFailure(operation, error);
+    throw error;
+  }
+}
+
+function validateStorageKey(key: string): string {
+  if (!key || key.startsWith('/') || key.includes('\\') || /[\u0000-\u001f\u007f]/.test(key) ||
+      key.split('/').some(part => !part || part === '.' || part === '..')) {
+    throw new Error('Invalid private evidence key');
+  }
+  return key;
+}
+
+function signedUrlTtl(expiresInSeconds: number | undefined): number {
+  const ttl = expiresInSeconds ?? 60;
+  if (!Number.isInteger(ttl) || ttl < 1 || ttl > 300) {
+    throw new Error('Private evidence URL expiry must be between 1 and 300 seconds.');
+  }
+  return ttl;
+}
+
+function privateEvidenceApiBaseUrl(): string {
+  let url: URL;
+  try {
+    url = new URL(process.env.API_BASE_URL?.trim() || 'http://localhost:4000');
+  } catch {
+    throw new Error('API_BASE_URL must be a valid URL for private evidence retrieval.');
+  }
+  const localHttp = process.env.NODE_ENV !== 'production' &&
+    url.protocol === 'http:' &&
+    ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  if (url.protocol !== 'https:' && !localHttp) {
+    throw new Error('API_BASE_URL must use HTTPS except for a local development endpoint.');
+  }
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error('API_BASE_URL must be an origin without credentials, a path, query parameters, or a fragment.');
+  }
+  return url.origin;
+}
 
 // Local private evidence is explicitly opt-in and disabled in production.
 // The path is resolved from the repository root when invoked by an npm workspace.
@@ -28,23 +159,21 @@ function localEvidenceRoot(): string | null {
 function localPathForKey(key: string): string {
   const root = localEvidenceRoot();
   if (!root) throw new Error('Local evidence storage is not enabled');
-  if (!key || key.startsWith('/') || key.includes('\\') || key.split('/').some(part => !part || part === '.' || part === '..')) {
-    throw new Error('Invalid private evidence key');
-  }
-  const path = resolve(root, ...key.split('/'));
+  const safeKey = validateStorageKey(key);
+  const path = resolve(root, ...safeKey.split('/'));
   if (!path.startsWith(root + sep)) throw new Error('Private evidence path escaped its storage root');
   return path;
 }
 
 function evidenceJwtSecret(): string {
   const secret = process.env.JWT_SECRET ?? '';
-  if (secret.length < 32) throw new Error('JWT_SECRET must be configured before local evidence URLs can be issued');
+  if (secret.length < 32) throw new Error('JWT_SECRET must be configured before private evidence URLs can be issued');
   return secret;
 }
 
-export function verifyLocalEvidenceToken(token: string): string {
+export function verifyPrivateEvidenceToken(token: string): string {
   const payload = jwt.verify(token, evidenceJwtSecret(), { audience: 'examguard-local-evidence' });
-  if (typeof payload !== 'object' || typeof payload.key !== 'string') throw new Error('Invalid local evidence token');
+  if (typeof payload !== 'object' || typeof payload.key !== 'string') throw new Error('Invalid private evidence token');
   return payload.key;
 }
 
@@ -69,10 +198,10 @@ async function localPrivateDocumentMetadata(key: string) {
   }
 }
 
-async function localPrivateDocumentUrl(key: string, _contentType?: string, expiresInSeconds = 60) {
-  // Check existence before issuing a URL. The token is short-lived like an S3 presigned URL.
+async function localPrivateDocumentUrl(key: string, _contentType?: string, expiresInSeconds?: number) {
+  // Check existence before issuing a short-lived URL.
   if (!(await localPrivateDocumentMetadata(key))) throw new Error('Private evidence object is missing');
-  const token = jwt.sign({ key }, evidenceJwtSecret(), { audience: 'examguard-local-evidence', expiresIn: expiresInSeconds });
+  const token = jwt.sign({ key }, evidenceJwtSecret(), { audience: 'examguard-local-evidence', expiresIn: signedUrlTtl(expiresInSeconds) });
   const apiBase = (process.env.API_BASE_URL || 'http://localhost:4000').replace(/\/$/, '');
   return `${apiBase}/api/local-evidence/${token}`;
 }
@@ -82,10 +211,35 @@ async function getLocalPrivateDocument(key: string): Promise<Buffer | null> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
 }
 
+async function getPrivateDocument(key: string): Promise<Buffer | null> {
+  if (localEvidenceRoot()) {
+    const localDocument = await getLocalPrivateDocument(key);
+    if (localDocument) return localDocument;
+    if (!storageConfigured()) return null;
+  }
+  try {
+    return await withStorageClient('download', async (client, config) => {
+      const { data, error } = await client.storage.from(config.bucket).download(key, {}, { cache: 'no-store' });
+      if (error) throw error;
+      if (!data) return null;
+      return Buffer.from(await data.arrayBuffer());
+    });
+  } catch (error) {
+    if (isNotFound(error)) return null;
+    throw error;
+  }
+}
+
 export async function putPrivateDocument(key: string, body: Buffer, contentType: string) {
-  if (!s3Configured()) throw new Error('Private object storage is not configured');
-  const client = new S3Client({ endpoint: process.env.OBJECT_STORAGE_ENDPOINT, region: process.env.OBJECT_STORAGE_REGION || 'auto', credentials: { accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID!, secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY! } });
-  await client.send(new PutObjectCommand({ Bucket: process.env.OBJECT_STORAGE_BUCKET!, Key: key, Body: body, ContentType: contentType, ServerSideEncryption: 'AES256' }));
+  validateStorageKey(key);
+  await withStorageClient('upload', async (client, config) => {
+    const { error } = await client.storage.from(config.bucket).upload(key, body, {
+      cacheControl: '0',
+      contentType,
+      upsert: true,
+    });
+    if (error) throw error;
+  });
   return key;
 }
 
@@ -97,57 +251,99 @@ async function verifyStorageReadiness() {
     await rmdir(probeDirectory);
     return;
   }
-  if (!s3Configured()) throw new Error('Private object storage is not configured');
-  const client = new S3Client({ endpoint: process.env.OBJECT_STORAGE_ENDPOINT, region: process.env.OBJECT_STORAGE_REGION || 'auto', credentials: { accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID!, secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY! } });
-  try {
-    await client.send(new HeadBucketCommand({ Bucket: process.env.OBJECT_STORAGE_BUCKET! }));
-  } finally {
-    client.destroy();
-  }
+  await withStorageClient('get_bucket', async (client, config) => {
+    const { data, error } = await client.storage.getBucket(config.bucket);
+    if (error) throw error;
+    if (data.public) throw new Error('Evidence storage bucket must be private');
+  });
 }
 
 export async function privateDocumentExists(key: string) {
+  validateStorageKey(key);
   if (localEvidenceRoot() && await localPrivateDocumentMetadata(key)) return true;
-  // During local development, previously captured S3 objects remain readable.
+  // During local development, previously captured remote objects remain readable.
   // New objects go to the local store; existing remote evidence is not hidden.
-  if (!s3Configured()) return false;
-  const client = new S3Client({ endpoint: process.env.OBJECT_STORAGE_ENDPOINT, region: process.env.OBJECT_STORAGE_REGION || 'auto', credentials: { accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID!, secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY! } });
-  try { await client.send(new HeadObjectCommand({ Bucket: process.env.OBJECT_STORAGE_BUCKET!, Key: key })); return true; } catch { return false; }
+  try {
+    return await withStorageClient('info', async (client, config) => {
+      const { data, error } = await client.storage.from(config.bucket).info(key);
+      if (error) throw error;
+      return Boolean(data);
+    });
+  } catch (error) {
+    if (isNotFound(error)) return false;
+    throw error;
+  }
 }
 
 export async function privateDocumentMetadata(key: string) {
+  validateStorageKey(key);
   if (localEvidenceRoot()) {
     const localMetadata = await localPrivateDocumentMetadata(key);
     if (localMetadata) return localMetadata;
-    if (!s3Configured()) return null;
+    if (!storageConfigured()) return null;
   }
-  if (!s3Configured()) throw new Error('Private object storage is not configured');
-  const client = new S3Client({ endpoint: process.env.OBJECT_STORAGE_ENDPOINT, region: process.env.OBJECT_STORAGE_REGION || 'auto', credentials: { accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID!, secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY! } });
   try {
-    const result = await client.send(new HeadObjectCommand({ Bucket: process.env.OBJECT_STORAGE_BUCKET!, Key: key }));
-    return { contentType: result.ContentType, contentLength: result.ContentLength };
+    return await withStorageClient('info', async (client, config) => {
+      const { data, error } = await client.storage.from(config.bucket).info(key);
+      if (error) throw error;
+      if (!data) return null;
+      const info = data as typeof data & {
+        metadata?: { mimetype?: unknown; contentType?: unknown; size?: unknown; contentLength?: unknown };
+        mimetype?: unknown;
+        size?: unknown;
+        contentType?: unknown;
+        contentLength?: unknown;
+      };
+      const contentTypeValue = info.metadata?.mimetype ?? info.metadata?.contentType ?? info.mimetype ?? info.contentType;
+      const sizeValue = info.metadata?.size ?? info.metadata?.contentLength ?? info.size ?? info.contentLength;
+      const contentLength = typeof sizeValue === 'number' ? sizeValue :
+        typeof sizeValue === 'string' && sizeValue.trim() !== '' ? Number(sizeValue) : undefined;
+      return {
+        ...(typeof contentTypeValue === 'string' ? { contentType: contentTypeValue } : {}),
+        ...(contentLength !== undefined && Number.isSafeInteger(contentLength) ? { contentLength } : {}),
+      };
+    });
   } catch (error) {
-    const failure = error as { name?: string; $metadata?: { httpStatusCode?: number } };
-    if (failure.name === 'NotFound' || failure.name === 'NoSuchKey' || failure.$metadata?.httpStatusCode === 404) return null;
+    if (isNotFound(error)) return null;
     throw error;
   }
 }
 
 export async function privateDocumentUrl(key: string, contentType?: string, expiresInSeconds = 60) {
+  validateStorageKey(key);
+  const ttl = signedUrlTtl(expiresInSeconds);
+  const apiBase = privateEvidenceApiBaseUrl();
   if (localEvidenceRoot()) {
-    if (await localPrivateDocumentMetadata(key)) return localPrivateDocumentUrl(key, contentType, expiresInSeconds);
-    if (!s3Configured()) throw new Error('Private evidence object is missing from local storage');
+    if (await localPrivateDocumentMetadata(key)) return localPrivateDocumentUrl(key, contentType, ttl);
+    if (!storageConfigured()) throw new Error('Private evidence object is missing from local storage');
   }
-  if (!s3Configured()) throw new Error('Private object storage is not configured');
-  const client = new S3Client({ endpoint: process.env.OBJECT_STORAGE_ENDPOINT, region: process.env.OBJECT_STORAGE_REGION || 'auto', credentials: { accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID!, secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY! } });
-  return getSignedUrl(client, new GetObjectCommand({ Bucket: process.env.OBJECT_STORAGE_BUCKET!, Key: key, ...(contentType ? { ResponseContentType: contentType } : {}), ResponseCacheControl: 'private, no-store', ResponseContentDisposition: 'inline' }), { expiresIn: expiresInSeconds });
+  if (!(await privateDocumentMetadata(key))) throw new Error('Private evidence object is missing');
+  const token = jwt.sign({ key }, evidenceJwtSecret(), { audience: 'examguard-local-evidence', expiresIn: ttl });
+  return `${apiBase}/api/private-evidence/${token}`;
+}
+
+export async function deleteStorageObject(key: string) {
+  validateStorageKey(key);
+  await withStorageClient('remove', async (client, config) => {
+    const { error } = await client.storage.from(config.bucket).remove([key]);
+    if (error) throw error;
+  });
+}
+
+function storageConfigured(): boolean {
+  try {
+    getSupabaseStorageConfig();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export const realStorage: StorageInterface = {
   putPrivateDocument: async (key, body, contentType) => localEvidenceRoot() ? putLocalPrivateDocument(key, body, contentType) : putPrivateDocument(key, body, contentType),
   privateDocumentUrl,
   privateDocumentMetadata,
-  getPrivateDocument: async key => localEvidenceRoot() ? getLocalPrivateDocument(key) : null,
+  getPrivateDocument,
   verifyReadiness: verifyStorageReadiness,
-  storageConfigured: () => Boolean(localEvidenceRoot()) || s3Configured()
+  storageConfigured: () => Boolean(localEvidenceRoot()) || storageConfigured()
 };

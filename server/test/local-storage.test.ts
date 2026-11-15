@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { realStorage, verifyLocalEvidenceToken } from '../src/storage.js';
+import { realStorage, verifyPrivateEvidenceToken } from '../src/storage.js';
 
 test('local evidence is private, metadata-backed and delivered by a short-lived signed URL', async () => {
   const previousRoot = process.env.LOCAL_EVIDENCE_DIR;
@@ -22,7 +22,7 @@ test('local evidence is private, metadata-backed and delivered by a short-lived 
     assert.deepEqual(await realStorage.getPrivateDocument?.(key), body);
     const url = await realStorage.privateDocumentUrl(key, 'image/jpeg', 60);
     const token = url.split('/').at(-1)!;
-    assert.equal(verifyLocalEvidenceToken(token), key);
+    assert.equal(verifyPrivateEvidenceToken(token), key);
   } finally {
     if (previousRoot === undefined) delete process.env.LOCAL_EVIDENCE_DIR; else process.env.LOCAL_EVIDENCE_DIR = previousRoot;
     if (previousSecret === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = previousSecret;
