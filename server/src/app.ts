@@ -221,6 +221,7 @@ const aiFrameSchema = z.object({
 const aiFrameLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false });
 export function createApp(storageImpl?: StorageInterface): express.Express {
   const app = express();
+  app.set('trust proxy', 1);
   const codeRunner = judge0AdapterFromEnv();
   const judge0LanguageIds = judge0LanguageIdsFromEnv();
   const storage = storageImpl ?? realStorage;

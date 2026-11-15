@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "test": "tsx test/run-all.ts",
+    "email:verify": "tsx scripts/verify-email.ts",
     "seed": "tsx scripts/seed.ts",
     "bootstrap:platform-admin": "tsx scripts/bootstrap-platform-admin.ts"
   },

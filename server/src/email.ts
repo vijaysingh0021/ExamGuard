@@ -32,17 +32,29 @@ export class WebhookEmailProvider implements EmailProvider {
 export class SmtpEmailProvider implements EmailProvider {
   name = 'smtp';
   private transporter: Transporter;
+  private readonly sensitiveValues: string[];
 
   constructor(host: string, port: number, user: string, password: string, private from: string, transporter?: Transporter) {
+    this.sensitiveValues = [user, password];
     this.transporter = transporter ?? nodemailer.createTransport({
       host,
       port,
       secure: port === 465,
+      requireTLS: port === 587,
       auth: { user, pass: password },
       connectionTimeout: 15_000,
       greetingTimeout: 10_000,
       socketTimeout: 20_000,
     });
+  }
+
+  async verify() {
+    try {
+      await this.transporter.verify();
+    } catch (error) {
+      logSmtpFailure('verification', error, undefined, this.sensitiveValues);
+      throw new Error('SMTP connectivity or authentication verification failed');
+    }
   }
 
   async send(message: EmailMessage) {
@@ -56,6 +68,7 @@ export class SmtpEmailProvider implements EmailProvider {
       });
       return { messageId: typeof result.messageId === 'string' ? result.messageId.slice(0, 200) : undefined };
     } catch (error) {
+      logSmtpFailure('delivery', error, message.text, this.sensitiveValues);
       const failure = error as { code?: unknown; responseCode?: unknown };
       const code = typeof failure.code === 'string' ? failure.code : '';
       const responseCode = typeof failure.responseCode === 'number' ? failure.responseCode : 0;
@@ -65,6 +78,36 @@ export class SmtpEmailProvider implements EmailProvider {
       throw new EmailPermanentError('SMTP server rejected the message');
     }
   }
+}
+
+function logSmtpFailure(operation: 'delivery' | 'verification', error: unknown, messageText?: string, providerSecrets: string[] = []) {
+  const failure = error !== null && typeof error === 'object'
+    ? error as { code?: unknown; responseCode?: unknown; response?: unknown }
+    : {};
+  const secretValues = Object.entries(process.env)
+    .filter(([name, value]) => value && /(?:PASS|SECRET|TOKEN|API[_-]?KEY|CREDENTIAL)/i.test(name))
+    .map(([, value]) => value as string)
+    .concat(providerSecrets);
+  if (messageText) {
+    secretValues.push(messageText);
+    secretValues.push(...(messageText.match(/[A-Za-z0-9+/_=-]{8,}/g) ?? []));
+  }
+  for (const secret of [...secretValues]) {
+    if (secret) secretValues.push(Buffer.from(secret).toString('base64'), encodeURIComponent(secret));
+  }
+  const redact = (value: string) => {
+    let safe = value;
+    for (const secret of secretValues) safe = safe.split(secret).join('[REDACTED]');
+    return safe.replace(/\b\d{6}\b/g, '[REDACTED]')
+      .replace(/(password|pass|api[-_ ]?key|token|secret)\s*[:=]\s*([^\s,;]+)/gi, '$1=[REDACTED]');
+  };
+  const response = typeof failure.response === 'string' ? redact(failure.response).slice(0, 1000) : undefined;
+  console.error('email.smtp.failure', {
+    operation,
+    code: typeof failure.code === 'string' ? failure.code : undefined,
+    responseCode: typeof failure.responseCode === 'number' ? failure.responseCode : undefined,
+    response,
+  });
 }
 
 type BrevoSender = { email: string; name?: string };
@@ -119,7 +162,7 @@ export function emailProviderFromEnv(env: Record<string, string | undefined> = p
   if (!from) return null;
   if (env.EMAIL_PROVIDER === 'smtp') {
     const port = Number(env.SMTP_PORT);
-    if (!env.SMTP_HOST || !Number.isInteger(port) || port < 1 || port > 65535 || !env.SMTP_USER || !env.SMTP_PASS) return null;
+    if (!env.SMTP_HOST || !Number.isInteger(port) || port < 1 || port > 65535 || !env.SMTP_USER || !env.SMTP_PASS || !parseBrevoSender(from)) return null;
     return new SmtpEmailProvider(env.SMTP_HOST, port, env.SMTP_USER, env.SMTP_PASS, from);
   }
   if (env.EMAIL_PROVIDER === 'brevo') {

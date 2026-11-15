@@ -167,9 +167,9 @@ JUDGE0_AUTH_TOKEN=<Judge0 service token>
 # JUDGE0_PRIVATE_HTTP_CONFIRMED=true # only for a trusted private network
 ```
 
-For Gmail SMTP, enable 2-Step Verification on the mailbox and create a Google App Password. Use that App Password for `SMTP_PASS`; a normal Google account password will not work. Keep all mail settings in the backend's secret manager or untracked server-side `.env`, never in frontend variables or source control. The `MAIL_FROM` address should be the authenticated Gmail mailbox. Signup email verification and password recovery both require this provider to deliver successfully; test an actual code delivery after deployment. Check the recipient's spam folder and the backend's sanitized delivery-failure logs if it does not arrive. A healthy API or configured mail provider does not prove that SMTP authentication and delivery succeeded.
+For Gmail SMTP, enable 2-Step Verification on the mailbox and create a Google App Password. Use that App Password for `SMTP_PASS`; a normal Google account password will not work. Keep all mail settings in the backend's secret manager or untracked server-side `.env`, never in frontend variables or source control. The `MAIL_FROM` address should be the authenticated Gmail mailbox. For Brevo SMTP, use its SMTP relay host, port, and generated SMTP credentials (not the Brevo API key), and verify the sender address in the Brevo account. Signup email verification and password recovery both use the same configured provider.
 
-For production transactional mail, a dedicated provider such as Brevo is often preferable to a personal Gmail mailbox; use the SMTP host, login, and API key issued by that provider.
+To test SMTP connectivity and authentication without sending an email, run `npm run email:verify -w @examguard/server` with `EMAIL_PROVIDER=smtp` and valid SMTP settings in the server environment. A successful SMTP check does not prove that the configured sender is verified or that a recipient will accept delivery. SMTP delivery failures include structured error codes and server responses, with credentials and OTP values redacted. For Render Free, use the Brevo HTTPS API configuration above because SMTP ports are blocked.
 
 ### Isolated coding execution (Judge0)
 

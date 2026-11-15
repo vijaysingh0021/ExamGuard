@@ -119,6 +119,7 @@ test('SMTP provider requires complete settings and sends with the configured sen
   assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'smtp', SMTP_HOST: 'smtp.example.test', SMTP_PORT: '587', SMTP_USER: 'user', SMTP_PASS: 'pass', MAIL_FROM: 'ExamGuard <no-reply@example.test>' })?.name, 'smtp');
   assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'smtp', SMTP_HOST: 'smtp.example.test', SMTP_PORT: 'not-a-port', SMTP_USER: 'user', SMTP_PASS: 'pass', MAIL_FROM: 'no-reply@example.test' }), null);
   assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'smtp', SMTP_HOST: 'smtp.example.test', SMTP_PORT: '587', SMTP_USER: 'user', MAIL_FROM: 'no-reply@example.test' }), null);
+  assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'smtp', SMTP_HOST: 'smtp.example.test', SMTP_PORT: '587', SMTP_USER: 'user', SMTP_PASS: 'pass', MAIL_FROM: 'not-an-email' }), null);
 
   const sent: any[] = [];
   const transport = { sendMail: async (message: any) => { sent.push(message); return { messageId: '<message@example.test>' }; } };
@@ -129,14 +130,41 @@ test('SMTP provider requires complete settings and sends with the configured sen
   assert.equal(sent[0].text, '123456');
   assert.equal(sent[0].headers['X-ExamGuard-Idempotency-Key'], 'reset:1');
 });
-test('SMTP provider maps temporary transport failures without exposing SMTP details', async () => {
+test('SMTP provider logs Nodemailer codes and redacts credentials and OTPs', async () => {
+  const logs: unknown[][] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { logs.push(args); };
   const provider = new SmtpEmailProvider('smtp.example.test', 587, 'user', 'secret-value', 'no-reply@example.test', {
-    sendMail: async () => { throw Object.assign(new Error('private SMTP response'), { code: 'ETIMEDOUT' }); },
+    sendMail: async () => { throw Object.assign(new Error('private SMTP response'), { code: 'EAUTH', responseCode: 535, response: '535 auth failed password=secret-value OTP 123456; key=safe-detail', command: 'AUTH PLAIN' }); },
   } as any);
-  await assert.rejects(provider.send({ to: 'person@example.test', subject: 's', text: 't', idempotencyKey: 'reset:2' }), (error: unknown) => {
-    assert.ok(error instanceof EmailTransientError);
-    assert.ok(!String(error).includes('secret-value'));
-    assert.ok(!String(error).includes('private SMTP response'));
-    return true;
-  });
+  try {
+    await assert.rejects(provider.send({ to: 'person@example.test', subject: 's', text: 'OTP 123456', idempotencyKey: 'reset:2' }), (error: unknown) => {
+      assert.ok(error instanceof EmailPermanentError);
+      assert.ok(!String(error).includes('secret-value'));
+      assert.ok(!String(error).includes('private SMTP response'));
+      return true;
+    });
+  } finally {
+    console.error = originalError;
+  }
+  const log = logs[0] as [string, { code: string; responseCode: number; response: string }];
+  assert.equal(log[0], 'email.smtp.failure');
+  assert.equal(log[1].code, 'EAUTH');
+  assert.equal(log[1].responseCode, 535);
+  assert.match(log[1].response, /535 auth failed/);
+  assert.match(log[1].response, /\[REDACTED\]/);
+  assert.ok(!log[1].response.includes('secret-value'));
+  assert.ok(!log[1].response.includes('123456'));
+  assert.ok(!log[1].response.includes('OTP 123456'));
+});
+test('SMTP verification checks connectivity without sending a message', async () => {
+  let verified = 0;
+  let sent = 0;
+  const provider = new SmtpEmailProvider('smtp.example.test', 587, 'user', 'pass', 'no-reply@example.test', {
+    verify: async () => { verified++; },
+    sendMail: async () => { sent++; throw new Error('Should not send mail during verification'); },
+  } as any);
+  await provider.verify();
+  assert.equal(verified, 1);
+  assert.equal(sent, 0);
 });
