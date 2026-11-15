@@ -1,13 +1,14 @@
-import { GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { GetObjectCommand, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import jwt from 'jsonwebtoken';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, resolve, sep } from 'node:path';
 
 export interface StorageInterface {
   putPrivateDocument(key: string, body: Buffer, contentType: string): Promise<string>;
   privateDocumentUrl(key: string, contentType?: string, expiresInSeconds?: number): Promise<string>;
   storageConfigured(): boolean;
+  verifyReadiness?(): Promise<void>;
   privateDocumentMetadata?(key: string): Promise<{ contentType?: string; contentLength?: number } | null>;
   getPrivateDocument?(key: string): Promise<Buffer | null>;
 }
@@ -88,6 +89,23 @@ export async function putPrivateDocument(key: string, body: Buffer, contentType:
   return key;
 }
 
+async function verifyStorageReadiness() {
+  if (localEvidenceRoot()) {
+    const root = localEvidenceRoot()!;
+    await mkdir(root, { recursive: true });
+    const probeDirectory = await mkdtemp(resolve(root, '.readiness-'));
+    await rmdir(probeDirectory);
+    return;
+  }
+  if (!s3Configured()) throw new Error('Private object storage is not configured');
+  const client = new S3Client({ endpoint: process.env.OBJECT_STORAGE_ENDPOINT, region: process.env.OBJECT_STORAGE_REGION || 'auto', credentials: { accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID!, secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY! } });
+  try {
+    await client.send(new HeadBucketCommand({ Bucket: process.env.OBJECT_STORAGE_BUCKET! }));
+  } finally {
+    client.destroy();
+  }
+}
+
 export async function privateDocumentExists(key: string) {
   if (localEvidenceRoot() && await localPrivateDocumentMetadata(key)) return true;
   // During local development, previously captured S3 objects remain readable.
@@ -130,5 +148,6 @@ export const realStorage: StorageInterface = {
   privateDocumentUrl,
   privateDocumentMetadata,
   getPrivateDocument: async key => localEvidenceRoot() ? getLocalPrivateDocument(key) : null,
+  verifyReadiness: verifyStorageReadiness,
   storageConfigured: () => Boolean(localEvidenceRoot()) || s3Configured()
 };

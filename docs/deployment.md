@@ -48,11 +48,17 @@ pilot, not for a high-stakes exam service:
    `APP_BASE_URL` to that exact HTTPS origin, and `API_BASE_URL` to the
    Render HTTPS origin. Redeploy the API. These origins also secure CORS,
    OAuth callbacks, Socket.IO, and email links.
-5. Add the private R2 S3 endpoint, bucket, region, access key, and secret to
-   the Render API environment. Never put these values in `VITE_*` variables.
-6. Configure a verified sender and an API key in Brevo, then set
-   `EMAIL_PROVIDER=brevo`, `EMAIL_FROM`, and `EMAIL_API_KEY` in Render.
-   Render Free blocks SMTP ports; the API integration sends mail over HTTPS.
+5. Add `OBJECT_STORAGE_ENDPOINT`, `OBJECT_STORAGE_REGION`,
+   `OBJECT_STORAGE_BUCKET`, `OBJECT_STORAGE_ACCESS_KEY_ID`, and
+   `OBJECT_STORAGE_SECRET_ACCESS_KEY` to the Render API environment. Keep the
+   bucket private and grant the credentials permission for the bucket metadata
+   check (`HeadBucket`; the AWS S3 equivalent is `s3:ListBucket`). Never put
+   these values in `VITE_*` variables.
+6. Configure an active, verified sender and API key in Brevo, then set
+   `EMAIL_PROVIDER=brevo`, `EMAIL_API_KEY`, and `MAIL_FROM` in Render.
+   `MAIL_FROM` must be the verified address, optionally formatted as
+   `ExamGuard <no-reply@your-verified-domain.example>`. Render Free blocks
+   SMTP ports; the integration sends mail over HTTPS.
 7. Configure OAuth callback URLs using the deployed API origin. Bootstrap the
    first platform administrator once from a trusted environment after
    migrations complete; do not put bootstrap credentials in the Blueprint.
@@ -60,6 +66,12 @@ pilot, not for a high-stakes exam service:
 Render's `sync: false` entries are intentionally left for you to fill in from
 the provider dashboards. Never commit secrets, upload a private YOLO model to
 the public repository, or expose the AI token to the browser.
+
+The Blueprint build command installs the workspace dependencies, generates
+Prisma Client, and runs `npm run build -w @examguard/server`. TypeScript compiles
+the current server source, scripts, and tests into `server/dist`; do not commit
+or manually upload stale build output. Deploy the changed source through the
+Blueprint so Render rebuilds `server/dist` before starting the API.
 
 ### PWA and device support
 
@@ -79,7 +91,7 @@ separately reviewed monitoring design.
 ### Cloud AI and the zero-budget limit
 
 The API is configured to call an HTTPS AI service; production must not point
-`AI_SERVICE_URL` at a personal computer. The Render Free instance has only
+`AI_SERVICE_URL` at a personal computer or localhost. The Render Free instance has only
 512 MB RAM and shares the workspace's free hours, which is not a dependable
 place to run this Python, MediaPipe, and YOLO stack. The Blueprint therefore
 asks for `AI_SERVICE_URL` and `AI_SERVICE_TOKEN` but does not deploy an AI
@@ -89,8 +101,32 @@ no reliable always-on host for this model is included in the requested
 zero-cost Vercel/Render/Supabase setup. Until that is configured, monitoring
 readiness will fail closed and secure exams cannot start.
 Render Free services cannot receive private-network traffic. If an AI host is
-used with the free API, it must expose HTTPS and enforce the shared
-`AI_SERVICE_TOKEN`; never expose an unauthenticated inference endpoint.
+used with the free API, configure its network-accessible HTTPS URL in
+`AI_SERVICE_URL` and enforce the shared `AI_SERVICE_TOKEN`; never expose an
+unauthenticated inference endpoint. The token must be at least 32 characters
+and identical on the API and AI service. The API's readiness probe authenticates
+to `/health/ready` and requires MediaPipe face detection, YOLO phone detection,
+head-orientation, and multiple-face detection to be ready.
+
+### Examination readiness and start gate
+
+The readiness page checks browser APIs and live camera, microphone, and
+full-display tracks, and displays the exam assignment/window and live AI and
+private-storage checks. A display track is accepted only when the browser
+reports `displaySurface=monitor`; stopping or switching away from that track
+marks it failed and the UI checks it again before manual submission. The API
+independently verifies the AI service and private storage before creating an
+attempt, and does not release exam questions until the attempt has a recent,
+authenticated Windows Companion heartbeat. Browser hardware tracks cannot be
+cryptographically attested by a website, so do not treat a client readiness
+response as server proof of camera or display state.
+
+The storage probe creates and removes a temporary local directory in local
+development, or sends `HeadBucket` to the configured private bucket in
+production. Verify that the storage provider's credentials permit this check
+as well as the application's object read/write operations. Readiness reports
+service availability; test the complete candidate flow against the production
+services and a physical Windows machine before inviting candidates.
 
 The backend already publishes incident events through Socket.IO. The incident
 timeline now subscribes when an authorized staff member filters by a valid
@@ -136,13 +172,18 @@ OBJECT_STORAGE_BUCKET=examguard-private
 OBJECT_STORAGE_ACCESS_KEY_ID=your-access-key
 OBJECT_STORAGE_SECRET_ACCESS_KEY=your-secret-key
 
-# Email (SMTP, e.g. Brevo or Gmail)
+# Email (local SMTP example; Render Free must use the Brevo HTTPS API below)
 EMAIL_PROVIDER=smtp
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=your-mailbox@gmail.com
 SMTP_PASS=your-google-app-password
 MAIL_FROM="ExamGuard <your-mailbox@gmail.com>"
+
+# Render production: configure a sender that is active and verified in Brevo.
+# EMAIL_PROVIDER=brevo
+# EMAIL_API_KEY=<Brevo API key>
+# MAIL_FROM="ExamGuard <no-reply@your-verified-domain.example>"
 
 # Alternatively use the webhook provider:
 # EMAIL_PROVIDER=webhook
@@ -156,8 +197,9 @@ MICROSOFT_CLIENT_ID=your-microsoft-client-id
 MICROSOFT_CLIENT_SECRET=your-microsoft-secret
 MICROSOFT_TENANT_ID=common
 
-# AI Service (optional)
-AI_SERVICE_URL=http://examguard-ai:8000 # private service address reachable by the API
+# AI Service (required for secure examination readiness)
+# Local: http://127.0.0.1:8001; production: a network-accessible HTTPS URL
+AI_SERVICE_URL=https://ai.example.com
 AI_SERVICE_TOKEN=<same 32+ character secret configured for the AI service>
 
 # Self-hosted Judge0 (optional; keep private and reachable only by the API)
@@ -167,9 +209,9 @@ JUDGE0_AUTH_TOKEN=<Judge0 service token>
 # JUDGE0_PRIVATE_HTTP_CONFIRMED=true # only for a trusted private network
 ```
 
-For Gmail SMTP, enable 2-Step Verification on the mailbox and create a Google App Password. Use that App Password for `SMTP_PASS`; a normal Google account password will not work. Keep all mail settings in the backend's secret manager or untracked server-side `.env`, never in frontend variables or source control. The `MAIL_FROM` address should be the authenticated Gmail mailbox. For Brevo SMTP, use its SMTP relay host, port, and generated SMTP credentials (not the Brevo API key), and verify the sender address in the Brevo account. Signup email verification and password recovery both use the same configured provider.
+For local Gmail SMTP, enable 2-Step Verification and create an App Password for `SMTP_PASS`; a normal Google account password will not work. Keep all mail settings in the backend's secret manager or untracked server-side `.env`, never in frontend variables or source control. For Brevo, use its API key (not its SMTP relay credentials), set `EMAIL_PROVIDER=brevo`, and set `MAIL_FROM` to a sender that Brevo lists as active and verified. Signup email verification and password recovery use the same provider.
 
-To test SMTP connectivity and authentication without sending an email, run `npm run email:verify -w @examguard/server` with `EMAIL_PROVIDER=smtp` and valid SMTP settings in the server environment. A successful SMTP check does not prove that the configured sender is verified or that a recipient will accept delivery. SMTP delivery failures include structured error codes and server responses, with credentials and OTP values redacted. For Render Free, use the Brevo HTTPS API configuration above because SMTP ports are blocked.
+Run `npm run email:verify -w @examguard/server` in the configured server environment to check Brevo authentication and sender verification without sending an email. It exits unsuccessfully if the provider is unavailable or rejects the check. A successful check does not prove that a recipient will accept delivery. On Render Free, use the Brevo HTTPS API; do not configure SMTP.
 
 ### Isolated coding execution (Judge0)
 
@@ -232,7 +274,8 @@ For local development, both services load the repository-root `.env`; do not
 create separate `server/.env` or `ai-service/.env` token values. Process
 environment variables override `.env`, so deployments must inject the same
 secret into both services using their secret manager. Keep the token out of
-client configuration and logs. The backend's authenticated monitoring
+client configuration and logs. Production requires `AI_SERVICE_URL` to be a
+network-accessible HTTPS URL, not localhost. The backend's authenticated
 readiness check verifies the shared Bearer credential; `/health/ready` is also
 Bearer-protected, while `/health` exposes non-secret diagnostics only.
 
@@ -313,7 +356,7 @@ COPY --from=builder /app/server/prisma ./prisma
 COPY --from=builder /app/node_modules ./node_modules
 
 EXPOSE 4000
-CMD ["node", "dist/index.js"]
+CMD ["node", "dist/src/index.js"]
 ```
 
 #### Build & Run
@@ -328,10 +371,13 @@ docker run -d \
 
 ### Option B: Render/Railway/ECS
 
-1. **Connect Repository**: Link GitHub repo
-2. **Build Command**: `npm run build -w server`
-3. **Start Command**: `npm run start -w server`
-4. **Environment Variables**: Add all from `.env` above
+1. **Connect Repository**: Link the GitHub repository and use the root
+   `render.yaml` Blueprint.
+2. **Build Command**: `npm ci --include=dev && cd server && npx prisma generate && cd .. && npm run build -w @examguard/server`
+3. **Start Command**: `cd server && npx prisma migrate deploy && cd .. && npm run start -w @examguard/server`
+4. **Environment Variables**: Configure the production variables listed in
+   [Free-tier deployment](#deploy-the-client-and-api), including private
+   storage, Brevo, and the HTTPS AI endpoint.
 5. **Health Check**: `GET /health` → `{"status":"ok"}`
 
 ### Option C: PM2 (VPS)
@@ -343,7 +389,7 @@ npm install -g pm2
 module.exports = {
   apps: [{
     name: 'examguard-api',
-    script: 'dist/index.js',
+    script: 'dist/src/index.js',
     cwd: '/path/to/server',
     env: {
       NODE_ENV: 'production',
@@ -392,9 +438,11 @@ npm run build
 
 ## AI Service Deployment
 
-The AI process must run continuously on the institution's host, not on each
-student's device. The API calls it over a private network; only the browser
-calls the API. Do not expose port 8000 to the public internet.
+The AI process must run continuously on a network-accessible host, not on each
+student's device. The API calls it server-to-server; only the browser calls
+the API. For production, the URL configured in `AI_SERVICE_URL` must be HTTPS
+and reachable from the API host. Protect `/analyze` and `/health/ready` with
+the shared Bearer token and do not expose an unauthenticated inference endpoint.
 
 Build the included container and run it with the same random 32+ character
 `AI_SERVICE_TOKEN` used by the API. Mount compatible YOLO weights read-only:
@@ -410,12 +458,12 @@ docker run -d --name examguard-ai --restart unless-stopped `
   examguard-ai
 ```
 
-Attach the API container to the same private network and configure
-`AI_SERVICE_URL=http://examguard-ai:8000` and the identical
-`AI_SERVICE_TOKEN`. If your hosting platform provides private service
-discovery, use its private AI service URL instead. Set `NODE_ENV=production`
-on the API so readiness accepts the configured non-local private AI hostname.
-Never put `AI_SERVICE_TOKEN` or the AI URL in `VITE_*` frontend variables.
+For local-only Docker development, attach the API container to the same private
+network. In production, terminate TLS at the AI service or a trusted HTTPS
+proxy and set `AI_SERVICE_URL` to that network-accessible HTTPS URL; the
+backend rejects production HTTP and localhost URLs. Set the identical
+`AI_SERVICE_TOKEN` on both services. Never put `AI_SERVICE_TOKEN` or the AI
+URL in `VITE_*` frontend variables.
 
 The API readiness check verifies the model automatically. Set up a platform
 health check for the AI container at `/health`; its authenticated readiness
@@ -429,6 +477,15 @@ curl http://localhost:8000/health
 # Expect mediapipe=ready, looking_away=ready, and phone_model=ready only when
 # compatible YOLO weights with a recognized phone class are loaded.
 ```
+
+### Local development commands
+
+From the repository root, `npm run dev` starts the client, API, and local AI
+service together. The local API and AI service use `AI_SERVICE_URL=http://127.0.0.1:8001`.
+To validate before deployment, run `npm run lint`, `npm run typecheck`,
+`npm test`, and `npm run build`. The production server-only build is
+`npm run build -w @examguard/server`; it compiles the updated server sources
+into `server/dist`.
 
 ## Windows Companion Distribution
 

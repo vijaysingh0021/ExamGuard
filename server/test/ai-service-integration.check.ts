@@ -31,6 +31,7 @@ const attempt = {
 };
 const testStorage = {
   storageConfigured: () => true,
+  verifyReadiness: async () => undefined,
   putPrivateDocument: async (key: string) => key,
   privateDocumentUrl: async () => '',
 };

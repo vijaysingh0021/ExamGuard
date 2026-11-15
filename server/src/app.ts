@@ -35,6 +35,7 @@ import { examToJson, policyOf } from './serializers.js';
 import { validateAnswerValue } from './answers.js';
 import { explanationResponseOpen, incidentStatusForExplanation, validExplanationDeadline } from './explanation-workflow.js';
 import { isSupportedImage, isSupportedIdentityDocument } from './upload-validation.js';
+import { checkAiService, checkEvidenceStorage, readinessSummary, readinessCheck } from './readiness.js';
 import { candidateListQuerySchema, candidateWhere, incidentListQuerySchema, incidentWhere, memberUpdateSchema, paginationHeaders, paginationOffset, questionOrderMatches, questionOrderSchema, memberCanBeManaged, wouldRemoveLastActiveAdmin, organizationApiRoles, prismaErrorResponse } from './organization-api.js';
 import { evidenceInventoryQuerySchema, evidenceReviewerRoles, evidenceUrlTtlSeconds, incidentReviewStatus, radioReviewStatus, canTransitionIncident, canTransitionRadio, evidencePaginationHeaders, evidenceOffset, privateEvidenceMetadataError, evidenceKeyMatchesAttempt, evidenceAttemptScopeMatches, uploadErrorHttpStatus, signedEvidenceUrlExpiresAt, sanitizeEvidenceDetails } from './evidence-api.js';
 import { codingExecutionRequest, codingQuestionInput, codingRateLimits, codingTestCaseInput } from './coding-contracts.js';
@@ -274,32 +275,43 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
   });
 
   app.get('/api/student/monitoring-readiness', authenticate, async (req: AuthRequest, res) => {
-    const evidenceStorageReady = (req.app.get('storage') as StorageInterface).storageConfigured();
-    const serviceUrl = process.env.AI_SERVICE_URL;
-    const serviceToken = process.env.AI_SERVICE_TOKEN;
-    if (!serviceUrl || !serviceToken || serviceToken.length < 32) return res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'not_configured', error: 'Configure AI_SERVICE_URL and the same 32-character AI_SERVICE_TOKEN for the local server and AI service.' });
-    try {
-      const base = new URL(serviceUrl);
-      const localHosts = ['localhost', '127.0.0.1', '[::1]'];
-      if (!['http:', 'https:'].includes(base.protocol) || (process.env.NODE_ENV !== 'production' && !localHosts.includes(base.hostname))) return res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'invalid_service_url', error: 'In production, AI_SERVICE_URL must point to the private AI service address reachable by the API.' });
-      const response = await fetch(new URL('/health/ready', base), {
-        headers: { Authorization: `Bearer ${serviceToken}` },
-        signal: AbortSignal.timeout(2500),
-      });
-      if (response.status === 401) return res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'authentication_mismatch', error: 'The Node backend and AI service must load the same AI_SERVICE_TOKEN from the shared environment.' });
-      if (response.status === 503) return res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'authentication_not_configured', error: 'Set the same 32-character AI_SERVICE_TOKEN for the local server and AI service.' });
-      if (!response.ok) return res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'unavailable', error: `The AI service returned HTTP ${response.status}.` });
-      const health = await response.json() as Record<string, unknown>;
-      const ready = health.mediapipe === 'ready' && health.phone_model === 'ready' && health.looking_away === 'ready' && health.multiple_faces === 'ready';
-      const unavailableModels = [
-        health.mediapipe !== 'ready' && 'face analysis',
-        health.phone_model !== 'ready' && 'phone detection (configure YOLO_MODEL_PATH to a supported model)',
-      ].filter(Boolean);
-      res.status(ready ? 200 : 503).json({ ready, evidenceStorageReady, aiService: ready ? 'ready' : 'models_unavailable', ...(ready ? {} : { error: `The AI service is running, but these capabilities are unavailable: ${unavailableModels.join(', ')}.` }), capabilities: { faceDetection: health.mediapipe === 'ready', phoneDetection: health.phone_model === 'ready', headOrientation: health.looking_away === 'ready', multipleFaces: health.multiple_faces === 'ready' }, note: 'Head orientation is an approximate review signal, not eye-gaze tracking.' });
-    } catch {
-      res.status(503).json({ ready: false, evidenceStorageReady, aiService: 'unavailable', error: 'The AI service is not responding. Check the hosted AI service health and API-to-AI network connection.' });
-    }
+    const storage = req.app.get('storage') as StorageInterface;
+    const [ai, evidenceStorage] = await Promise.all([checkAiService(), checkEvidenceStorage(storage)]);
+    const checks = [ai.check, evidenceStorage];
+    const summary = readinessSummary(checks);
+    res.status(summary.ready ? 200 : 503).json({
+      ...summary,
+      checks,
+      evidenceStorageReady: evidenceStorage.status === 'ready',
+      aiService: ai.check.status === 'ready' ? 'ready' : ai.check.status,
+      error: checks.find(check => check.status !== 'ready')?.explanation,
+      capabilities: ai.capabilities,
+      note: 'Head orientation is an approximate review signal, not eye-gaze tracking.',
+    });
   });
+  app.get('/api/student/organizations/:organizationId/exams/:examId/readiness', authenticate, async (req: AuthRequest, res, next) => { try {
+    const organizationId = String(req.params.organizationId);
+    const examId = String(req.params.examId);
+    const [candidate, exam] = await Promise.all([
+      prisma.candidate.findFirst({ where: { organizationId, userId: req.auth!.userId }, select: { id: true } }),
+      prisma.exam.findFirst({ where: { id: examId, organizationId }, select: { id: true, status: true, startsAt: true, endsAt: true } }),
+    ]);
+    if (!candidate || !exam) return res.status(403).json({ error: 'Authorized candidate and examination required.' });
+    const assignment = await prisma.examAssignment.findUnique({ where: { examId_candidateId: { examId, candidateId: candidate.id } }, select: { id: true } });
+    const now = new Date();
+    const examCanStart = ['published', 'scheduled', 'live'].includes(exam.status) && canStartExam(now, exam.startsAt ?? undefined, exam.endsAt ?? undefined);
+    const examStatus = examCanStart ? 'ready' : exam.startsAt && exam.startsAt > now ? 'pending' : 'failed';
+    const storage = req.app.get('storage') as StorageInterface;
+    const [ai, evidenceStorage] = await Promise.all([checkAiService(), checkEvidenceStorage(storage)]);
+    const checks = [
+      readinessCheck('exam_assignment', assignment ? 'ready' : 'failed', assignment ? 'You are assigned to this examination.' : 'You are not assigned to this examination.', 'Contact your examination organizer to confirm your assignment.', now),
+      readinessCheck('exam_window', examStatus, examCanStart ? 'The examination is open for starting.' : examStatus === 'pending' ? 'The examination start time has not arrived.' : 'The examination is not currently available.', 'Start during the scheduled examination window or contact your organizer.', now),
+      ai.check,
+      evidenceStorage,
+    ];
+    const summary = readinessSummary(checks);
+    res.status(summary.ready ? 200 : 503).json({ ...summary, checks, capabilities: ai.capabilities });
+  } catch (error) { next(error); } });
 
   app.get('/api/auth/providers', (_req, res) => { const providers = configuredProviders(); res.json({ providers, status: providers.length ? 'configured' : 'not_configured', message: providers.length ? undefined : 'Google or Microsoft credentials have not been configured by this institution.' }); });
   app.get('/api/auth/oauth/:provider/start', async (req, res, next) => { try {
@@ -1675,6 +1687,17 @@ app.post('/api/student/organizations/:organizationId/exams/:examId/start', authe
   const assignment = await prisma.examAssignment.findUnique({ where: { examId_candidateId: { examId: exam.id, candidateId: candidate.id } }, select: { id: true } });
   if (!assignment || !canStartExam(new Date(), exam.startsAt ?? undefined, exam.endsAt ?? undefined)) return res.status(403).json({ error: 'This exam is not currently available' });
   if (exam.accessCodeHash && !(accessCode && await bcrypt.compare(accessCode, exam.accessCodeHash))) return res.status(403).json({ error: 'Valid access code required' });
+  const storage = req.app.get('storage') as StorageInterface;
+  const [aiReadiness, evidenceStorageReadiness] = await Promise.all([checkAiService(), checkEvidenceStorage(storage)]);
+  const readinessChecks = [aiReadiness.check, evidenceStorageReadiness];
+  const readiness = readinessSummary(readinessChecks);
+  if (!readiness.ready) {
+    return res.status(503).json({
+      error: 'Mandatory server-side examination readiness checks have not passed.',
+      readiness: { ...readiness, checks: readinessChecks },
+      capabilities: aiReadiness.capabilities,
+    });
+  }
   const attemptResult = await prisma.$transaction(async tx => {
     await tx.$queryRaw<Array<{ lock: string }>>`SELECT pg_advisory_xact_lock(hashtext(${req.auth!.userId})::bigint)::text AS lock`;
     const now = new Date();

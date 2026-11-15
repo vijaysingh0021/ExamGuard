@@ -99,6 +99,18 @@ import { ExamTimer, QuestionPalette, SubmitReviewDialog, SyncIndicator } from ".
 import { AnswerSync, pendingStore, type SyncSnapshot } from "./lib/answer-sync";
 import { createSubmitter } from "./lib/submit-flow";
 import { clockOffsetMs, isAnswered, loadMarks, progress as examProgress, remainingMs, saveMarks } from "./lib/exam-state";
+import {
+  browserCompatibility,
+  cameraStreamIsActive,
+  checkCompanionBridge,
+  createReadinessCheck,
+  fullDisplayStreamIsActive,
+  microphoneStreamIsActive,
+  requestCameraStream,
+  requestFullDisplayStream,
+  requestMicrophoneStream,
+  type ReadinessCheck,
+} from "./lib/exam-readiness";
 const queryClient = new QueryClient();
 
 const nav = [
@@ -658,7 +670,7 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
     </div>
   );
 }
-function ReadinessChecks({ onStart, error, fullscreenRequired }: { onStart: () => void; error: string; fullscreenRequired: boolean }) {
+function ReadinessChecks({ onStart, error, fullscreenRequired, organizationId, examId }: { onStart: () => void; error: string; fullscreenRequired: boolean; organizationId: string; examId: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const cameraStream = useRef<MediaStream | null>(null);
   const microphoneStream = useRef<MediaStream | null>(null);
@@ -668,10 +680,10 @@ function ReadinessChecks({ onStart, error, fullscreenRequired }: { onStart: () =
   const [microphone, setMicrophone] = useState("Not checked");
   const [level, setLevel] = useState(0);
   const [acknowledged, setAcknowledged] = useState(false);
-  const [practiceCompleted, setPracticeCompleted] = useState(false);
+  const [practiceAnswer, setPracticeAnswer] = useState("");
+  const practiceCompleted = practiceAnswer === "blue";
   const [screen, setScreen] = useState("Not enabled");
   const screenStream = useRef<MediaStream | null>(null);
-  const [fullscreen, setFullscreen] = useState(false);
   const [companionStatus, setCompanionStatus] = useState("Checking local Windows Companion…");
   const [companionReady, setCompanionReady] = useState(false);
   const [aiStatus, setAiStatus] = useState("Checking AI proctoring service…");
@@ -679,14 +691,25 @@ function ReadinessChecks({ onStart, error, fullscreenRequired }: { onStart: () =
   const [evidenceStorageReady, setEvidenceStorageReady] = useState(false);
   const [evidenceStorageStatus, setEvidenceStorageStatus] = useState("Checking private evidence storage…");
   const [monitoringConsent, setMonitoringConsent] = useState(false);
-  const supported = typeof navigator !== "undefined" && !!navigator.mediaDevices?.getUserMedia;
-  const online = typeof navigator !== "undefined" && navigator.onLine;
+  const [online, setOnline] = useState(typeof navigator !== "undefined" && navigator.onLine);
+  const [serverChecks, setServerChecks] = useState<ReadinessCheck[]>([]);
+  const [lastChecked, setLastChecked] = useState<Record<string, string>>({});
+  const [startError, setStartError] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
+  const browserCheck = useMemo(() => browserCompatibility(
+    typeof navigator === "undefined" ? "" : navigator.userAgent,
+    typeof window !== "undefined" && window.isSecureContext,
+    typeof navigator !== "undefined" && !!navigator.mediaDevices?.getUserMedia,
+    typeof navigator !== "undefined" && !!navigator.mediaDevices?.getDisplayMedia,
+  ), []);
+  const markChecked = (id: string) => setLastChecked(existing => ({ ...existing, [id]: new Date().toISOString() }));
   const stopCamera = () => {
     cameraStream.current?.getTracks().forEach((track) => track.stop());
     cameraStream.current = null;
     delete (window as any).__examguardCameraStream;
     if (videoRef.current) videoRef.current.srcObject = null;
     setCamera("Not checked");
+    markChecked("camera");
   };
   const stopMicrophone = () => {
     if (meterFrame.current) cancelAnimationFrame(meterFrame.current);
@@ -697,100 +720,147 @@ function ReadinessChecks({ onStart, error, fullscreenRequired }: { onStart: () =
     microphoneStream.current = null;
     setLevel(0);
     setMicrophone("Not checked");
+    markChecked("microphone");
   };
   const stopScreen = () => {
     screenStream.current?.getTracks().forEach((track) => track.stop());
     screenStream.current = null;
     setScreen("Not enabled");
+    markChecked("screen_sharing");
   };
-  useEffect(() => () => { stopMicrophone(); stopScreen(); }, []);
-  useEffect(() => { const update = () => setFullscreen(Boolean(document.fullscreenElement)); document.addEventListener("fullscreenchange", update); return () => document.removeEventListener("fullscreenchange", update); }, []);
+  useEffect(() => () => {
+    cameraStream.current?.getTracks().forEach(track => track.stop());
+    microphoneStream.current?.getTracks().forEach(track => track.stop());
+    screenStream.current?.getTracks().forEach(track => track.stop());
+    audioContext.current?.close().catch(() => undefined);
+  }, []);
+  useEffect(() => {
+    const online = () => setOnline(true);
+    const offline = () => setOnline(false);
+    window.addEventListener("online", online);
+    window.addEventListener("offline", offline);
+    return () => { window.removeEventListener("online", online); window.removeEventListener("offline", offline); };
+  }, []);
   useEffect(() => {
     let active = true;
     const checkServices = async () => {
+      const companion = await checkCompanionBridge();
+      if (!active) return;
+      setCompanionReady(companion.status === "ready");
+      setCompanionStatus(companion.explanation);
+      markChecked(companion.id);
       try {
-        const response = await fetch("http://127.0.0.1:43117/health", { cache: "no-store", signal: AbortSignal.timeout(1500) });
-        const health = await response.json();
+        const response = await api.get(`/api/student/organizations/${organizationId}/exams/${examId}/readiness`, { timeout: 7000 });
         if (!active) return;
-        const ready = response.ok && health.status === "ready";
-        setCompanionReady(ready);
-        setCompanionStatus(ready ? "Connected locally and ready" : "Companion is running but not ready");
-      } catch {
-        if (!active) return;
-        setCompanionReady(false);
-        setCompanionStatus("Not running — open ExamGuard Device Monitor");
-      }
-      try {
-        const response = await api.get("/api/student/monitoring-readiness", { timeout: 3500 });
-        if (!active) return;
-        setAiReady(response.data?.ready === true);
-        setAiStatus(response.data?.ready ? "Connected — all required AI models are ready" : (response.data?.error ?? "The AI service is running, but its models are unavailable."));
-        const storageReady = response.data?.evidenceStorageReady === true;
+        const checks = Array.isArray(response.data?.checks) ? response.data.checks as ReadinessCheck[] : [];
+        setServerChecks(checks);
+        const aiCheck = checks.find(check => check.id === "ai_service");
+        setAiReady(aiCheck?.status === "ready");
+        setAiStatus(aiCheck?.explanation ?? "The server did not return an AI readiness result.");
+        const storageCheck = checks.find(check => check.id === "evidence_storage");
+        const storageReady = storageCheck?.status === "ready";
         setEvidenceStorageReady(storageReady);
-        setEvidenceStorageStatus(storageReady
-          ? "Ready — captured images can be stored privately"
-          : "Not configured — set LOCAL_EVIDENCE_DIR for local development or S3-compatible storage on the server");
+        setEvidenceStorageStatus(storageCheck?.explanation ?? "The server did not return an evidence storage readiness result.");
+        for (const check of checks) markChecked(check.id);
       } catch (serviceError) {
         if (!active) return;
+        const checks = axios.isAxiosError(serviceError) && Array.isArray(serviceError.response?.data?.checks)
+          ? serviceError.response.data.checks as ReadinessCheck[]
+          : [];
+        setServerChecks(checks);
+        const aiCheck = checks.find(check => check.id === "ai_service");
+        const storageCheck = checks.find(check => check.id === "evidence_storage");
         setAiReady(false);
-        setAiStatus(axios.isAxiosError(serviceError) ? (serviceError.response?.data?.error ?? "The AI proctoring service is starting or unavailable. Contact your organizer if this continues.") : "The AI proctoring service is starting or unavailable. Contact your organizer if this continues.");
-        const storageReady = axios.isAxiosError(serviceError) && serviceError.response?.data?.evidenceStorageReady === true;
-        setEvidenceStorageReady(storageReady);
-        setEvidenceStorageStatus(storageReady
-          ? "Ready — captured images can be stored privately"
-          : "Could not verify — start the server and configure private evidence storage");
+        setAiStatus(aiCheck?.explanation ?? (axios.isAxiosError(serviceError) ? serviceError.response?.data?.error : undefined) ?? "The server-side readiness check is unavailable.");
+        setEvidenceStorageReady(false);
+        setEvidenceStorageStatus(storageCheck?.explanation ?? "The server could not verify private evidence storage.");
+        for (const check of checks) markChecked(check.id);
       }
     };
     void checkServices();
-    const interval = window.setInterval(() => void checkServices(), 4000);
+    const interval = window.setInterval(() => void checkServices(), 10_000);
     return () => { active = false; window.clearInterval(interval); };
-  }, []);
+  }, [organizationId, examId, refreshKey]);
   const checkCamera = async () => {
-    if (!supported) return setCamera("Camera unavailable: this browser does not support device access.");
     stopCamera();
-    setCamera("Permission required");
+    setCamera("Checking camera access…");
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      const stream = await requestCameraStream(navigator.mediaDevices ?? null);
       cameraStream.current = stream;
       (window as any).__examguardCameraStream = stream;
       if (videoRef.current) videoRef.current.srcObject = stream;
       setCamera("Camera ready");
+      stream.getVideoTracks().forEach(track => {
+        track.addEventListener("ended", () => {
+          setCamera("Camera disconnected — reconnect the camera and retry.");
+          markChecked("camera");
+        }, { once: true });
+        track.addEventListener("mute", () => {
+          setCamera("Camera track is paused — reconnect it and retry.");
+          markChecked("camera");
+        }, { once: true });
+        track.addEventListener("unmute", () => {
+          setCamera(cameraStreamIsActive(stream) ? "Camera ready" : "Camera is not active — reconnect it and retry.");
+          markChecked("camera");
+        }, { once: true });
+      });
     } catch (e) {
-      setCamera(e instanceof DOMException && e.name === "NotAllowedError" ? "Permission denied — allow camera access in your browser settings, then try again." : "Camera unavailable — check that no other application is using it.");
+      setCamera(e instanceof Error ? e.message : "Camera access could not be verified.");
+    } finally {
+      markChecked("camera");
     }
   };
   const enableScreen = async () => {
-    if (!navigator.mediaDevices?.getDisplayMedia) return setScreen("Screen sharing is not supported by this browser.");
     stopScreen();
+    setScreen("Requesting display permission…");
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { displaySurface: "monitor" },
-        audio: false,
-        selfBrowserSurface: "exclude",
-        surfaceSwitching: "exclude",
-        monitorTypeSurfaces: "include",
-      });
+      const stream = await requestFullDisplayStream(navigator.mediaDevices ?? null);
       const track = stream.getVideoTracks()[0];
-      if (!track || track.getSettings().displaySurface !== "monitor") {
-        stream.getTracks().forEach((item) => item.stop());
-        setScreen("Choose Entire screen / Monitor in the browser picker. Window or tab sharing is not accepted.");
-        return;
-      }
       screenStream.current = stream;
       (window as any).__examguardScreenStream = stream;
-      track.addEventListener("ended", () => { screenStream.current = null; delete (window as any).__examguardScreenStream; setScreen("Full-display sharing stopped — enable it again before starting."); });
+      track.addEventListener("ended", () => {
+        screenStream.current = null;
+        delete (window as any).__examguardScreenStream;
+        setScreen("Full-display sharing stopped — enable it again before starting.");
+        markChecked("screen_sharing");
+      }, { once: true });
+      track.addEventListener("mute", () => {
+        setScreen("Full-display sharing is paused — enable it again before starting.");
+        markChecked("screen_sharing");
+      }, { once: true });
+      track.addEventListener("unmute", () => {
+        setScreen(fullDisplayStreamIsActive(stream)
+          ? "Full display selected — periodic still capture ready"
+          : "The shared surface is no longer the full display — select Entire screen / Monitor again.");
+        markChecked("screen_sharing");
+      }, { once: true });
       setScreen("Full display selected — periodic still capture ready");
     } catch (e) {
-      setScreen(e instanceof DOMException && e.name === "NotAllowedError" ? "Screen sharing was not allowed." : "Screen sharing could not start.");
+      setScreen(e instanceof Error ? e.message : "Screen sharing could not be verified.");
+    } finally {
+      markChecked("screen_sharing");
     }
   };
   const checkMicrophone = async () => {
-    if (!supported) return setMicrophone("Microphone unavailable: this browser does not support device access.");
     stopMicrophone();
-    setMicrophone("Permission required");
+    setMicrophone("Checking microphone access…");
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const stream = await requestMicrophoneStream(navigator.mediaDevices ?? null);
       microphoneStream.current = stream;
+      stream.getAudioTracks().forEach(track => {
+        track.addEventListener("ended", () => {
+          setMicrophone("Microphone disconnected — reconnect it and retry.");
+          markChecked("microphone");
+        }, { once: true });
+        track.addEventListener("mute", () => {
+          setMicrophone("Microphone track is paused — reconnect it and retry.");
+          markChecked("microphone");
+        }, { once: true });
+        track.addEventListener("unmute", () => {
+          setMicrophone(microphoneStreamIsActive(stream) ? "Microphone ready — audio is not recorded or sent." : "Microphone is not active — reconnect it and retry.");
+          markChecked("microphone");
+        }, { once: true });
+      });
       const context = new AudioContext();
       const analyser = context.createAnalyser();
       analyser.fftSize = 256;
@@ -806,30 +876,131 @@ function ReadinessChecks({ onStart, error, fullscreenRequired }: { onStart: () =
       updateLevel();
       setMicrophone("Microphone ready — audio is not recorded or sent.");
     } catch (e) {
-      setMicrophone(e instanceof DOMException && e.name === "NotAllowedError" ? "Permission denied — allow microphone access in your browser settings, then try again." : "Microphone unavailable — check your device and browser settings.");
+      setMicrophone(e instanceof Error ? e.message : "Microphone access could not be verified.");
+    } finally {
+      markChecked("microphone");
     }
   };
-  return <div className="card max-w-2xl">
-    <h2 className="text-xl font-semibold">Exam readiness check</h2>
-    <p className="mt-2 text-sm text-slate-500">Camera and microphone permission must be granted before starting. The browser always asks for your consent; this readiness check does not record or upload media.</p>
-    <ol className="mt-4 list-decimal space-y-1 rounded-xl border border-blue-100 bg-blue-50/50 p-4 pl-9 text-sm leading-6 text-slate-700">
-      <li>Use a supported Windows computer and install the Companion provided by your institution before exam day.</li>
-      <li>Open the Companion and leave it running. Select <b>Open Windows Companion</b> if prompted by your browser.</li>
-      <li>Allow camera and microphone access, then choose <b>Entire screen</b> or <b>Monitor</b> when asked to share your screen.</li>
-      <li>Read and accept the monitoring notice. Start only when every required check below says it is ready.</li>
-    </ol>
-    <p className="mt-2 text-xs leading-5 text-slate-500">Fullscreen is {fullscreenRequired ? "required" : "not required"} for this exam. Websites cannot lock Windows or stop app switching; your institution must provide a managed kiosk computer for that level of lockdown.</p>
-    <div className="mt-5 grid gap-3 sm:grid-cols-2">
-      <section className="rounded-xl border border-slate-200 p-4"><b>Camera</b><p className="mt-1 text-sm text-slate-500">{camera}</p><video ref={videoRef} autoPlay muted playsInline className="mt-3 aspect-video w-full rounded-lg bg-slate-100 object-cover" aria-label="Camera preview" /> <div className="mt-3 flex gap-2"><button type="button" onClick={checkCamera} className="button">Check camera</button><button type="button" onClick={stopCamera} className="text-sm font-semibold text-slate-700">Stop camera</button></div></section>
-      <section className="rounded-xl border border-slate-200 p-4"><b>Microphone</b><p className="mt-1 text-sm text-slate-500">{microphone}</p><div className="mt-4 h-3 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-teal-600 transition-[width]" style={{ width: `${level}%` }} /></div><div className="mt-5 flex gap-2"><button type="button" onClick={checkMicrophone} className="button">Check microphone</button><button type="button" onClick={stopMicrophone} className="text-sm font-semibold text-slate-700">Stop test</button></div></section>
+  const localCheck = (id: string, value: string, readyText: string, remediation: string): ReadinessCheck => {
+    const ready = value.startsWith(readyText);
+    const pending = value === "Not checked" || value.startsWith("Checking") || value.startsWith("Requesting");
+    return createReadinessCheck(
+      id,
+      ready ? "ready" : pending ? "pending" : value.includes("unavailable") ? "unavailable" : "failed",
+      value,
+      ready ? "No action needed." : remediation,
+      lastChecked[id] ? new Date(lastChecked[id]) : new Date(),
+    );
+  };
+  const serverCheck = (id: string, fallback: ReadinessCheck) => serverChecks.find(check => check.id === id) ?? fallback;
+  const companionCheck = createReadinessCheck(
+    "windows_companion",
+    companionReady ? "ready" : "unavailable",
+    companionStatus,
+    companionReady ? "No action needed." : "Install and register the Windows Companion from your institution's trusted installer, then open it and retry.",
+    lastChecked.windows_companion ? new Date(lastChecked.windows_companion) : new Date(),
+  );
+  const checks: ReadinessCheck[] = [
+    serverCheck("exam_assignment", createReadinessCheck("exam_assignment", "pending", "Checking your assignment.", "Retry the server check.")),
+    serverCheck("exam_window", createReadinessCheck("exam_window", "pending", "Checking the examination window.", "Retry the server check.")),
+    browserCheck,
+    localCheck("camera", camera, "Camera ready", "Allow camera access and connect a working camera, then retry."),
+    localCheck("microphone", microphone, "Microphone ready", "Allow microphone access and connect a working microphone, then retry."),
+    createReadinessCheck(
+      "screen_sharing",
+      fullDisplayStreamIsActive(screenStream.current) ? "ready" : screen === "Not enabled" ? "pending" : screen.includes("unavailable") ? "unavailable" : "failed",
+      fullDisplayStreamIsActive(screenStream.current) ? "Full display is actively shared." : screen,
+      "Start sharing again and select Entire screen / Monitor. Keep the browser's sharing indicator active.",
+      lastChecked.screen_sharing ? new Date(lastChecked.screen_sharing) : new Date(),
+    ),
+    companionCheck,
+    serverCheck("ai_service", createReadinessCheck("ai_service", "pending", aiStatus, "Retry the authenticated AI service check.")),
+    serverCheck("evidence_storage", createReadinessCheck("evidence_storage", "pending", evidenceStorageStatus, "Retry the private storage check.")),
+    createReadinessCheck("network", online ? "ready" : "failed", online ? "The browser reports an active network connection." : "The browser is offline.", "Reconnect to the internet before starting."),
+    createReadinessCheck("instructions", acknowledged ? "ready" : "pending", acknowledged ? "Examination instructions acknowledged." : "Read and acknowledge the examination instructions.", "Review the exam instructions and select the acknowledgement."),
+    createReadinessCheck("practice", practiceCompleted ? "ready" : "pending", practiceCompleted ? "Practice readiness exercise acknowledged." : "Complete the short practice readiness exercise.", "Complete the practice check before starting."),
+    createReadinessCheck("monitoring_consent", monitoringConsent ? "ready" : "pending", monitoringConsent ? "Monitoring consent recorded for this browser session." : "Explicit consent is required before starting.", "Read the monitoring notice and consent only if you agree."),
+  ];
+  const mandatoryChecks = checks.filter(check => check.mandatory);
+  const readyCount = mandatoryChecks.filter(check => check.status === "ready").length;
+  const readinessPercent = Math.round(readyCount / mandatoryChecks.length * 100);
+  const allReady = readyCount === mandatoryChecks.length;
+  const checkTone = (status: ReadinessCheck["status"]) => status === "ready"
+    ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+    : status === "pending"
+      ? "border-amber-200 bg-amber-50 text-amber-950"
+      : status === "failed"
+        ? "border-red-200 bg-red-50 text-red-900"
+        : "border-slate-200 bg-slate-50 text-slate-600";
+  const checkLabel = (status: ReadinessCheck["status"]) => status === "ready" ? "Ready" : status === "pending" ? "Pending" : status === "failed" ? "Failed" : "Unavailable";
+  const checkName: Record<string, string> = {
+    exam_assignment: "Exam assignment",
+    exam_window: "Exam availability",
+    browser: "Browser compatibility",
+    camera: "Camera",
+    microphone: "Microphone",
+    screen_sharing: "Full-display sharing",
+    windows_companion: "Windows Companion",
+    ai_service: "AI proctoring",
+    evidence_storage: "Private evidence storage",
+    network: "Network connection",
+    instructions: "Exam instructions",
+    practice: "Practice check",
+    monitoring_consent: "Monitoring consent",
+  };
+  const checkButton = (id: string) => id === "camera" ? <div className="mt-3 flex gap-3"><button type="button" onClick={() => void checkCamera()} className="text-sm font-semibold text-blue-700 underline">Check camera</button><button type="button" onClick={stopCamera} className="text-sm text-slate-600 underline">Stop preview</button></div>
+    : id === "microphone" ? <div className="mt-3 flex gap-3"><button type="button" onClick={() => void checkMicrophone()} className="text-sm font-semibold text-blue-700 underline">Check microphone</button><button type="button" onClick={stopMicrophone} className="text-sm text-slate-600 underline">Stop test</button></div>
+      : id === "screen_sharing" ? <button type="button" onClick={() => void enableScreen()} className="mt-3 text-sm font-semibold text-blue-700 underline">Share / retry display</button>
+        : id === "windows_companion" ? <a className="mt-3 inline-flex text-sm font-semibold text-blue-700 underline" href="examguard-companion://start" target="_blank" rel="noreferrer">Open Windows Companion</a>
+          : id === "ai_service" || id === "evidence_storage" || id === "exam_assignment" || id === "exam_window" ? <button type="button" onClick={() => setRefreshKey(value => value + 1)} className="mt-3 text-sm font-semibold text-blue-700 underline">Retry server checks</button>
+            : null;
+  return <div className="card w-full max-w-5xl">
+    <div className="flex flex-wrap items-start justify-between gap-4">
+      <div><p className="text-xs font-semibold uppercase tracking-[.18em] text-blue-700">Before you begin</p><h2 className="mt-2 text-2xl font-semibold">Examination readiness</h2><p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">Each status reflects a browser permission check, a live device test, or a server-verified service. A green check is not inferred from configuration alone.</p></div>
+      <div className="min-w-40 rounded-xl border border-slate-200 bg-white px-4 py-3 text-right"><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Overall readiness</p><p className="mt-1 text-2xl font-bold text-slate-900">{readinessPercent}%</p><p className="text-xs text-slate-500">{readyCount} of {mandatoryChecks.length} required checks</p></div>
     </div>
-    <dl className="mt-5 grid gap-2 rounded-xl bg-slate-50 p-4 text-sm sm:grid-cols-2"><div><dt className="text-slate-500">Browser</dt><dd>{supported ? "Compatible" : "Limited device support"}</dd></div><div><dt className="text-slate-500">Network</dt><dd>{online ? "Connected" : "Offline — reconnect before starting"}</dd></div><div><dt className="text-slate-500">Instructions</dt><dd>{acknowledged ? "Acknowledged" : "Awaiting acknowledgement"}</dd></div><div><dt className="text-slate-500">Full-display sharing</dt><dd className={screen.startsWith("Full display selected") ? "text-emerald-700" : "text-red-700"}>{screen}</dd></div><div className="sm:col-span-2"><dt className="text-slate-500">Windows Companion — required</dt><dd className={companionReady ? "text-emerald-700" : "text-red-700"}>{companionStatus}</dd>{!companionReady && <p className="mt-2 text-xs leading-5 text-slate-500">If installed, open the Companion now. It starts automatically at Windows sign-in after one-time registration. The app shows scanner status and has a stop button. Browser security may ask you to confirm launching it.</p>}<a className="mt-2 inline-flex text-sm font-semibold text-blue-700 underline" href="examguard-companion://start" target="_blank" rel="noreferrer">Open Windows Companion</a></div><div className="sm:col-span-2"><dt className="text-slate-500">AI proctoring — required</dt><dd className={aiReady ? "text-emerald-700" : "text-red-700"}>{aiStatus}</dd><p className="mt-1 text-xs text-slate-500">The service runs on the institution's host and is checked automatically. Students do not install the AI service.</p></div><div className="sm:col-span-2"><dt className="text-slate-500">Private evidence storage — required for incident images</dt><dd className={evidenceStorageReady ? "text-emerald-700" : "text-red-700"}>{evidenceStorageStatus}</dd></div></dl>
-    <button type="button" onClick={() => void enableScreen()} className="button mt-4">Share entire display</button>
-    <label className="mt-5 flex gap-2 text-sm"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /> I have read the instructions and understand the examination rules.</label>
-    <label className="mt-4 flex items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm leading-6"><input type="checkbox" className="mt-1" checked={practiceCompleted} onChange={(event) => setPracticeCompleted(event.target.checked)} /><span><b>Practice check complete.</b> I have used the answer controls, checked my camera and microphone, and understand how to submit. This short readiness exercise does not submit exam answers.</span></label>
-    <label className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-950"><input type="checkbox" className="mt-1" checked={monitoringConsent} onChange={(event) => setMonitoringConsent(event.target.checked)} /><span><b>Required monitoring consent.</b> I consent to camera-frame AI analysis, full-display still images at up to 15-second intervals while the exam tab is visible, and camera snapshots when tab/window changes or AI review signals are recorded. This is not continuous video and background browser behavior may affect capture timing. I also consent to Bluetooth and Wi-Fi access-point observations by the required Windows Companion. The browser will show its screen-sharing indicator; I can stop sharing, but monitoring will be interrupted. Images are stored in private evidence storage for authorized review. This prototype does not automatically purge evidence; my institution must publish and apply its retention schedule. Automated signals are review aids, not proof of misconduct. Audio is not recorded or uploaded. ExamGuard locks the active attempt to one ExamGuard exam tab in this browser profile and records tab/window changes, but a normal browser cannot close unrelated tabs or prevent switching apps. Use a managed kiosk browser/device if those restrictions are required.</span></label>
-    {error && <p role="alert" className="mt-4 text-sm text-red-600">{error}</p>}
-    <button onClick={async () => { if (fullscreenRequired) { try { await document.documentElement.requestFullscreen?.(); } catch {} if (!document.fullscreenElement) { setError("Fullscreen could not be enabled. Use a supported browser and allow fullscreen before starting."); return; } } onStart(); }} disabled={!acknowledged || !practiceCompleted || !monitoringConsent || !online || !companionReady || !aiReady || !evidenceStorageReady || camera !== "Camera ready" || !microphone.startsWith("Microphone ready") || screen !== "Full display selected — periodic still capture ready"} className="button mt-6 disabled:cursor-not-allowed disabled:opacity-50">Start secure exam</button>
+    <div className="mt-5 h-2 overflow-hidden rounded-full bg-slate-100" role="progressbar" aria-label="Mandatory readiness checks" aria-valuenow={readinessPercent} aria-valuemin={0} aria-valuemax={100}><div className="h-full rounded-full bg-emerald-600 transition-all" style={{ width: `${readinessPercent}%` }} /></div>
+    <ol className="mt-5 grid gap-2 rounded-xl border border-blue-100 bg-blue-50/60 p-4 text-sm leading-6 text-slate-700 sm:grid-cols-2">
+      <li>Use a current browser on the secure ExamGuard website and a supported Windows computer.</li>
+      <li>Allow camera and microphone access, then select <b>Entire screen</b> or <b>Monitor</b> when sharing.</li>
+      <li>Install and open the institution-provided Companion; keep its window running through submission.</li>
+      <li>Review the notice and explicitly consent only if you agree. Fullscreen is {fullscreenRequired ? "required" : "not required"}.</li>
+    </ol>
+    <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+      {checks.map(check => <section key={check.id} className={`rounded-xl border p-4 ${checkTone(check.status)}`} aria-label={`${checkName[check.id]}: ${checkLabel(check.status)}`}>
+        <div className="flex items-start justify-between gap-3"><h3 className="font-semibold">{checkName[check.id]}</h3><span className="rounded-full bg-white/80 px-2 py-1 text-xs font-semibold">{checkLabel(check.status)}</span></div>
+        <p className="mt-2 text-sm leading-5">{check.explanation}</p>
+        {check.status !== "ready" && <p className="mt-2 text-xs leading-5 opacity-80">{check.remediation}</p>}
+        <p className="mt-3 text-[11px] opacity-70">Required · Checked {new Date(check.lastCheckedAt).toLocaleTimeString()}</p>
+        {check.id === "camera" && <video ref={videoRef} autoPlay muted playsInline className="mt-3 aspect-video w-full rounded-lg bg-slate-200 object-cover" aria-label="Live camera preview" />}
+        {check.id === "microphone" && <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/80"><div className="h-full bg-emerald-600 transition-[width]" style={{ width: `${level}%` }} /></div>}
+        {checkButton(check.id)}
+      </section>)}
+    </div>
+    <label className="mt-5 flex gap-3 rounded-xl border border-slate-200 bg-white p-4 text-sm leading-6"><input type="checkbox" checked={acknowledged} onChange={event => { setAcknowledged(event.target.checked); markChecked("instructions"); }} /><span><b>Instructions reviewed.</b> I understand the examination rules and how to submit.</span></label>
+    <fieldset className="mt-3 rounded-xl border border-slate-200 bg-white p-4 text-sm leading-6">
+      <legend className="px-1 font-semibold">Practice answer check</legend>
+      <p>To verify the answer controls, select <b>Blue</b> for this practice question. This does not submit exam answers.</p>
+      <div className="mt-2 flex flex-wrap gap-4">
+        {["Blue", "Green", "Red"].map(option => <label key={option} className="flex items-center gap-2"><input type="radio" name="readiness-practice-answer" value={option.toLowerCase()} checked={practiceAnswer === option.toLowerCase()} onChange={event => { setPracticeAnswer(event.target.value); markChecked("practice"); }} />{option}</label>)}
+      </div>
+      <p role="status" className="mt-2 text-xs text-slate-600">{practiceCompleted ? "Practice interaction completed." : "Select the requested answer to complete this check."}</p>
+    </fieldset>
+    <label className="mt-3 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-950"><input type="checkbox" className="mt-1" checked={monitoringConsent} onChange={event => { setMonitoringConsent(event.target.checked); markChecked("monitoring_consent"); }} /><span><b>Monitoring consent required.</b> I consent to periodic camera-frame AI analysis, full-display still images, and Bluetooth/Wi-Fi access-point observations from the Windows Companion. This is not continuous video. Images are private and reviewed by authorized people; automated signals are not proof of misconduct. Audio is not recorded or uploaded. I can stop sharing or withdraw consent, but monitoring will be interrupted. My institution must publish and apply an evidence-retention schedule. A normal browser cannot prevent switching to other applications.</span></label>
+    <p className="mt-3 text-xs leading-5 text-slate-500">Browser camera, microphone, and screen capture are user-controlled. The server independently rechecks examination eligibility, authenticated AI availability, and private storage before creating an attempt; it does not trust browser claims about local hardware.</p>
+    {(error || startError) && <p role="alert" className="mt-4 text-sm text-red-700">{startError || error}</p>}
+    <button type="button" onClick={async () => {
+      setStartError("");
+      if (!cameraStreamIsActive(cameraStream.current)) { setCamera("Camera is not active. Reconnect and retry before starting."); markChecked("camera"); return; }
+      if (!microphoneStreamIsActive(microphoneStream.current)) { setMicrophone("Microphone is not active. Reconnect and retry before starting."); markChecked("microphone"); return; }
+      if (!fullDisplayStreamIsActive(screenStream.current)) { setScreen("Full-display sharing is not active. Enable it again before starting."); markChecked("screen_sharing"); return; }
+      if (fullscreenRequired) {
+        try { await document.documentElement.requestFullscreen(); }
+        catch { setStartError("Fullscreen could not be enabled. Use a supported browser and allow fullscreen before starting."); return; }
+        if (!document.fullscreenElement) { setStartError("Fullscreen could not be enabled. Use a supported browser and allow fullscreen before starting."); return; }
+      }
+      onStart();
+    }} disabled={!allReady || !cameraStreamIsActive(cameraStream.current) || !microphoneStreamIsActive(microphoneStream.current) || !fullDisplayStreamIsActive(screenStream.current)} className="button mt-6 disabled:cursor-not-allowed disabled:opacity-50">Start secure exam</button>
   </div>;
 }
 function FullscreenLock({ onRestore }: { onRestore: () => void }) {
@@ -997,6 +1168,7 @@ function StudentExam({ session }: { session: Session }) {
   };
   const captureScreenBlob = async () => {
     const stream = (window as any).__examguardScreenStream as MediaStream | undefined;
+    if (!fullDisplayStreamIsActive(stream)) return null;
     return captureStreamFrame(stream, 1600, 0.65);
   };
   const captureEvidence = async () => {
@@ -1320,9 +1492,36 @@ function StudentExam({ session }: { session: Session }) {
     setError("");
     sync.current?.set(questionId, value, { immediate: typeof value !== "string" });
   };
+  const resumeScreenSharing = async () => {
+    try {
+      const stream = await requestFullDisplayStream(navigator.mediaDevices ?? null);
+      const track = stream.getVideoTracks()[0];
+      (window as any).__examguardScreenStream = stream;
+      track.addEventListener("ended", () => {
+        setAttentionWarning("Full-display sharing stopped. Screen evidence is no longer being captured; tell your exam organizer if this was accidental.");
+        void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+          examId: payload.attempt.examId,
+          candidateId: payload.attempt.candidateId,
+          attemptId: payload.attempt.id,
+          type: "screen_sharing_stopped",
+          occurredAt: new Date().toISOString(),
+          source: "browser",
+          details: { clientWarning: true, displaySurface: "monitor" },
+        }).catch(() => undefined);
+      }, { once: true });
+      setAttentionWarning("Full-display sharing is active again.");
+    } catch (resumeError) {
+      setAttentionWarning(resumeError instanceof Error ? resumeError.message : "Full-display sharing could not be restarted.");
+    }
+  };
   const submitter = useRef<ReturnType<typeof createSubmitter> | null>(null);
   const submit = async (automatic = false) => {
     if (!payload || singleWindowBlocked) return;
+    const activeScreen = fullDisplayStreamIsActive((window as any).__examguardScreenStream as MediaStream | undefined);
+    if (!activeScreen) {
+      setAttentionWarning("Full-display sharing is not active. Resume sharing before you submit.");
+      if (!automatic) return;
+    }
     submitter.current ??= createSubmitter({
       flush: async () => (await sync.current?.flush()) ?? true,
       post: async () => {
@@ -1548,7 +1747,7 @@ function StudentExam({ session }: { session: Session }) {
     const hasCodingQuestions = Boolean(payload?.questions?.some((item: any) => item.type === "coding"));
     if (payload && left === 0 && !hasCodingQuestions) void submit(true);
   }, [left, payload]);
-  if (!payload) return <ReadinessChecks onStart={start} error={error} fullscreenRequired={fullscreenRequired} />;
+  if (!payload) return <ReadinessChecks onStart={start} error={error} fullscreenRequired={fullscreenRequired} organizationId={session.organization.id} examId={examId} />;
   if (receipt)
     return (
       <div className="card max-w-xl text-center py-14">
@@ -1634,7 +1833,7 @@ function StudentExam({ session }: { session: Session }) {
         <div className="flex flex-wrap items-center gap-4"><span className="text-xs font-semibold text-slate-600">{pairingLoading ? "Connecting Companion…" : "Companion required"}</span><CompanionStatus attemptId={payload.attempt.id} /><span className="text-xs font-semibold text-emerald-700">One active ExamGuard exam enforced</span><span className="max-w-48 text-right text-xs text-slate-500">{aiStatus}</span><div className="flex flex-col items-end gap-1"><ExamTimer ms={left} /><SyncIndicator online={online} sync={syncSnap} /></div></div>
       </div>
       {error && !reviewing && <p role="alert" className="mb-3 text-sm text-red-600">{error}</p>}
-      {attentionWarning && <div role="alert" className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"><span><b>Attention required.</b> {attentionWarning}</span><div className="flex items-center gap-3">{!document.fullscreenElement && <button type="button" onClick={() => { void document.documentElement.requestFullscreen?.().catch(() => setAttentionWarning("Fullscreen could not be restored. Continue only after your organizer helps resolve the browser issue.")); }} className="font-semibold underline">Return to fullscreen</button>}<button type="button" onClick={() => setAttentionWarning("")} className="font-semibold">Dismiss</button></div></div>}
+      {attentionWarning && <div role="alert" className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"><span><b>Attention required.</b> {attentionWarning}</span><div className="flex items-center gap-3">{!fullDisplayStreamIsActive((window as any).__examguardScreenStream as MediaStream | undefined) && <button type="button" onClick={() => void resumeScreenSharing()} className="font-semibold underline">Resume full-display sharing</button>}{!document.fullscreenElement && <button type="button" onClick={() => { void document.documentElement.requestFullscreen?.().catch(() => setAttentionWarning("Fullscreen could not be restored. Continue only after your organizer helps resolve the browser issue.")); }} className="font-semibold underline">Return to fullscreen</button>}<button type="button" onClick={() => setAttentionWarning("")} className="font-semibold">Dismiss</button></div></div>}
       <div className="grid gap-5 lg:grid-cols-[1fr_250px]">
         <section className="card">
           <div className="flex items-center justify-between gap-3"><p className="font-medium">Question {current + 1} of {payload.questions.length}</p><button type="button" onClick={() => setMarked((items) => ({ ...items, [question.id]: !items[question.id] }))} aria-pressed={Boolean(marked[question.id])} className="text-sm font-semibold text-blue-700">{marked[question.id] ? "Remove review mark" : "Mark for review"}</button></div>
