@@ -21,6 +21,11 @@ interface SupabaseStorageConfig {
   serviceRoleKey: string;
 }
 
+interface StorageResponseDiagnostics {
+  responseStatus?: number;
+  requestId?: string;
+}
+
 export interface StorageConfigurationSummary {
   projectHost: string;
   bucket: string;
@@ -42,8 +47,11 @@ function getSupabaseStorageConfig(env: Record<string, string | undefined> = proc
   if (url.protocol !== 'https:' && !localHttp) {
     throw new Error('SUPABASE_URL must use HTTPS except for a local development endpoint.');
   }
+  if (/(?:^|\.)storage\.supabase\.(?:co|in|red)$/i.test(url.hostname)) {
+    throw new Error('SUPABASE_URL must be the project base URL, not a Supabase Storage S3 endpoint.');
+  }
   if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
-    throw new Error('SUPABASE_URL must be a project URL without credentials, a path, query parameters, or a fragment.');
+    throw new Error('SUPABASE_URL must be the project base URL without credentials, /rest/v1, Storage API paths, query parameters, or a fragment.');
   }
 
   return {
@@ -54,13 +62,21 @@ function getSupabaseStorageConfig(env: Record<string, string | undefined> = proc
   };
 }
 
-function createSupabaseStorageClient(config: SupabaseStorageConfig): SupabaseClient {
+function createSupabaseStorageClient(config: SupabaseStorageConfig, diagnostics: StorageResponseDiagnostics): SupabaseClient {
+  const fetchWithDiagnostics: typeof fetch = async (input, init) => {
+    const response = await fetch(input, init);
+    diagnostics.responseStatus = response.status;
+    diagnostics.requestId = safeRequestId(response.headers.get('sb-request-id'), [config.serviceRoleKey]) ??
+      safeRequestId(response.headers.get('x-request-id'), [config.serviceRoleKey]);
+    return response;
+  };
   return createClient(config.url, config.serviceRoleKey, {
     auth: {
       autoRefreshToken: false,
       persistSession: false,
       detectSessionInUrl: false,
     },
+    global: { fetch: fetchWithDiagnostics },
   });
 }
 
@@ -83,31 +99,148 @@ function isNotFound(error: unknown): boolean {
     failure.$metadata?.httpStatusCode === 404;
 }
 
-function logStorageFailure(operation: string, error: unknown) {
-  if (isNotFound(error)) return;
-  const failure = error && typeof error === 'object'
-    ? error as { name?: unknown; code?: unknown; error?: unknown; status?: unknown; statusCode?: unknown }
-    : {};
-  const name = typeof failure.name === 'string' ? failure.name.slice(0, 80) : 'UnknownError';
-  const codeValue = failure.error ?? failure.code;
-  const code = typeof codeValue === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(codeValue) ? codeValue : undefined;
-  const statusValue = failure.statusCode ?? failure.status;
-  const statusCode = typeof statusValue === 'number' ? statusValue : typeof statusValue === 'string' && /^\d{3}$/.test(statusValue) ? Number(statusValue) : undefined;
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function safeRequestId(value: unknown, secrets: string[] = []): string | undefined {
+  return typeof value === 'string' &&
+    !secrets.some(secret => secret.length >= 4 && value.includes(secret)) &&
+    /^[A-Za-z0-9._:-]{1,128}$/.test(value)
+    ? value
+    : undefined;
+}
+
+function safeErrorCode(value: unknown, secrets: string[] = []): string | undefined {
+  const text = safeDiagnosticText(value, secrets);
+  return typeof text === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(text) ? text : undefined;
+}
+
+function httpStatus(value: unknown): number | undefined {
+  const status = typeof value === 'number' ? value :
+    typeof value === 'string' && /^\d{3}$/.test(value) ? Number(value) : undefined;
+  return status !== undefined && status >= 100 && status <= 599 ? status : undefined;
+}
+
+function safeDiagnosticText(value: unknown, secrets: string[] = []): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  let text = value.slice(0, 2048);
+  for (const secret of secrets) {
+    if (secret.length >= 4) text = text.split(secret).join('[redacted]');
+  }
+  text = text
+    .replace(/data:image\/[^;,\s]+;base64,[A-Za-z0-9+/=_-]+/gi, '[redacted-image-data]')
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted-url]')
+    .replace(/\b(?:authorization|proxy-authorization|api[_ -]?key|apikey|service[_ -]?role(?:[_ -]?key)?|secret|password|token|cookie|credential)\b\s*[:=]\s*["']?[^,;\s"']+/gi, '[redacted]')
+    .replace(/\bBearer\s+[^\s,;]+/gi, '[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[redacted-token]')
+    .replace(/\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{8,}\b/gi, '[redacted-key]')
+    .replace(/\b[A-Za-z0-9+/_-]{80,}={0,2}\b/g, '[redacted-data]')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .trim();
+  return text ? text.slice(0, 400) : undefined;
+}
+
+function diagnosticError(error: unknown, secrets: string[], depth = 0, seen = new Set<object>()): unknown {
+  if (typeof error === 'string') return safeDiagnosticText(error, secrets);
+  const failure = asRecord(error);
+  if (!failure) return undefined;
+  if (seen.has(failure)) return { name: 'CircularError' };
+  seen.add(failure);
+
+  const details: Record<string, unknown> = {};
+  const nameText = safeDiagnosticText(failure.name, secrets);
+  const name = typeof nameText === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(nameText)
+    ? nameText
+    : undefined;
+  const message = safeDiagnosticText(failure.message, secrets);
+  const code = safeErrorCode(failure.code, secrets);
+  if (name) details.name = name;
+  if (message) details.message = message;
+  if (code) details.code = code;
+
+  if (depth < 2) {
+    const nestedCause = failure.originalError ?? failure.cause;
+    const cause = diagnosticError(nestedCause, secrets, depth + 1, seen);
+    if (cause !== undefined) details.cause = cause;
+  }
+  return Object.keys(details).length ? details : undefined;
+}
+
+function responseRequestId(error: unknown, secrets: string[]): string | undefined {
+  const seen = new Set<object>();
+  let current = error;
+  for (let depth = 0; depth < 3; depth += 1) {
+    const failure = asRecord(current);
+    if (!failure || seen.has(failure)) break;
+    seen.add(failure);
+    const response = asRecord(failure.response) ?? failure;
+    const headers = response.headers;
+    const headerRecord = asRecord(headers);
+    const getHeader = headers && typeof (headers as { get?: unknown }).get === 'function'
+      ? (headers as { get(name: string): unknown }).get.bind(headers)
+      : undefined;
+    for (const headerName of ['sb-request-id', 'x-request-id']) {
+      const value = getHeader?.(headerName) ??
+        Object.entries(headerRecord ?? {}).find(([name]) => name.toLowerCase() === headerName)?.[1];
+      const requestId = safeRequestId(value, secrets);
+      if (requestId) return requestId;
+    }
+    current = failure.originalError ?? failure.cause;
+  }
+  return undefined;
+}
+
+function errorResponseStatus(error: unknown): number | undefined {
+  const seen = new Set<object>();
+  let current = error;
+  for (let depth = 0; depth < 3; depth += 1) {
+    const failure = asRecord(current);
+    if (!failure || seen.has(failure)) break;
+    seen.add(failure);
+    const response = asRecord(failure.response);
+    const status = httpStatus(failure.status) ?? httpStatus(response?.status);
+    if (status) return status;
+    current = failure.originalError ?? failure.cause;
+  }
+  return undefined;
+}
+
+function logStorageFailure(operation: string, error: unknown, config: SupabaseStorageConfig, diagnostics: StorageResponseDiagnostics) {
+  if (operation !== 'get_bucket' && isNotFound(error)) return;
+  const failure = asRecord(error);
+  const secrets = [config.serviceRoleKey, config.url];
+  const nameText = safeDiagnosticText(failure?.name, secrets);
+  const name = typeof nameText === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(nameText)
+    ? nameText
+    : 'UnknownError';
+  const statusCode = httpStatus(failure?.status) ?? httpStatus(failure?.statusCode) ??
+    diagnostics.responseStatus ?? errorResponseStatus(error);
+  const code = safeErrorCode(failure?.code, secrets);
+  const requestId = safeRequestId(diagnostics.requestId, secrets) ?? responseRequestId(error, secrets);
+  const message = safeDiagnosticText(failure?.message, secrets);
+  const cause = diagnosticError(failure?.originalError ?? failure?.cause, secrets);
   console.error('storage.operation.failed', {
     operation,
+    bucket: safeDiagnosticText(config.bucket, secrets),
     name,
+    ...(message ? { message } : {}),
     ...(code ? { code } : {}),
     ...(statusCode ? { statusCode } : {}),
+    ...(diagnostics.responseStatus ? { responseStatus: diagnostics.responseStatus } : {}),
+    ...(requestId ? { requestId } : {}),
+    ...(cause !== undefined ? { cause } : {}),
   });
 }
 
 async function withStorageClient<T>(operation: string, action: (client: SupabaseClient, config: SupabaseStorageConfig) => Promise<T>): Promise<T> {
   const config = getSupabaseStorageConfig();
-  const client = createSupabaseStorageClient(config);
+  const diagnostics: StorageResponseDiagnostics = {};
+  const client = createSupabaseStorageClient(config, diagnostics);
   try {
     return await action(client, config);
   } catch (error) {
-    logStorageFailure(operation, error);
+    logStorageFailure(operation, error, config, diagnostics);
     throw error;
   }
 }

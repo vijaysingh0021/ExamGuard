@@ -22,9 +22,13 @@ test('Supabase configuration validates the project URL and excludes credentials 
   const summary = validateStorageConfiguration(validEnvironment);
   assert.deepEqual(summary, { projectHost: 'projectref.supabase.co', bucket: 'examguard-evidence' });
   assert.doesNotMatch(JSON.stringify(summary), /test-service-role-key/);
+  for (const key of ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'OBJECT_STORAGE_BUCKET']) {
+    assert.throws(() => validateStorageConfiguration({ ...validEnvironment, [key]: ' ' }), new RegExp(key));
+  }
   assert.throws(() => validateStorageConfiguration({ ...validEnvironment, SUPABASE_URL: 'http://storage.example.test' }), /must use HTTPS/);
-  assert.throws(() => validateStorageConfiguration({ ...validEnvironment, SUPABASE_URL: 'https://projectref.supabase.co/storage/v1' }), /project URL/);
-  assert.throws(() => validateStorageConfiguration({ ...validEnvironment, SUPABASE_SERVICE_ROLE_KEY: ' ' }), /SUPABASE_SERVICE_ROLE_KEY/);
+  assert.throws(() => validateStorageConfiguration({ ...validEnvironment, SUPABASE_URL: 'https://projectref.supabase.co/rest/v1' }), /project base URL/);
+  assert.throws(() => validateStorageConfiguration({ ...validEnvironment, SUPABASE_URL: 'https://projectref.supabase.co/storage/v1/s3' }), /project base URL/);
+  assert.throws(() => validateStorageConfiguration({ ...validEnvironment, SUPABASE_URL: 'https://projectref.storage.supabase.co' }), /S3 endpoint/);
 });
 
 test('Supabase SDK uploads, reads metadata and streams private evidence without exposing the service key', async () => {
@@ -33,6 +37,7 @@ test('Supabase SDK uploads, reads metadata and streams private evidence without 
   let denyInfo = false;
   let missingInfo = false;
   let publicBucket = false;
+  let bucketFailure: 'none' | 'invalid-credentials' | 'missing-bucket' | 'network' = 'none';
   let uploadedBody: Buffer | undefined;
   const server = createServer((request, response) => {
     const bodyChunks: Buffer[] = [];
@@ -49,7 +54,31 @@ test('Supabase SDK uploads, reads metadata and streams private evidence without 
       });
 
       if (path === '/storage/v1/bucket/examguard-evidence') {
+        if (bucketFailure === 'network') {
+          request.socket.destroy();
+          return;
+        }
         response.setHeader('Content-Type', 'application/json');
+        if (bucketFailure === 'invalid-credentials') {
+          response.statusCode = 401;
+          response.setHeader('sb-request-id', 'request-auth-401');
+          response.end(JSON.stringify({
+            statusCode: '401',
+            code: 'InvalidJWT',
+            message: `Invalid API key local-test-service-role-key; Authorization: Bearer local-test-service-role-key; https://projectref.supabase.co/storage/v1/object/sign/x?token=signed-token; data:image/jpeg;base64,${'A'.repeat(120)}`,
+          }));
+          return;
+        }
+        if (bucketFailure === 'missing-bucket') {
+          response.statusCode = 404;
+          response.setHeader('x-request-id', 'request-bucket-404');
+          response.end(JSON.stringify({
+            statusCode: '404',
+            code: 'NoSuchBucket',
+            message: 'Bucket not found',
+          }));
+          return;
+        }
         response.end(JSON.stringify({ id: 'examguard-evidence', name: 'examguard-evidence', public: publicBucket }));
         return;
       }
@@ -116,6 +145,9 @@ test('Supabase SDK uploads, reads metadata and streams private evidence without 
   try {
     const key = 'organizations/org/attempts/attempt/evidence/frame.jpg';
     await realStorage.verifyReadiness?.();
+    const bucketCheck = requests.find(request => request.method === 'GET' && request.path === '/storage/v1/bucket/examguard-evidence');
+    assert.ok(bucketCheck);
+    assert.equal(bucketCheck.authorization, 'Bearer local-test-service-role-key');
     await putPrivateDocument(key, objectBytes, 'image/jpeg');
     assert.deepEqual(uploadedBody, objectBytes);
     assert.deepEqual(await privateDocumentMetadata(key), { contentType: 'image/jpeg', contentLength: objectBytes.length });
@@ -151,11 +183,49 @@ test('Supabase SDK uploads, reads metadata and streams private evidence without 
     assert.ok(verifyStorage);
     await assert.rejects(verifyStorage(), /bucket must be private/);
     publicBucket = false;
+
+    bucketFailure = 'invalid-credentials';
+    await assert.rejects(verifyStorage());
+    const invalidCredentialsLog = storageLogs
+      .filter(entry => entry[0] === 'storage.operation.failed')
+      .map(entry => entry[1] as Record<string, unknown>)
+      .find(entry => entry.operation === 'get_bucket' && entry.responseStatus === 401);
+    assert.ok(invalidCredentialsLog);
+    assert.equal(invalidCredentialsLog.bucket, 'examguard-evidence');
+    assert.equal(invalidCredentialsLog.name, 'StorageApiError');
+    assert.equal(invalidCredentialsLog.statusCode, 401);
+    assert.equal(invalidCredentialsLog.requestId, 'request-auth-401');
+    assert.match(String(invalidCredentialsLog.message), /Invalid API key/);
+    assert.doesNotMatch(JSON.stringify(invalidCredentialsLog), /local-test-service-role-key|https:\/\/|signed-token|A{80}/);
+
+    bucketFailure = 'missing-bucket';
+    await assert.rejects(verifyStorage());
+    const missingBucketLog = storageLogs
+      .filter(entry => entry[0] === 'storage.operation.failed')
+      .map(entry => entry[1] as Record<string, unknown>)
+      .find(entry => entry.operation === 'get_bucket' && entry.responseStatus === 404);
+    assert.ok(missingBucketLog);
+    assert.equal(missingBucketLog.code, 'NoSuchBucket');
+    assert.equal(missingBucketLog.requestId, 'request-bucket-404');
+
+    bucketFailure = 'network';
+    await assert.rejects(verifyStorage());
+    const networkLog = storageLogs
+      .filter(entry => entry[0] === 'storage.operation.failed')
+      .map(entry => entry[1] as Record<string, unknown>)
+      .find(entry => entry.operation === 'get_bucket' && entry.name === 'StorageUnknownError');
+    assert.ok(networkLog);
+    assert.equal(networkLog.message, 'fetch failed');
+    assert.equal(networkLog.responseStatus, undefined);
+    assert.ok(networkLog.cause && typeof networkLog.cause === 'object');
+    assert.ok((networkLog.cause as Record<string, unknown>).name);
+    assert.ok((networkLog.cause as Record<string, unknown>).message);
+
+    bucketFailure = 'none';
     denyInfo = true;
     await assert.rejects(privateDocumentExists(key), error =>
       Boolean(error && typeof error === 'object' && 'statusCode' in error && error.statusCode === '403'),
     );
-    assert.equal(storageLogs.some(entry => entry[0] === 'storage.operation.failed'), true);
     assert.doesNotMatch(JSON.stringify(storageLogs), /local-test-service-role-key/);
   } finally {
     console.error = originalConsoleError;
