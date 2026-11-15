@@ -125,40 +125,91 @@ export class BrevoEmailProvider implements EmailProvider {
 
   constructor(private apiKey: string, private sender: BrevoSender, private timeoutMs = 15_000, private fetchImpl: typeof fetch = fetch) {}
 
+  async verify() {
+    const response = await this.request('https://api.brevo.com/v3/senders', 'verification');
+    if (!response.ok) {
+      if (response.status === 429 || response.status >= 500) throw new EmailTransientError(`Brevo returned ${response.status}`);
+      throw new EmailPermanentError(`Brevo rejected the verification request (${response.status})`);
+    }
+    const body = await response.json().catch(() => ({})) as { senders?: Array<{ email?: unknown; active?: unknown }> };
+    const senderIsActive = body.senders?.some(sender =>
+      typeof sender.email === 'string' && sender.email.toLowerCase() === this.sender.email.toLowerCase() && sender.active === true,
+    );
+    if (!senderIsActive) throw new EmailPermanentError('Configured Brevo sender is not verified and active');
+  }
+
   async send(message: EmailMessage) {
+    const response = await this.request('https://api.brevo.com/v3/smtp/email', 'delivery', {
+      sender: this.sender,
+      to: [{ email: message.to }],
+      subject: message.subject,
+      textContent: message.text,
+    });
+
+    if (response.ok) {
+      const body = await response.json().catch(() => ({})) as { messageId?: unknown };
+      return { messageId: typeof body.messageId === 'string' ? body.messageId.slice(0, 200) : undefined };
+    }
+    if (response.status === 429 || response.status >= 500) throw new EmailTransientError(`Brevo returned ${response.status}`);
+    throw new EmailPermanentError(`Brevo rejected the message (${response.status})`);
+  }
+
+  private async request(url: string, operation: 'delivery' | 'verification', body?: object) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     let response: Response;
     try {
-      response = await this.fetchImpl('https://api.brevo.com/v3/smtp/email', {
-        method: 'POST',
+      response = await this.fetchImpl(url, {
+        method: body ? 'POST' : 'GET',
         signal: controller.signal,
-        headers: { 'Content-Type': 'application/json', 'api-key': this.apiKey },
-        body: JSON.stringify({
-          sender: this.sender,
-          to: [{ email: message.to }],
-          subject: message.subject,
-          textContent: message.text,
-        }),
+        headers: { 'api-key': this.apiKey, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        ...(body ? { body: JSON.stringify(body) } : {}),
       });
     } catch {
+      console.error('email.brevo.request_failed', { operation, reason: 'network_or_timeout' });
       throw new EmailTransientError('Email provider unreachable or timed out');
     } finally {
       clearTimeout(timer);
     }
 
     if (response.ok) {
-      const body = await response.json().catch(() => ({})) as { messageId?: unknown };
-      return { messageId: typeof body.messageId === 'string' ? body.messageId.slice(0, 200) : undefined };
+      console.info('email.brevo.response', { operation, status: response.status, ok: true });
+    } else {
+      console.error('email.brevo.response', {
+        operation,
+        status: response.status,
+        ok: false,
+        error: await sanitizedBrevoError(response, this.apiKey),
+      });
     }
-    if (response.status === 429 || response.status >= 500) throw new EmailTransientError(`Email provider returned ${response.status}`);
-    throw new EmailPermanentError(`Email provider rejected the message (${response.status})`);
+    return response;
   }
+}
+
+async function sanitizedBrevoError(response: Response, apiKey: string) {
+  const raw = await response.text().catch(() => '');
+  let body: unknown;
+  try { body = JSON.parse(raw); } catch { body = null; }
+  if (!body || typeof body !== 'object') return { message: 'Brevo returned a non-JSON error response' };
+
+  const error = body as { code?: unknown; message?: unknown };
+  const code = typeof error.code === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(error.code) ? error.code : undefined;
+  if (typeof error.message !== 'string') return { ...(code ? { code } : {}) };
+  const escapedKey = apiKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const message = (apiKey ? error.message.replace(new RegExp(escapedKey, 'gi'), '[REDACTED]') : error.message)
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[REDACTED_EMAIL]')
+    .replace(/\b\d{6}\b/g, '[REDACTED]')
+    .replace(/(password|pass|api[-_ ]?key|token|secret)\s*[:=]\s*([^\s,;]+)/gi, '$1=[REDACTED]')
+    .replace(/\b[A-Za-z0-9_-]{24,}\b/g, '[REDACTED]')
+    .replace(/https?:\/\/\S+/gi, '[REDACTED_URL]')
+    .replace(/[\r\n\t]+/g, ' ')
+    .slice(0, 300);
+  return { ...(code ? { code } : {}), message };
 }
 
 const isLocalHttp = (u: URL) => u.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname);
 export function emailProviderFromEnv(env: Record<string, string | undefined> = process.env): EmailProvider | null {
-  const from = env.MAIL_FROM || env.EMAIL_FROM;
+  const from = env.MAIL_FROM?.trim() || env.EMAIL_FROM?.trim();
   if (!from) return null;
   if (env.EMAIL_PROVIDER === 'smtp') {
     const port = Number(env.SMTP_PORT);
@@ -167,9 +218,23 @@ export function emailProviderFromEnv(env: Record<string, string | undefined> = p
   }
   if (env.EMAIL_PROVIDER === 'brevo') {
     const sender = parseBrevoSender(from);
-    return env.EMAIL_API_KEY && sender ? new BrevoEmailProvider(env.EMAIL_API_KEY, sender) : null;
+    const apiKey = env.EMAIL_API_KEY?.trim();
+    return apiKey && sender ? new BrevoEmailProvider(apiKey, sender) : null;
   }
   if (env.EMAIL_PROVIDER !== 'webhook' || !env.EMAIL_URL) return null;
   try { const u = new URL(env.EMAIL_URL); if (u.protocol !== 'https:' && !isLocalHttp(u)) return null; } catch { return null; }
   return new WebhookEmailProvider(env.EMAIL_URL, from, env.EMAIL_API_KEY);
+}
+
+export function emailProviderStatus(env: Record<string, string | undefined> = process.env) {
+  const provider = emailProviderFromEnv(env);
+  const missing: string[] = [];
+  if (!env.MAIL_FROM?.trim() && !env.EMAIL_FROM?.trim()) missing.push('MAIL_FROM');
+  if (env.EMAIL_PROVIDER === 'brevo' && !env.EMAIL_API_KEY?.trim()) missing.push('EMAIL_API_KEY');
+  return {
+    provider: provider?.name ?? env.EMAIL_PROVIDER ?? 'unconfigured',
+    configured: provider !== null,
+    missing,
+    ...(provider === null && missing.length === 0 ? { configurationIssue: 'invalid_or_unsupported_configuration' } : {}),
+  };
 }

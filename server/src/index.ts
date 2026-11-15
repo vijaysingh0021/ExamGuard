@@ -8,6 +8,7 @@ import { prisma } from './prisma.js';
 import { isUuid } from './ids.js';
 import { bearerToken, jwtSubject } from './auth.js';
 import { startBackgroundJobs } from './background.js';
+import { emailProviderStatus } from './email.js';
 
 let config: Config;
 try { config = loadConfig(); } catch (error) {
@@ -16,6 +17,7 @@ try { config = loadConfig(); } catch (error) {
   process.exit(1);
 }
 const app = createApp();
+console.info('email.provider.initialized', emailProviderStatus());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: config.CLIENT_URL } });
 

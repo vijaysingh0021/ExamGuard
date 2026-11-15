@@ -38,5 +38,5 @@ services:
         value: brevo
       - key: EMAIL_API_KEY
         sync: false
-      - key: EMAIL_FROM
+      - key: MAIL_FROM
         sync: false

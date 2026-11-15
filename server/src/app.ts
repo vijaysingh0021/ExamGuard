@@ -1057,8 +1057,12 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
   app.post('/api/auth/password-reset/request', passwordResetLimiter, async (req, res, next) => { try {
     const { email } = resetRequest.parse(req.body);
     const generic = { message: 'If an account exists and email delivery is working, a verification code will be sent.' };
+    if (!emailProviderFromEnv()) {
+      console.error('email.request.failed', { operation: 'password_reset_otp', provider: 'unavailable', reason: 'not_configured' });
+      return res.status(503).json({ error: 'Password reset email delivery is temporarily unavailable. Please try again later.' });
+    }
     const user = await prisma.user.findUnique({ where: { email } });
-    if (!user || !emailProviderFromEnv()) return res.status(202).json(generic);
+    if (!user) return res.status(202).json(generic);
     const now = new Date();
     const config = otpConfig();
     const active = await prisma.passwordResetToken.findFirst({ where: { userId: user.id, usedAt: null }, orderBy: { createdAt: 'desc' } });
@@ -1069,9 +1073,9 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
       update: { tokenHash: hashResetToken(otp), expiresAt: new Date(now.getTime() + config.ttlMs), usedAt: null, otpAttempts: 0, lastSentAt: now, otpVerifiedAt: null },
       create: { userId: user.id, tokenHash: hashResetToken(otp), expiresAt: new Date(now.getTime() + config.ttlMs), lastSentAt: now },
     });
-    try { await sendPasswordOtpEmail(user.email, otp); } catch (error) {
+    try { await sendPasswordOtpEmail(user.email, otp); } catch {
       await prisma.passwordResetToken.delete({ where: { id: reset.id } });
-      console.warn('Password reset OTP delivery failed:', error instanceof Error ? error.message : 'Unknown email error');
+      return res.status(503).json({ error: 'Password reset email delivery failed. Please try again later.' });
     }
     const membership = await prisma.membership.findFirst({ where: { userId: user.id, active: true } });
     if (membership) await audit(membership.organizationId, user.id, 'password_reset.requested', 'User', user.id);

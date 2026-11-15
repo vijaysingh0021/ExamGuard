@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { BrevoEmailProvider, EmailPermanentError, EmailTransientError, SmtpEmailProvider, WebhookEmailProvider, emailProviderFromEnv, type EmailProvider } from '../src/email.js';
+import { BrevoEmailProvider, EmailPermanentError, EmailTransientError, SmtpEmailProvider, WebhookEmailProvider, emailProviderFromEnv, emailProviderStatus, type EmailProvider } from '../src/email.js';
 import { composeEmail, fanoutNotificationEmails, sendQueuedEmails, signUnsubscribe, verifyUnsubscribe, type OutboxDb } from '../src/email-outbox.js';
 
 const now = new Date('2026-11-07T10:00:00Z'); const at = (ms: number) => new Date(now.getTime() + ms);
@@ -89,7 +89,16 @@ test('provider: classifies errors, sends the idempotency key, never leaks creden
 });
 test('Brevo provider sends transactional mail over HTTPS and classifies retryable failures', async () => {
   const calls: any[] = []; let status = 201;
-  const f = (async (url: string, init: any) => { calls.push({ url, init }); return { ok: status < 300, status, json: async () => ({ messageId: '<brevo-1>' }) } as Response; }) as unknown as typeof fetch;
+  let responseBody: unknown = { messageId: '<brevo-1>' };
+  const f = (async (url: string, init: any) => {
+    calls.push({ url, init });
+    return {
+      ok: status < 300,
+      status,
+      json: async () => responseBody,
+      text: async () => JSON.stringify(responseBody),
+    } as Response;
+  }) as unknown as typeof fetch;
   const provider = new BrevoEmailProvider('BREVO_TEST_KEY', { email: 'no-reply@example.test', name: 'ExamGuard' }, 1000, f);
   assert.deepEqual(await provider.send({ to: 'student@example.test', subject: 'Verify', text: 'Your code', idempotencyKey: 'signup:1' }), { messageId: '<brevo-1>' });
   assert.equal(calls[0].url, 'https://api.brevo.com/v3/smtp/email');
@@ -101,17 +110,56 @@ test('Brevo provider sends transactional mail over HTTPS and classifies retryabl
     textContent: 'Your code',
   });
   status = 429;
+  responseBody = { code: 'rate_limit', message: 'Request rate exceeded' };
   await assert.rejects(provider.send({ to: 'a', subject: 's', text: 't', idempotencyKey: 'k' }), EmailTransientError);
   status = 400;
-  await assert.rejects(provider.send({ to: 'a', subject: 's', text: 't', idempotencyKey: 'k' }), (error: Error) => error instanceof EmailPermanentError && !error.message.includes('BREVO_TEST_KEY'));
-  assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'brevo', EMAIL_API_KEY: 'key', EMAIL_FROM: 'ExamGuard <no-reply@example.test>' })?.name, 'brevo');
+  responseBody = { code: 'invalid_parameter', message: 'Rejected test+user@example.test code 123456 key=BREVO_TEST_KEY token=abcdefghijklmnopqrstuvwx https://brevo.example.test/private' };
+  const logs: unknown[][] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { logs.push(args); };
+  try {
+    await assert.rejects(provider.send({ to: 'a', subject: 's', text: 't', idempotencyKey: 'k' }), (error: Error) => error instanceof EmailPermanentError && !error.message.includes('BREVO_TEST_KEY'));
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0][0], 'email.brevo.response');
+  assert.deepEqual(logs[0][1], {
+    operation: 'delivery',
+    status: 400,
+    ok: false,
+    error: {
+      code: 'invalid_parameter',
+      message: 'Rejected [REDACTED_EMAIL] code [REDACTED] key=[REDACTED] token=[REDACTED] [REDACTED_URL]',
+    },
+  });
+  assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'brevo', EMAIL_API_KEY: 'key', MAIL_FROM: 'ExamGuard <no-reply@example.test>' })?.name, 'brevo');
+  assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'brevo', EMAIL_API_KEY: 'key', EMAIL_FROM: 'ExamGuard <no-reply@example.test>' })?.name, 'brevo', 'legacy sender variable remains supported');
   assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'brevo', EMAIL_API_KEY: 'key', EMAIL_FROM: 'not-an-email' }), null);
+});
+test('Brevo verification checks API authentication without sending a message', async () => {
+  const calls: any[] = [];
+  const provider = new BrevoEmailProvider('BREVO_TEST_KEY', { email: 'no-reply@example.test' }, 1000, (async (url: string, init: any) => {
+    calls.push({ url, init });
+    return { ok: true, status: 200, json: async () => ({ senders: [{ email: 'no-reply@example.test', active: true }] }), text: async () => '' } as Response;
+  }) as typeof fetch);
+  await provider.verify();
+  assert.equal(calls[0].url, 'https://api.brevo.com/v3/senders');
+  assert.equal(calls[0].init.method, 'GET');
+  assert.equal(calls[0].init.headers['api-key'], 'BREVO_TEST_KEY');
+  assert.equal(calls[0].init.body, undefined);
 });
 test('provider configuration is fail-closed and requires https (or localhost)', () => {
   assert.equal(emailProviderFromEnv({}), null);
   assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'webhook', EMAIL_URL: 'http://mail.example.test/send', EMAIL_FROM: 'a@x.test' }), null);
   assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'webhook', EMAIL_URL: 'not a url', EMAIL_FROM: 'a@x.test' }), null);
   assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'smtp', EMAIL_URL: 'https://x.test', EMAIL_FROM: 'a@x.test' }), null);
+  assert.equal(emailProviderFromEnv({ EMAIL_PROVIDER: 'brevo', MAIL_FROM: 'no-reply@example.test' }), null);
+  assert.deepEqual(emailProviderStatus({ EMAIL_PROVIDER: 'brevo', MAIL_FROM: 'no-reply@example.test' }), {
+    provider: 'brevo',
+    configured: false,
+    missing: ['EMAIL_API_KEY'],
+  });
   assert.ok(emailProviderFromEnv({ EMAIL_PROVIDER: 'webhook', EMAIL_URL: 'https://mail.example.test/send', EMAIL_FROM: 'a@x.test' }));
   assert.ok(emailProviderFromEnv({ EMAIL_PROVIDER: 'webhook', EMAIL_URL: 'http://localhost:8025/send', EMAIL_FROM: 'a@x.test' }));
 });
