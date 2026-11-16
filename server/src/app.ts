@@ -230,7 +230,17 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
 
   app.disable('x-powered-by');
   app.use(securityHeaders);
-  app.use(cors({ origin: clientOrigin, exposedHeaders: ['X-Page', 'X-Page-Size', 'X-Total-Count', 'X-Total-Pages', 'Date'] }));
+  app.use(cors({
+  origin: clientOrigin,
+  credentials: true,
+  exposedHeaders: [
+    'X-Page',
+    'X-Page-Size',
+    'X-Total-Count',
+    'X-Total-Pages',
+    'Date'
+  ]
+}));
   app.set('storage', storage);
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
