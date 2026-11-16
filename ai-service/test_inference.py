@@ -437,6 +437,28 @@ class HeadPoseTests(unittest.TestCase):
         self.assertEqual(result["phone_model"], "configured")
         self.assertEqual(result["phone_confidence"], 0.91)
         self.assertEqual(result["phone_boxes"][0]["label"], "cell phone")
+        self.assertEqual(
+            set(result["inference_stages_ms"]),
+            {
+                "image_decode_ms",
+                "resize_ms",
+                "face_detection_ms",
+                "head_pose_ms",
+                "phone_detection_ms",
+                "postprocessing_ms",
+                "total_ms",
+            },
+        )
+        self.assertTrue(all(value >= 0 for value in result["inference_stages_ms"].values()))
+        self.assertEqual(result["inference_stages_ms"]["total_ms"], result["inference_ms"])
+
+    def test_frame_quality_statistics_match_combined_numpy_statistics(self):
+        image = np.random.default_rng(42).integers(0, 256, (64, 80, 3), dtype=np.uint8)
+
+        mean, standard_deviation = main.frame_quality_statistics(image)
+
+        self.assertAlmostEqual(mean, float(np.mean(image)), places=10)
+        self.assertAlmostEqual(standard_deviation, float(np.std(image)), places=10)
 
     def test_loaded_model_without_phone_class_does_not_report_false_negative(self):
         with patch.object(main, "yolo", FakeYolo("person")):

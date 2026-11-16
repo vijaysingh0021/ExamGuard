@@ -7,11 +7,12 @@ import { api } from "./lib/api";
 import { readPagination } from "./lib/pagination";
 import { ATTEMPT_STATUS_LABEL, GRADE_STATUS_LABEL, describeAnswer, formatScore, gradeActions, gradeTone, maxManualMarks, parseManualMarks, percent, sameAnswer, type GradeLite } from "./lib/grading-rules";
 import { Alert, Badge, Button, CopyableId, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Select, Skeleton, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea } from "./components/ui";
+import { QuestionTypeRenderer, type ExamQuestionType } from "./question-renderer";
 
 type StaffSession = { organization: { id: string; name: string }; role: string };
 type SubmissionRow = { id: string; status: string; startedAt: string; submittedAt: string | null; receiptCode: string | null; candidate: { id: string; name: string }; grade: GradeLite | null };
 type Summary = { assigned: number; attempts: Record<string, number>; grades: Record<string, number>; awaitingEvaluation: number; isPractice?: boolean };
-type ReviewQuestion = { id: string; type: string; prompt: string; options: Array<{ id: string; text: string }> | null; marks: number; objective: boolean; correctAnswer: unknown; answer: unknown; position: number | null };
+type ReviewQuestion = { id: string; type: string; prompt: string; options: Array<{ id: string; text: string }> | null; marks: number; objective: boolean; correctAnswer: unknown; gradingGuide?: unknown; answer: unknown; position: number | null };
 type Review = { attempt: { id: string; status: string; submittedAt: string | null; receiptCode: string | null; candidate: { id: string; name: string }; examTitle: string }; grade: (GradeLite & { feedback?: string | null }) | null; questions: ReviewQuestion[] };
 
 const errorMessage = (e: unknown, fallback: string) => (axios.isAxiosError(e) ? e.response?.data?.error ?? fallback : fallback);
@@ -221,9 +222,17 @@ export function AttemptReviewDialog({ session, examId, attemptId, onClose, onCha
             return (
               <li key={qu.id} className="rounded-xl border border-stone-200 p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2"><p className="font-medium">{i + 1}. {qu.prompt}</p><span className="flex items-center gap-2 text-xs text-stone-500">{qu.marks} mark{qu.marks === 1 ? "" : "s"}<Badge variant="outline">{qu.type.replaceAll("_", " ")}</Badge>{correct !== null && <Badge variant={correct ? "success" : "danger"}>{correct ? "Correct" : shown ? "Incorrect" : "Not answered"}</Badge>}</span></div>
-                {qu.type === "coding" ? <><p className="mt-2 text-xs text-stone-500">Submitted code. Coding answers are not run automatically and need manual marking.</p><pre className="mt-1 max-h-64 overflow-auto rounded-lg bg-stone-950 p-3 text-xs text-stone-100">{shown || "No code submitted."}</pre></>
-                  : <p className="mt-2 whitespace-pre-wrap text-sm text-stone-800"><span className="text-xs uppercase tracking-wide text-stone-400">Candidate's answer </span><br />{shown || <i className="text-stone-400">No answer</i>}</p>}
-                {qu.objective && correct === false && <p className="mt-2 text-sm text-stone-600"><span className="text-xs uppercase tracking-wide text-stone-400">Correct answer </span><br />{describeAnswer(qu.correctAnswer, qu.options)}</p>}
+                {qu.type === "coding" && <p className="mt-2 text-xs text-stone-500">Submitted code. Coding answers are not run automatically and need manual marking.</p>}
+                <div className="mt-2">
+                  <QuestionTypeRenderer
+                    mode="evaluation"
+                    type={qu.type as ExamQuestionType}
+                    options={qu.options ?? []}
+                    value={qu.answer}
+                    correctAnswer={qu.correctAnswer}
+                    gradingGuide={qu.gradingGuide}
+                  />
+                </div>
               </li>);
           })}</ol>
         </>)}

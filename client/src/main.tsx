@@ -96,6 +96,7 @@ import { AccountPage } from "./account";
 import { StaffOverview } from "./staff-dashboard";
 import { CompanionStatus } from "./companion-status";
 import { ExamTimer, QuestionPalette, SubmitReviewDialog, SyncIndicator } from "./exam-ui";
+import { QuestionTypeRenderer, type ExamQuestionType } from "./question-renderer";
 import { AnswerSync, pendingStore, type SyncSnapshot } from "./lib/answer-sync";
 import { createSubmitter } from "./lib/submit-flow";
 import { clockOffsetMs, isAnswered, loadMarks, progress as examProgress, remainingMs, saveMarks, serverAlignedNow } from "./lib/exam-state";
@@ -104,6 +105,7 @@ import {
   browserCompatibility,
   cameraStreamHasLiveTrack,
   cameraStreamIsActive,
+  companionBridgeAuthorization,
   checkCompanionBridge,
   createReadinessCheck,
   fullDisplayStreamIsActive,
@@ -686,7 +688,7 @@ function ReadinessChecks({ onStart, error, fullscreenRequired, organizationId, e
   const practiceCompleted = practiceAnswer === "blue";
   const [screen, setScreen] = useState("Not enabled");
   const screenStream = useRef<MediaStream | null>(null);
-  const [companionStatus, setCompanionStatus] = useState("Checking local Windows Companion…");
+  const [companionStatus, setCompanionStatus] = useState("Use the Check Companion button to request local-network access and verify the bridge.");
   const [companionReady, setCompanionReady] = useState(false);
   const [aiStatus, setAiStatus] = useState("Checking AI proctoring service…");
   const [aiReady, setAiReady] = useState(false);
@@ -705,6 +707,13 @@ function ReadinessChecks({ onStart, error, fullscreenRequired, organizationId, e
     typeof navigator !== "undefined" && !!navigator.mediaDevices?.getDisplayMedia,
   ), []);
   const markChecked = (id: string) => setLastChecked(existing => ({ ...existing, [id]: new Date().toISOString() }));
+  const checkLocalCompanion = async () => {
+    setCompanionStatus("Connecting to the local Windows Companion…");
+    const companion = await checkCompanionBridge();
+    setCompanionReady(companion.status === "ready");
+    setCompanionStatus(companion.explanation);
+    markChecked(companion.id);
+  };
   const stopCamera = () => {
     cameraStream.current?.getTracks().forEach((track) => track.stop());
     cameraStream.current = null;
@@ -746,11 +755,6 @@ function ReadinessChecks({ onStart, error, fullscreenRequired, organizationId, e
   useEffect(() => {
     let active = true;
     const checkServices = async () => {
-      const companion = await checkCompanionBridge();
-      if (!active) return;
-      setCompanionReady(companion.status === "ready");
-      setCompanionStatus(companion.explanation);
-      markChecked(companion.id);
       try {
         const response = await api.get(`/api/student/organizations/${organizationId}/exams/${examId}/readiness`, { timeout: 7000 });
         if (!active) return;
@@ -960,7 +964,10 @@ function ReadinessChecks({ onStart, error, fullscreenRequired, organizationId, e
   const checkButton = (id: string) => id === "camera" ? <div className="mt-3 flex gap-3"><button type="button" onClick={() => void checkCamera()} className="text-sm font-semibold text-blue-700 underline">Check camera</button><button type="button" onClick={stopCamera} className="text-sm text-slate-600 underline">Stop preview</button></div>
     : id === "microphone" ? <div className="mt-3 flex gap-3"><button type="button" onClick={() => void checkMicrophone()} className="text-sm font-semibold text-blue-700 underline">Check microphone</button><button type="button" onClick={stopMicrophone} className="text-sm text-slate-600 underline">Stop test</button></div>
       : id === "screen_sharing" ? <button type="button" onClick={() => void enableScreen()} className="mt-3 text-sm font-semibold text-blue-700 underline">Share / retry display</button>
-        : id === "windows_companion" ? <a className="mt-3 inline-flex text-sm font-semibold text-blue-700 underline" href="examguard-companion://start" target="_blank" rel="noreferrer">Open Windows Companion</a>
+        : id === "windows_companion" ? <div className="mt-3 flex flex-wrap gap-3">
+          <button type="button" onClick={() => void checkLocalCompanion()} className="text-sm font-semibold text-blue-700 underline">{companionReady ? "Check Companion again" : "Connect / check Companion"}</button>
+          <a className="text-sm font-semibold text-blue-700 underline" href="examguard-companion://start" target="_blank" rel="noreferrer">Open Windows Companion</a>
+        </div>
           : id === "ai_service" || id === "evidence_storage" || id === "exam_assignment" || id === "exam_window" ? <button type="button" onClick={() => setRefreshKey(value => value + 1)} className="mt-3 text-sm font-semibold text-blue-700 underline">Retry server checks</button>
             : null;
   return <div className="card w-full max-w-5xl">
@@ -1067,6 +1074,7 @@ function StudentExam({ session }: { session: Session }) {
     save: async ({ questionId, sourceCode }: { questionId: string; languageId: string; sourceCode: string }) => {
       if (!payload?.attempt?.id) throw new Error("The active attempt is unavailable.");
       await api.put(`/api/student/attempts/${payload.attempt.id}/answers/${questionId}`, { value: sourceCode });
+      setAnswers(current => ({ ...current, [questionId]: sourceCode }));
     },
   }), [payload?.attempt?.id]);
   useEffect(() => {
@@ -1602,6 +1610,7 @@ function StudentExam({ session }: { session: Session }) {
         // immediately afterwards. This bridge endpoint is loopback + origin restricted.
         void fetch("http://127.0.0.1:43117/stop", {
           method: "POST",
+          headers: companionBridgeAuthorization(),
           cache: "no-store",
           signal: AbortSignal.timeout(1500),
         }).catch(() => undefined);
@@ -1640,7 +1649,7 @@ function StudentExam({ session }: { session: Session }) {
       const { data } = await api.post(`/api/student/attempts/${attemptId}/companion-pairing`);
       const bridgeResponse = await fetch("http://127.0.0.1:43117/pair", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...companionBridgeAuthorization() },
         cache: "no-store",
         body: JSON.stringify({ apiUrl: new URL(api.defaults.baseURL || window.location.origin, window.location.origin).origin, pairingToken: data.pairingToken, consentGranted: true }),
       });
@@ -1900,8 +1909,7 @@ function StudentExam({ session }: { session: Session }) {
     };
   }, [payload?.attempt?.candidateId, payload?.attempt?.examId, payload?.attempt?.id, payload?.attempt?.organizationId, receipt, cameraStreamVersion]);
   useEffect(() => {
-    const hasCodingQuestions = Boolean(payload?.questions?.some((item: any) => item.type === "coding"));
-    if (payload && left === 0 && !hasCodingQuestions) void submit(true);
+    if (payload && left === 0) void submit(true);
   }, [left, payload]);
   if (!payload) return <ReadinessChecks onStart={start} error={error} fullscreenRequired={fullscreenRequired} organizationId={session.organization.id} examId={examId} />;
   if (receipt)
@@ -1920,62 +1928,6 @@ function StudentExam({ session }: { session: Session }) {
         </p>
       </div>
     );
-  if (payload.questions?.some((item: any) => item.type === "coding")) {
-    const codingQuestions = payload.questions.filter((item: any) => item.type === "coding");
-    const initialCodes = Object.fromEntries(
-      (payload.answers ?? [])
-        .filter((answer: any) => typeof answer.value === "string")
-        .map((answer: any) => {
-          const question = codingQuestions.find((item: any) => item.id === answer.questionId);
-          return [answer.questionId, {
-            languageId: question?.coding?.languageIds?.[0] ?? "",
-            sourceCode: answer.value,
-          }];
-        }),
-    );
-    return <div className="relative">
-      {attentionWarning && <div role="alert" className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-3 border-b border-amber-300 bg-amber-100 px-4 py-3 text-sm text-amber-950 shadow-md">
-        <span><b>Attention required.</b> {attentionWarning}</span>
-        <div className="flex items-center gap-3">
-          {!document.fullscreenElement && <button type="button" onClick={() => { void document.documentElement.requestFullscreen?.().catch(() => setAttentionWarning("Fullscreen could not be restored. Continue only after your organizer helps resolve the browser issue.")); }} className="font-semibold underline">Return to fullscreen</button>}
-          <button type="button" onClick={() => setAttentionWarning("")} className="font-semibold">Dismiss</button>
-        </div>
-      </div>}
-      <CodingExamWorkspace
-        assessment={{ title: payload.exam.isPractice ? `${payload.exam.title} — Practice (ungraded)` : payload.exam.title, instructions: payload.exam.instructions, deadlineAt: payload.attempt.deadlineAt }}
-        attemptId={payload.attempt.id}
-        questions={codingQuestions.map((item: any) => ({
-          id: item.id,
-          title: item.coding?.title ?? "Coding problem",
-          description: item.coding?.description ?? item.prompt,
-          difficulty: item.coding?.difficulty ?? "medium",
-          inputFormat: item.coding?.inputFormat,
-          outputFormat: item.coding?.outputFormat,
-          constraints: item.coding?.constraints,
-          explanation: item.coding?.explanation,
-          marks: item.marks,
-          languageIds: item.coding?.languageIds ?? [],
-          starterCode: item.coding?.starterCode ?? {},
-          samples: item.coding?.samples ?? []
-        }))}
-        initialCodes={initialCodes}
-        persistence={codingPersistence}
-        execution={codingExecution}
-        submissionError={error}
-        clockOffsetMs={clockOffset.current}
-        onFinishAssessment={(automatic = false) => submit(automatic)}
-      />
-      {fullscreenLost && <FullscreenLock onRestore={() => { void document.documentElement.requestFullscreen().catch(() => setAttentionWarning("Fullscreen could not be restored. Continue only after your organizer helps resolve the browser issue.")); }} />}
-      {singleWindowBlocked && <div role="alertdialog" aria-modal="true" className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-6">
-        <div className="max-w-md rounded-2xl bg-white p-6 text-center shadow-2xl">
-          <ShieldCheck className="mx-auto text-red-600" size={32} />
-          <h2 className="mt-4 text-xl font-semibold">Single exam-tab lock active</h2>
-          <p className="mt-2 text-sm leading-6 text-slate-600">{singleWindowMessage}</p>
-          <p className="mt-3 text-xs leading-5 text-slate-500">Only one active ExamGuard exam is allowed in this browser profile. Browser security does not let a website close unrelated tabs or apps. The signal is for human review, not an automatic misconduct decision.</p>
-        </div>
-      </div>}
-    </div>;
-  }
   const question = payload.questions[current];
   const answered = (id: string) => isAnswered(answers[id]);
   return (
@@ -1995,10 +1947,44 @@ function StudentExam({ session }: { session: Session }) {
         <section className="card">
           <div className="flex items-center justify-between gap-3"><p className="font-medium">Question {current + 1} of {payload.questions.length}</p><button type="button" onClick={() => setMarked((items) => ({ ...items, [question.id]: !items[question.id] }))} aria-pressed={Boolean(marked[question.id])} className="text-sm font-semibold text-blue-700">{marked[question.id] ? "Remove review mark" : "Mark for review"}</button></div>
           <p className="mt-5 text-lg font-medium">{question.prompt}</p>
-          {question.options?.length ? <div className="mt-5 space-y-3">{question.options.map((option: any) => {
-            const selected = question.type === "multiple_select" ? Array.isArray(answers[question.id]) && answers[question.id].includes(option.id) : answers[question.id] === option.id;
-            return <label className="flex cursor-pointer gap-3 rounded-xl border border-slate-200 p-3 hover:border-blue-300" key={option.id}><input type={question.type === "multiple_select" ? "checkbox" : "radio"} name={question.id} checked={selected} onChange={(event) => { const previous = Array.isArray(answers[question.id]) ? answers[question.id] : []; const value = question.type === "multiple_select" ? (event.target.checked ? [...previous, option.id] : previous.filter((item: string) => item !== option.id)) : option.id; void save(question.id, value); }} /><span>{option.text}</span></label>;
-          })}</div> : <textarea className="input mt-5 min-h-40" value={String(answers[question.id] ?? "")} onChange={(event) => void save(question.id, event.target.value)} onBlur={() => void sync.current?.flush()} placeholder="Write your answer" aria-label={`Answer for question ${current + 1}`} />}
+          {question.type === "coding" ? (() => {
+            const languageIds: string[] = question.coding?.languageIds ?? [];
+            const initialCode = typeof answers[question.id] === "string"
+              ? answers[question.id]
+              : question.coding?.starterCode?.[languageIds[0]] ?? "";
+            return <CodingExamWorkspace
+              assessment={{ title: payload.exam.isPractice ? `${payload.exam.title} — Practice (ungraded)` : payload.exam.title, instructions: payload.exam.instructions, deadlineAt: payload.attempt.deadlineAt }}
+              attemptId={payload.attempt.id}
+              questions={[{
+                id: question.id,
+                title: question.coding?.title ?? "Coding problem",
+                description: question.coding?.description ?? question.prompt,
+                difficulty: question.coding?.difficulty ?? "medium",
+                inputFormat: question.coding?.inputFormat,
+                outputFormat: question.coding?.outputFormat,
+                constraints: question.coding?.constraints,
+                explanation: question.coding?.explanation,
+                marks: question.marks,
+                languageIds,
+                starterCode: question.coding?.starterCode ?? {},
+                samples: question.coding?.samples ?? [],
+              }]}
+              initialCodes={{ [question.id]: { languageId: languageIds[0] ?? "", sourceCode: initialCode } }}
+              persistence={codingPersistence}
+              execution={codingExecution}
+              submissionError={error}
+              clockOffsetMs={clockOffset.current}
+            />;
+          })() : <QuestionTypeRenderer
+            mode="candidate"
+            type={question.type as ExamQuestionType}
+            groupId={question.id}
+            options={question.options ?? []}
+            value={answers[question.id]}
+            label={`Answer for question ${current + 1}`}
+            onChange={value => { void save(question.id, value); }}
+            onBlur={() => void sync.current?.flush()}
+          />}
           <div className="mt-7 flex justify-between"><button type="button" disabled={current === 0} onClick={() => setCurrent((value) => value - 1)} className="button disabled:opacity-50">Previous</button><button type="button" disabled={current === payload.questions.length - 1} onClick={() => setCurrent((value) => value + 1)} className="button disabled:opacity-50">Next</button></div>
         </section>
         <aside className="card h-fit" aria-label="Question navigation">

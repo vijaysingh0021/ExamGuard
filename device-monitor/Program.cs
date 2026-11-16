@@ -217,6 +217,8 @@ internal sealed class MonitorForm : Form
     private bool wifiAvailable;
     private bool paired;
     private DateTimeOffset? pairingExpiresAt;
+    private readonly object bridgeAuthorizationLock = new();
+    private byte[]? bridgeAuthorizationToken;
 
     private readonly TcpListener bridge = new(IPAddress.Loopback, 43117);
     private readonly NotifyIcon trayIcon;
@@ -668,6 +670,31 @@ internal sealed class MonitorForm : Form
         return string.IsNullOrWhiteSpace(storedValue) ? null : storedValue.Trim().TrimEnd('/');
     }
 
+    private bool AuthorizeBridgeRequest(string? authorization, bool allowInitialRegistration = false)
+    {
+        const string prefix = "Bearer ";
+        if (authorization is null || !authorization.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var token = authorization[prefix.Length..].Trim();
+        if (token.Length != 64)
+            return false;
+        byte[] supplied;
+        try { supplied = Convert.FromHexString(token); }
+        catch (FormatException) { return false; }
+
+        lock (bridgeAuthorizationLock)
+        {
+            if (bridgeAuthorizationToken is null && allowInitialRegistration)
+            {
+                bridgeAuthorizationToken = supplied;
+                return true;
+            }
+            return bridgeAuthorizationToken is not null &&
+                CryptographicOperations.FixedTimeEquals(bridgeAuthorizationToken, supplied);
+        }
+    }
+
     private async Task HandleLocalBridgeRequestAsync(TcpClient client)
     {
         using (client)
@@ -694,12 +721,22 @@ internal sealed class MonitorForm : Form
 
             if (request.Method == "GET" && request.Path == "/health")
             {
+                if (!AuthorizeBridgeRequest(request.Authorization, allowInitialRegistration: true))
+                {
+                    await WriteBridgeJsonAsync(stream, origin, new { error = "Local browser session is not authorized." }, 401);
+                    return;
+                }
                 await WriteBridgeJsonAsync(stream, origin, new { status = "ready", paired, scanning });
                 return;
             }
 
             if (request.Method == "POST" && request.Path == "/stop")
             {
+                if (!AuthorizeBridgeRequest(request.Authorization))
+                {
+                    await WriteBridgeJsonAsync(stream, origin, new { error = "Local browser session is not authorized." }, 401);
+                    return;
+                }
                 await InvokeOnUiAsync(() => StopAsync());
                 await WriteBridgeJsonAsync(stream, origin, new { status = "stopped", scanning = false });
                 return;
@@ -708,6 +745,11 @@ internal sealed class MonitorForm : Form
             if (request.Method != "POST" || request.Path != "/pair")
             {
                 await WriteBridgeJsonAsync(stream, origin, new { error = "Local bridge route not found." }, 404);
+                return;
+            }
+            if (!AuthorizeBridgeRequest(request.Authorization))
+            {
+                await WriteBridgeJsonAsync(stream, origin, new { error = "Local browser session is not authorized." }, 401);
                 return;
             }
 
@@ -767,7 +809,7 @@ internal sealed class MonitorForm : Form
         }
     }
 
-    private sealed record BridgeRequest(string Method, string Path, string? Origin, byte[] Body);
+    private sealed record BridgeRequest(string Method, string Path, string? Origin, string? Authorization, byte[] Body);
 
     private static async Task<BridgeRequest?> ReadBridgeRequestAsync(NetworkStream stream)
     {
@@ -798,6 +840,7 @@ internal sealed class MonitorForm : Form
             throw new JsonException("Invalid request path.");
 
         string? origin = null;
+        string? authorization = null;
         var contentLength = 0;
         var hasTransferEncoding = false;
         foreach (var line in lines.Skip(1))
@@ -807,6 +850,7 @@ internal sealed class MonitorForm : Form
             var name = line[..separator].Trim();
             var value = line[(separator + 1)..].Trim();
             if (name.Equals("Origin", StringComparison.OrdinalIgnoreCase)) origin = value;
+            if (name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)) authorization = value;
             if (name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) &&
                 (!int.TryParse(value, out contentLength) || contentLength < 0))
                 throw new JsonException("Invalid content length.");
@@ -823,7 +867,7 @@ internal sealed class MonitorForm : Form
             if (count == 0) throw new JsonException("Incomplete request body.");
             offset += count;
         }
-        return new BridgeRequest(requestLine[0].ToUpperInvariant(), targetUri.AbsolutePath, origin, body);
+        return new BridgeRequest(requestLine[0].ToUpperInvariant(), targetUri.AbsolutePath, origin, authorization, body);
     }
 
     private static async Task WriteBridgeJsonAsync(NetworkStream stream, string? origin, object value, int statusCode = 200)
@@ -839,6 +883,7 @@ internal sealed class MonitorForm : Form
             200 => "OK",
             204 => "No Content",
             400 => "Bad Request",
+            401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
             413 => "Payload Too Large",
@@ -857,7 +902,7 @@ internal sealed class MonitorForm : Form
             headers.Append($"Access-Control-Allow-Origin: {origin}\r\n")
                 .Append("Vary: Origin\r\n")
                 .Append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")
-                .Append("Access-Control-Allow-Headers: Content-Type\r\n")
+                .Append("Access-Control-Allow-Headers: Authorization, Content-Type\r\n")
                 .Append("Access-Control-Allow-Private-Network: true\r\n");
         }
         headers.Append("\r\n");

@@ -174,13 +174,18 @@ export async function checkCompanionBridge(
     explanation,
     lastCheckedAt: checkedAt.toISOString(),
     mandatory: true,
-    remediation: 'Install and register the Windows Companion, open it, then retry. If it is installed, check its local bridge and Windows radio permissions.',
+    remediation: 'Use HTTPS (or localhost during development), install and register the institution-provided Windows Companion if needed, open it, grant ExamGuard local-network access when Chrome asks, then retry this check. If permission was denied, allow Local network access in the browser site settings.',
   });
+  if (typeof window !== 'undefined' && window.isSecureContext === false) {
+    return unavailable('The Companion bridge requires a secure context. Open ExamGuard over HTTPS or localhost.');
+  }
   try {
     const response = await fetchImpl('http://127.0.0.1:43117/health', {
+      headers: { Authorization: `Bearer ${getCompanionBridgeToken()}` },
       cache: 'no-store',
       signal: AbortSignal.timeout(1500),
     });
+    if (response.status === 401) return unavailable('The local Companion bridge rejected its browser session. Retry after opening the Companion.');
     if (!response.ok) return unavailable('The local Companion health endpoint returned an error.');
     const health = await response.json() as { status?: unknown };
     if (health.status !== 'ready') return unavailable('The Companion is installed but its local bridge is not ready.');
@@ -193,6 +198,37 @@ export async function checkCompanionBridge(
       remediation: 'No action needed.',
     };
   } catch {
-    return unavailable('The Windows Companion is not reachable on this device.');
+    return unavailable('The Windows Companion is not reachable. Chrome may be waiting for Local network access permission; allow it and click Check Companion again.');
   }
+}
+
+let memoryCompanionBridgeToken: string | null = null;
+const COMPANION_BRIDGE_TOKEN_KEY = 'examguard:companion-bridge-token';
+
+export function getCompanionBridgeToken(): string {
+  if (memoryCompanionBridgeToken) return memoryCompanionBridgeToken;
+  try {
+    const stored = window.sessionStorage.getItem(COMPANION_BRIDGE_TOKEN_KEY);
+    if (stored && stored.length >= 32) {
+      memoryCompanionBridgeToken = stored;
+      return stored;
+    }
+  } catch {
+    // Storage may be disabled; keep the per-tab token in memory instead.
+  }
+  const cryptoApi = globalThis.crypto;
+  if (!cryptoApi?.getRandomValues) throw new Error('Secure browser randomness is required to connect the Windows Companion.');
+  const bytes = cryptoApi.getRandomValues(new Uint8Array(32));
+  const token = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+  memoryCompanionBridgeToken = token;
+  try {
+    window.sessionStorage.setItem(COMPANION_BRIDGE_TOKEN_KEY, token);
+  } catch {
+    // Keep using the in-memory token for this page session.
+  }
+  return token;
+}
+
+export function companionBridgeAuthorization(): Record<string, string> {
+  return { Authorization: `Bearer ${getCompanionBridgeToken()}` };
 }

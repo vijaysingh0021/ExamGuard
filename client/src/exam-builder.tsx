@@ -3,17 +3,12 @@ import axios from "axios";
 import { api } from "./lib/api";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { CopyableId } from "./components/ui";
+import { QuestionTypeRenderer, type ExamQuestionType } from "./question-renderer";
 
 type Session = { organization: { id: string } };
 type Question = {
   id?: string;
-  type:
-    | "mcq"
-    | "multiple_select"
-    | "true_false"
-    | "short_answer"
-    | "descriptive"
-    | "coding";
+  type: ExamQuestionType;
   prompt: string;
   options: Array<{ id: string; text: string }>;
   correctAnswer?: unknown;
@@ -842,66 +837,22 @@ export function ExamBuilder({ session }: { session: Session }) {
                   onChange={(e) => update(i, { prompt: e.target.value })}
                 />
               </label>
-              {(["mcq", "multiple_select", "true_false"].includes(q.type) || q.type === "coding") && (
-                <div className="mt-3 space-y-2">
-                  {["mcq", "multiple_select", "true_false"].includes(q.type) && <>
-                  {q.options.map((o, n) => (
-                    <label className="flex gap-2 text-sm" key={o.id}>
-                      <input
-                        type={
-                          q.type === "multiple_select" ? "checkbox" : "radio"
-                        }
-                        name={`answer-${i}`}
-                        checked={
-                          q.type === "multiple_select"
-                            ? Array.isArray(q.correctAnswer) &&
-                              q.correctAnswer.includes(o.id)
-                            : q.correctAnswer === o.id
-                        }
-                        onChange={(event) => {
-                          if (q.type !== "multiple_select")
-                            return update(i, { correctAnswer: o.id });
-                          const selected = Array.isArray(q.correctAnswer)
-                            ? q.correctAnswer
-                            : [];
-                          update(i, {
-                            correctAnswer: event.target.checked
-                              ? [...selected, o.id]
-                              : selected.filter((answer) => answer !== o.id),
-                          });
-                        }}
-                      />
-                      <input
-                        className="input"
-                        value={o.text}
-                        onChange={(e) =>
-                          update(i, {
-                            options: q.options.map((v, j) =>
-                              j === n ? { ...v, text: e.target.value } : v,
-                            ),
-                          })
-                        }
-                      />
-                    </label>
-                  ))}
-                  {q.type !== "true_false" && (
-                    <button
-                      onClick={() =>
-                        update(i, {
-                          options: [
-                            ...q.options,
-                            { id: crypto.randomUUID(), text: "" },
-                          ],
-                        })
-                      }
-                      className="text-sm text-blue-700"
-                    >
-                      Add option
-                    </button>
-                  )}
-                  </>}
-                  {q.type === "coding" && (
-                    <div className="mt-4 rounded-2xl border border-blue-100 bg-blue-50/50 p-4">
+              {q.type !== "coding" && (
+                <div className="mt-3">
+                  <QuestionTypeRenderer
+                    mode="author"
+                    type={q.type}
+                    groupId={q.id ?? `draft-${i}`}
+                    options={q.options}
+                    correctAnswer={q.correctAnswer}
+                    label={`Question ${i + 1}`}
+                    onCorrectAnswerChange={correctAnswer => update(i, { correctAnswer })}
+                    onOptionsChange={options => update(i, { options })}
+                  />
+                </div>
+              )}
+              {q.type === "coding" && (
+                <div className="mt-3 rounded-2xl border border-blue-100 bg-blue-50/50 p-4">
                       <div className="mb-4 flex items-start justify-between gap-3">
                         <div><h4 className="font-semibold text-slate-900">Coding problem</h4><p className="mt-1 text-xs leading-5 text-slate-500">Candidates will solve this in the secure coding workspace. Add clear input, output, and constraints.</p></div>
                         <span className="rounded-full bg-blue-100 px-2.5 py-1 text-[11px] font-semibold text-blue-700">Code runner</span>
@@ -948,8 +899,6 @@ export function ExamBuilder({ session }: { session: Session }) {
                         <div className="flex items-center justify-between gap-3"><div><h5 className="text-sm font-semibold">Test cases</h5><p className="mt-1 text-xs text-slate-500">Sample cases are visible to candidates; private cases are used for validation.</p></div><button type="button" className="text-sm font-semibold text-blue-700" onClick={() => update(i, { codingTestCases: [...(q.codingTestCases ?? []), { input: "", expectedOutput: "", visibility: "private", position: q.codingTestCases?.length ?? 0 }] })}>Add test case</button></div>
                         <div className="mt-3 space-y-3">{(q.codingTestCases ?? []).map((testCase, testIndex) => <div key={testIndex} className="grid gap-2 rounded-xl border border-blue-100 bg-white p-3 sm:grid-cols-[1fr_1fr_auto]"><label className="text-xs font-semibold text-slate-600">Input<textarea className="input mt-1 min-h-16 text-sm font-normal" value={testCase.input} onChange={(e) => update(i, { codingTestCases: q.codingTestCases?.map((item, index) => index === testIndex ? { ...item, input: e.target.value } : item) })} /></label><label className="text-xs font-semibold text-slate-600">Expected output<textarea className="input mt-1 min-h-16 text-sm font-normal" value={testCase.expectedOutput} onChange={(e) => update(i, { codingTestCases: q.codingTestCases?.map((item, index) => index === testIndex ? { ...item, expectedOutput: e.target.value } : item) })} /></label><div className="flex items-end gap-2 sm:flex-col sm:items-stretch"><select className="input text-sm" value={testCase.visibility} onChange={(e) => update(i, { codingTestCases: q.codingTestCases?.map((item, index) => index === testIndex ? { ...item, visibility: e.target.value as "sample" | "private" } : item) })}><option value="sample">Sample</option><option value="private">Private</option></select>{(q.codingTestCases?.length ?? 0) > 1 && <button type="button" className="text-xs font-semibold text-red-600" onClick={() => update(i, { codingTestCases: q.codingTestCases?.filter((_, index) => index !== testIndex).map((item, index) => ({ ...item, position: index })) })}>Remove</button>}</div></div>)}</div>
                       </div>
-                    </div>
-                  )}
                 </div>
               )}
               <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -1015,6 +964,25 @@ export function ExamBuilder({ session }: { session: Session }) {
               </dd>
             </div>
           </dl>
+          <section className="mt-5 space-y-3" aria-label="Question preview">
+            <h4 className="font-semibold text-slate-800">Question preview</h4>
+            {questions.map((question, index) => (
+              <article key={question.id ?? `preview-${index}`} className="rounded-xl border border-slate-200 bg-white p-4">
+                <p className="font-medium">{index + 1}. {question.prompt || "Question prompt"}</p>
+                <QuestionTypeRenderer
+                  mode="preview"
+                  type={question.type}
+                  groupId={`preview-${question.id ?? index}`}
+                  options={question.options}
+                  label={`Preview answer ${index + 1}`}
+                />
+                {question.type === "coding" && <p className="mt-2 text-xs text-slate-500">
+                  {question.coding?.languageIds.length ?? 0} supported language(s) · {question.codingTestCases?.length ?? 0} test case(s)
+                </p>}
+                <p className="mt-2 text-xs text-slate-500">{question.marks} marks · {question.negativeMarks} negative marks</p>
+              </article>
+            ))}
+          </section>
           {examId && <div className="mt-5 rounded-xl border border-blue-100 bg-blue-50/50 p-4">
             <h4 className="text-sm font-semibold text-slate-800">Save this draft as a reusable template</h4>
             <p className="mt-1 text-xs text-slate-600">The template stores exam settings, answer keys, and coding test cases for reuse by authorized staff in this institution.</p>

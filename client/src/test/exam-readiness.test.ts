@@ -122,4 +122,25 @@ describe("examination media readiness", () => {
     const response = await checkCompanionBridge(async () => Response.json({ status: "ready" }));
     expect(response.status).toBe("ready");
   });
+
+  it("authenticates health checks with a random local browser session token", async () => {
+    let requestHeaders: HeadersInit | undefined;
+    const response = await checkCompanionBridge(async (_input, init) => {
+      requestHeaders = init?.headers;
+      return Response.json({ status: "ready" });
+    });
+    expect(response.status).toBe("ready");
+    const authorization = new Headers(requestHeaders).get("Authorization");
+    expect(authorization).toMatch(/^Bearer [a-f0-9]{64}$/);
+  });
+
+  it("reports rejected local bridge authorization and permission failures for user recovery", async () => {
+    const unauthorized = await checkCompanionBridge(async () => new Response(null, { status: 401 }));
+    expect(unauthorized.status).toBe("unavailable");
+    expect(unauthorized.explanation).toMatch(/rejected its browser session/i);
+    const denied = await checkCompanionBridge(async () => { throw new TypeError("Failed to fetch"); });
+    expect(denied.status).toBe("unavailable");
+    expect(denied.explanation).toMatch(/Local network access permission/i);
+    expect(denied.remediation).toMatch(/site settings/i);
+  });
 });

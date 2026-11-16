@@ -550,8 +550,18 @@ def resize_for_inference(image):
     return resized, original_width, original_height
 
 
+def frame_quality_statistics(image):
+    channel_means, channel_stddevs = cv2.meanStdDev(image)
+    means = channel_means[:, 0]
+    standard_deviations = channel_stddevs[:, 0]
+    mean = float(np.mean(means))
+    variance = float(np.mean(standard_deviations ** 2 + (means - mean) ** 2))
+    return mean, variance ** 0.5
+
+
 def _analyze_content(content: bytes, content_type: str | None):
     started_at = time.perf_counter()
+    inference_stages_ms = {}
     if content_type and content_type not in SUPPORTED_IMAGE_TYPES:
         raise HTTPException(415, "Upload an image file")
 
@@ -564,6 +574,7 @@ def _analyze_content(content: bytes, content_type: str | None):
     if not image_signature_matches(content, content_type):
         raise HTTPException(415, "Image content does not match a supported JPEG, PNG, or WebP format")
 
+    stage_started_at = time.perf_counter()
     try:
         image = cv2.imdecode(
             np.frombuffer(content, dtype=np.uint8),
@@ -573,13 +584,16 @@ def _analyze_content(content: bytes, content_type: str | None):
         logger.info("Rejected an image that OpenCV could not decode (%s)", type(exc).__name__)
         image = None
 
+    inference_stages_ms["image_decode_ms"] = (time.perf_counter() - stage_started_at) * 1000
     if image is None or image.ndim != 3 or image.shape[2] != 3:
         raise HTTPException(400, "Invalid image")
     height, width = image.shape[:2]
     if height < 32 or width < 32 or height * width > MAX_IMAGE_PIXELS:
         raise HTTPException(422, "Image dimensions must be at least 32x32 and no larger than 40 megapixels")
 
+    stage_started_at = time.perf_counter()
     image, original_width, original_height = resize_for_inference(image)
+    inference_stages_ms["resize_ms"] = (time.perf_counter() - stage_started_at) * 1000
     height, width = image.shape[:2]
     scale_x = original_width / width
     scale_y = original_height / height
@@ -587,11 +601,13 @@ def _analyze_content(content: bytes, content_type: str | None):
     # Detect and count faces.
     if face_detector is None:
         raise HTTPException(503, "Face-detection model is unavailable")
+    stage_started_at = time.perf_counter()
     try:
         face_boxes = detect_face_boxes_with_tiles(image, face_detector)
     except Exception as exc:
         logger.error("Face-detection inference failed (%s)", type(exc).__name__)
         raise HTTPException(503, "Face-detection inference is unavailable") from exc
+    inference_stages_ms["face_detection_ms"] = (time.perf_counter() - stage_started_at) * 1000
 
     face_count = len(face_boxes)
     multiple_faces = face_count > 1
@@ -612,6 +628,7 @@ def _analyze_content(content: bytes, content_type: str | None):
     head_pose = None
     looking_away = "unavailable"
     face_pose_estimates = []
+    stage_started_at = time.perf_counter()
     if face_count:
         if face_mesh is None:
             raise HTTPException(503, "Head-pose model is unavailable")
@@ -639,8 +656,10 @@ def _analyze_content(content: bytes, content_type: str | None):
 
         if face_count == 1:
             looking_away = classify_looking_away(head_pose)
+    inference_stages_ms["head_pose_ms"] = (time.perf_counter() - stage_started_at) * 1000
 
     # Run YOLO phone detection if a compatible model is configured.
+    stage_started_at = time.perf_counter()
     phone_detection = "unavailable"
     phone_confidence = None
     phone_boxes = []
@@ -712,8 +731,10 @@ def _analyze_content(content: bytes, content_type: str | None):
             if phone_scores:
                 phone_confidence = round(max(phone_scores), 3)
 
-    frame_mean = float(np.mean(image))
-    frame_stddev = float(np.std(image))
+    inference_stages_ms["phone_detection_ms"] = (time.perf_counter() - stage_started_at) * 1000
+
+    stage_started_at = time.perf_counter()
+    frame_mean, frame_stddev = frame_quality_statistics(image)
     obstruction = frame_stddev < 8 or frame_mean < 8
     camera_health = "obstructed" if obstruction else "ok"
     readability = assess_visual_readability(
@@ -724,6 +745,9 @@ def _analyze_content(content: bytes, content_type: str | None):
         (original_height, original_width, 3),
         camera_health,
     )
+    inference_stages_ms["postprocessing_ms"] = (time.perf_counter() - stage_started_at) * 1000
+    total_inference_ms = (time.perf_counter() - started_at) * 1000
+    inference_stages_ms["total_ms"] = total_inference_ms
     return {
         "face_presence": face_count > 0,
         "face_count": face_count,
@@ -742,7 +766,11 @@ def _analyze_content(content: bytes, content_type: str | None):
             "mean_luminance": round(frame_mean, 2),
             "luminance_stddev": round(frame_stddev, 2)
         },
-        "inference_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        "inference_ms": round(total_inference_ms, 2),
+        "inference_stages_ms": {
+            stage: round(duration, 2)
+            for stage, duration in inference_stages_ms.items()
+        },
         "service_version": "examguard-ai-local-v1",
         "phone_model": "configured" if phone_model_ready else "unavailable",
         "disclosure": (

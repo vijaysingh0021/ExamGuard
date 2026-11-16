@@ -19,9 +19,9 @@ test('audit query: dates validated, action prefix filter, org scoped', () => {
   const w = auditWhere('o', { action: 'grade.', from: new Date(0) }) as any; assert.equal(w.organizationId, 'o'); assert.deepEqual(w.action, { startsWith: 'grade.' }); assert.ok(w.createdAt.gte);
 });
 test('uuid check', () => { assert.equal(isUuidValue('11111111-1111-4111-8111-111111111111'), true); assert.equal(isUuidValue('abc'), false); assert.equal(isUuidValue(undefined), false); });
-test('review projection: answer keys only for objective questions; coding never exposes test data', () => {
+test('review projection: objective keys and descriptive marking guidance are available to staff; coding never exposes test data', () => {
   const base = { id: 'q', prompt: 'p', marks: 2, negativeMarks: 0, position: 1, options: ['a', 'b'] };
   const mcq = projectReviewQuestion({ ...base, type: 'mcq', correctAnswer: 'a' }, 'b'); assert.equal(mcq.correctAnswer, 'a'); assert.equal(mcq.objective, true); assert.equal(mcq.answer, 'b');
-  const essay = projectReviewQuestion({ ...base, type: 'descriptive', correctAnswer: 'model answer' }, undefined); assert.equal(essay.correctAnswer, null); assert.equal(essay.answer, null);
-  const code = projectReviewQuestion({ ...base, type: 'coding', correctAnswer: { hidden: 'x' } }, 'print(1)'); assert.equal(code.correctAnswer, null); assert.equal(code.answer, 'print(1)');
+  const essay = projectReviewQuestion({ ...base, type: 'descriptive', correctAnswer: 'model answer' }, undefined); assert.equal(essay.correctAnswer, null); assert.equal(essay.gradingGuide, 'model answer'); assert.equal(essay.answer, null);
+  const code = projectReviewQuestion({ ...base, type: 'coding', correctAnswer: { hidden: 'x' } }, 'print(1)'); assert.equal(code.correctAnswer, null); assert.equal(code.gradingGuide, null); assert.equal(code.answer, 'print(1)');
 });

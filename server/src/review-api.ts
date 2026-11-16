@@ -47,5 +47,17 @@ export const auditWhere = (organizationId: string, f: { action?: string; from?: 
 export const OBJECTIVE_TYPES = ['mcq', 'multiple_select', 'true_false', 'short_answer'];
 export function projectReviewQuestion(q: { id: string; type: string; prompt: string; options?: unknown; correctAnswer?: unknown; marks: number; negativeMarks: number; position: number | null }, answer: unknown) {
   const objective = OBJECTIVE_TYPES.includes(q.type);
-  return { id: q.id, type: q.type, prompt: q.prompt, options: q.options ?? null, marks: q.marks, negativeMarks: q.negativeMarks, position: q.position, objective, correctAnswer: objective ? q.correctAnswer ?? null : null, answer: answer ?? null };
+  return {
+    id: q.id,
+    type: q.type,
+    prompt: q.prompt,
+    options: q.options ?? null,
+    marks: q.marks,
+    negativeMarks: q.negativeMarks,
+    position: q.position,
+    objective,
+    correctAnswer: objective ? q.correctAnswer ?? null : null,
+    gradingGuide: q.type === 'descriptive' ? q.correctAnswer ?? null : null,
+    answer: answer ?? null,
+  };
 }
