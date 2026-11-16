@@ -281,10 +281,7 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
         'X-Content-Type-Options': 'nosniff',
         'Content-Disposition': 'inline',
       };
-      if (
-        req.path.startsWith('/api/private-evidence/') &&
-        req.get('origin') === clientOrigin
-      ) {
+      if (req.path.startsWith('/api/private-evidence/')) {
         headers['Cross-Origin-Resource-Policy'] = 'cross-origin';
       }
       res.set(headers);

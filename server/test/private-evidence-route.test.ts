@@ -84,7 +84,12 @@ test('private evidence permits trusted cross-origin image retrieval and rejects 
     });
     assert.equal(untrustedOrigin.status, 200);
     assert.equal(untrustedOrigin.headers.get('access-control-allow-origin'), trustedOrigin);
-    assert.equal(untrustedOrigin.headers.get('cross-origin-resource-policy'), 'same-site');
+    assert.notEqual(untrustedOrigin.headers.get('access-control-allow-origin'), 'https://untrusted.example');
+    assert.equal(untrustedOrigin.headers.get('cross-origin-resource-policy'), 'cross-origin');
+
+    const noOrigin = await fetch(`${baseUrl}/api/private-evidence/${makeToken(objectKey)}`);
+    assert.equal(noOrigin.status, 200);
+    assert.equal(noOrigin.headers.get('cross-origin-resource-policy'), 'cross-origin');
 
     const invalidToken = await fetch(`${baseUrl}/api/private-evidence/not-a-valid-token`, {
       headers: { Origin: trustedOrigin },
@@ -103,7 +108,13 @@ test('private evidence permits trusted cross-origin image retrieval and rejects 
       headers: { Origin: trustedOrigin },
     });
     assert.equal(unassociated.status, 404);
-    assert.deepEqual(storageReads, [objectKey, objectKey]);
+    assert.deepEqual(storageReads, [objectKey, objectKey, objectKey]);
+
+    const localEvidence = await fetch(`${baseUrl}/api/local-evidence/${makeToken(objectKey)}`, {
+      headers: { Origin: trustedOrigin },
+    });
+    assert.equal(localEvidence.status, 200);
+    assert.equal(localEvidence.headers.get('cross-origin-resource-policy'), 'same-site');
 
     await stopServer(server);
     server = undefined;
@@ -117,7 +128,7 @@ test('private evidence permits trusted cross-origin image retrieval and rejects 
     assert.equal(fallback.status, 200);
     assert.equal(fallback.headers.get('access-control-allow-origin'), 'http://localhost:5173');
     assert.equal(fallback.headers.get('cross-origin-resource-policy'), 'cross-origin');
-    assert.deepEqual(storageReads, [objectKey, objectKey, objectKey]);
+    assert.deepEqual(storageReads, [objectKey, objectKey, objectKey, objectKey, objectKey]);
   } finally {
     try {
       if (server?.listening) await stopServer(server);
