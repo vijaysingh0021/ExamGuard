@@ -226,10 +226,11 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
   const codeRunner = judge0AdapterFromEnv();
   const judge0LanguageIds = judge0LanguageIdsFromEnv();
   const storage = storageImpl ?? realStorage;
+  const clientOrigin = new URL(process.env.CLIENT_URL?.trim() || 'http://localhost:5173').origin;
 
   app.disable('x-powered-by');
   app.use(securityHeaders);
-  app.use(cors({ origin: process.env.CLIENT_URL ?? 'http://localhost:5173', exposedHeaders: ['X-Page', 'X-Page-Size', 'X-Total-Count', 'X-Total-Pages', 'Date'] }));
+  app.use(cors({ origin: clientOrigin, exposedHeaders: ['X-Page', 'X-Page-Size', 'X-Total-Count', 'X-Total-Pages', 'Date'] }));
   app.set('storage', storage);
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -272,7 +273,21 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
       const bytes = await storage.getPrivateDocument(key);
       const metadata = object ? null : await storage.privateDocumentMetadata?.(key);
       if (!bytes || (object && bytes.length !== object.sizeBytes) || (metadata?.contentLength !== undefined && bytes.length !== metadata.contentLength)) return res.status(404).end();
-      res.set({ 'Content-Type': object?.mimeType ?? metadata?.contentType ?? 'application/octet-stream', 'Content-Length': String(bytes.length), 'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Content-Disposition': 'inline' });
+      const headers: Record<string, string> = {
+        'Content-Type': object?.mimeType ?? metadata?.contentType ?? 'application/octet-stream',
+        'Content-Length': String(bytes.length),
+        'Cache-Control': 'private, no-store',
+        'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Disposition': 'inline',
+      };
+      if (
+        req.path.startsWith('/api/private-evidence/') &&
+        req.get('origin') === clientOrigin
+      ) {
+        headers['Cross-Origin-Resource-Policy'] = 'cross-origin';
+      }
+      res.set(headers);
       return res.status(200).send(bytes);
     } catch (error) { next(error); }
   });
