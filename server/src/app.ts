@@ -1809,7 +1809,7 @@ app.post('/api/student/organizations/:organizationId/exams/:examId/start', authe
     }];
   }) : [];
   const answers = companionReady ? await prisma.attemptAnswer.findMany({ where: { attemptId: attempt.id } }) : [];
-  res.json({ attempt: { id: attempt.id, candidateId: candidate.id, examId: exam.id, deadlineAt: attempt.deadlineAt, status: attempt.status }, exam: { title: exam.title, instructions: exam.instructions, isPractice: exam.isPractice, fullscreenRequired: exam.policyFullscreenRequired }, questions, answers, companionRequired: !companionReady });
+  res.json({ attempt: { id: attempt.id, organizationId: attempt.organizationId, candidateId: candidate.id, examId: exam.id, deadlineAt: attempt.deadlineAt, status: attempt.status }, exam: { title: exam.title, instructions: exam.instructions, isPractice: exam.isPractice, fullscreenRequired: exam.policyFullscreenRequired }, questions, answers, companionRequired: !companionReady });
 } catch (error) { next(error); } });
 app.put('/api/student/attempts/:attemptId/answers/:questionId', authenticate, async (req: AuthRequest, res, next) => { try {
   const attemptId = String(req.params.attemptId);
@@ -2081,6 +2081,21 @@ app.post('/api/student/attempts/:attemptId/ai-frame', authenticate, aiFrameLimit
   let analysis: z.infer<typeof aiFrameSchema>;
   try { analysis = aiFrameSchema.parse(await inferenceResponse.json()); }
   catch { return res.status(502).json({ error: 'The AI service returned an invalid analysis response.' }); }
+  const activeAttemptAfterInference = await prisma.examAttempt.findFirst({
+    where: {
+      id: attempt.id,
+      organizationId: attempt.organizationId,
+      examId: attempt.examId,
+      candidateId: attempt.candidateId,
+      userId: req.auth!.userId,
+      status: 'in_progress',
+      deadlineAt: { gt: new Date() },
+      monitoringConsentAt: { not: null },
+      monitoringConsentVersion: 'examguard-monitoring-v2',
+    },
+    select: { id: true },
+  });
+  if (!activeAttemptAfterInference) return res.status(409).json({ error: 'The attempt closed before AI analysis could be recorded.' });
   const visuallyReadable = analysis.readability_assessment?.status === 'potentially_readable';
   const nearbyRadioResult = visuallyReadable ? await withAdvertisedNameCompatibility(includeAdvertisedName =>
     prisma.radioObservation.findMany({
@@ -2226,45 +2241,89 @@ app.post('/api/student/attempts/:attemptId/ai-context-frame', authenticate, aiFr
   if (contextInput.contextType === 'after' && (capturedAt.getTime() < parentEvent.occurredAt.getTime() || capturedAt.getTime() > parentEvent.occurredAt.getTime() + 5_000)) return res.status(400).json({ error: 'An after-context frame must follow the incident and remain within five seconds' });
   const storage = req.app.get('storage') as StorageInterface;
   if (!storage.storageConfigured()) return res.status(503).json({ error: 'Private evidence storage is not configured' });
-  const used = (await prisma.evidenceObject.aggregate({ where: { organizationId: attempt.organizationId }, _sum: { sizeBytes: true } }))._sum.sizeBytes ?? 0;
-  const quota = evaluateQuota({ usedBytes: used, incomingBytes: req.file.size, quotaBytes: parseQuotaBytes(process.env.EVIDENCE_ORG_QUOTA_MB) });
-  if (!quota.allowed) return res.status(507).json({ error: 'Private evidence storage is full for this organization' });
-  const key = `organizations/${attempt.organizationId}/attempts/${attempt.id}/evidence/${crypto.randomUUID()}`;
-  await storage.putPrivateDocument(key, req.file.buffer, req.file.mimetype);
-  await prisma.evidenceObject.create({ data: { organizationId: attempt.organizationId, attemptId: attempt.id, objectKey: key, sizeBytes: req.file.size, mimeType: req.file.mimetype } });
-  const contextEvent = await prisma.proctoringEvent.create({
-    data: {
-      organizationId: attempt.organizationId,
-      examId: attempt.examId,
-      candidateId: attempt.candidateId,
-      attemptId: attempt.id,
-      type: 'ai_context_frame',
-      occurredAt: capturedAt,
-      source: 'ai_service',
-      evidenceKey: key,
-      fingerprint: fingerprintFor(attempt.organizationId, attempt.candidateId, `ai_context_frame:${parentEvent.id}:${contextInput.contextType}:${contextInput.sequence}`, capturedAt.getTime()),
-      policyAction: 'recorded',
-      details: {
-        parentEventId: parentEvent.id,
-        contextType: contextInput.contextType,
-        sequence: contextInput.sequence,
-        capturedAt: capturedAt.toISOString(),
-        temporalConfirmation: 'linked_to_confirmed_incident',
-      } as Prisma.InputJsonValue,
-    },
+  const fingerprint = fingerprintFor(
+    attempt.organizationId,
+    attempt.candidateId,
+    `ai_context_frame:${parentEvent.id}:${contextInput.contextType}:${contextInput.sequence}`,
+    0,
+  );
+  const result = await prisma.$transaction(async tx => {
+    await tx.$queryRaw<Array<{ lock: string }>>`SELECT pg_advisory_xact_lock(hashtext(${parentEvent.id})::bigint)::text AS lock`;
+    const duplicate = await tx.proctoringEvent.findFirst({
+      where: { organizationId: attempt.organizationId, attemptId: attempt.id, fingerprint },
+      select: { id: true, evidenceKey: true },
+    });
+    if (duplicate) return { kind: 'duplicate' as const, eventId: duplicate.id, evidenceKey: duplicate.evidenceKey };
+
+    const existingFrames = await tx.proctoringEvent.findMany({
+      where: { organizationId: attempt.organizationId, attemptId: attempt.id, details: { path: ['parentEventId'], equals: parentEvent.id } },
+      orderBy: [{ occurredAt: 'asc' }, { id: 'asc' }],
+      select: { occurredAt: true, details: true },
+    });
+    const framesOfType = existingFrames.filter(frame =>
+      frame.details !== null &&
+      typeof frame.details === 'object' &&
+      !Array.isArray(frame.details) &&
+      frame.details.contextType === contextInput.contextType,
+    );
+    if (contextInput.contextType === 'after' && !existingFrames.some(frame =>
+      frame.details !== null &&
+      typeof frame.details === 'object' &&
+      !Array.isArray(frame.details) &&
+      frame.details.contextType === 'before',
+    )) return { kind: 'before_required' as const };
+    if (contextInput.sequence !== framesOfType.length) return { kind: 'out_of_order' as const };
+    const previousFrame = framesOfType.at(-1);
+    if (previousFrame && capturedAt.getTime() <= previousFrame.occurredAt.getTime()) return { kind: 'out_of_order' as const };
+
+    const used = (await tx.evidenceObject.aggregate({ where: { organizationId: attempt.organizationId }, _sum: { sizeBytes: true } }))._sum.sizeBytes ?? 0;
+    const quota = evaluateQuota({ usedBytes: used, incomingBytes: req.file!.size, quotaBytes: parseQuotaBytes(process.env.EVIDENCE_ORG_QUOTA_MB) });
+    if (!quota.allowed) return { kind: 'quota_full' as const };
+    const key = `organizations/${attempt.organizationId}/attempts/${attempt.id}/evidence/${crypto.randomUUID()}`;
+    await storage.putPrivateDocument(key, req.file!.buffer, req.file!.mimetype);
+    await tx.evidenceObject.create({ data: { organizationId: attempt.organizationId, attemptId: attempt.id, objectKey: key, sizeBytes: req.file!.size, mimeType: req.file!.mimetype } });
+    const contextEvent = await tx.proctoringEvent.create({
+      data: {
+        organizationId: attempt.organizationId,
+        examId: attempt.examId,
+        candidateId: attempt.candidateId,
+        attemptId: attempt.id,
+        type: 'ai_context_frame',
+        occurredAt: capturedAt,
+        source: 'ai_service',
+        evidenceKey: key,
+        fingerprint,
+        policyAction: 'recorded',
+        details: {
+          parentEventId: parentEvent.id,
+          contextType: contextInput.contextType,
+          sequence: contextInput.sequence,
+          capturedAt: capturedAt.toISOString(),
+          temporalConfirmation: 'linked_to_confirmed_incident',
+        } as Prisma.InputJsonValue,
+      },
+    });
+    await tx.incidentEvent.createMany({ data: parentEvent.incidents.map(({ incidentId }) => ({ incidentId, eventId: contextEvent.id })), skipDuplicates: true });
+    return { kind: 'created' as const, eventId: contextEvent.id, evidenceKey: key };
   });
-  await prisma.incidentEvent.createMany({ data: parentEvent.incidents.map(({ incidentId }) => ({ incidentId, eventId: contextEvent.id })), skipDuplicates: true });
-  await audit(attempt.organizationId, req.auth!.userId, 'evidence.ai_context_captured', 'ProctoringEvent', contextEvent.id, { parentEventId: parentEvent.id, contextType: contextInput.contextType, sequence: contextInput.sequence, capturedAt: capturedAt.toISOString() });
-  res.status(201).json({ evidenceKey: key, eventId: contextEvent.id });
+  if (result.kind === 'before_required') return res.status(409).json({ error: 'At least one valid before-context frame is required before after-context frames.' });
+  if (result.kind === 'out_of_order') return res.status(409).json({ error: 'Context frames must be uploaded once and in sequence.' });
+  if (result.kind === 'quota_full') return res.status(507).json({ error: 'Private evidence storage is full for this organization' });
+  if (result.kind === 'duplicate') return res.status(200).json({ evidenceKey: result.evidenceKey, eventId: result.eventId, duplicate: true });
+  await audit(attempt.organizationId, req.auth!.userId, 'evidence.ai_context_captured', 'ProctoringEvent', result.eventId, { parentEventId: parentEvent.id, contextType: contextInput.contextType, sequence: contextInput.sequence, capturedAt: capturedAt.toISOString() });
+  res.status(201).json({ evidenceKey: result.evidenceKey, eventId: result.eventId });
 } catch (error) { next(error); } });
 
 app.post('/api/organizations/:organizationId/proctoring/events', authenticate, async (req: AuthRequest, res, next) => { try {
   const data = proctorEventInput.parse(req.body);
   const organizationId = String(req.params.organizationId);
-  const candidate = await prisma.candidate.findFirst({ where: { id: data.candidateId, organizationId, userId: req.auth!.userId } });
-  const attempt = await prisma.examAttempt.findFirst({ where: { id: data.attemptId, organizationId, candidateId: data.candidateId, examId: data.examId, userId: req.auth!.userId, status: 'in_progress' } });
+  const now = new Date();
+  const attempt = await prisma.examAttempt.findFirst({ where: { id: data.attemptId, organizationId, userId: req.auth!.userId, status: 'in_progress', deadlineAt: { gt: now } } });
+  const candidate = attempt && attempt.candidateId === data.candidateId
+    ? await prisma.candidate.findFirst({ where: { id: attempt.candidateId, organizationId: attempt.organizationId, userId: req.auth!.userId } })
+    : null;
   const exam = await prisma.exam.findFirst({ where: { id: data.examId, organizationId } });
-  if (!candidate || !attempt || !exam) return res.status(403).json({ error: 'An active authorized attempt is required' });
+  if (!candidate || !attempt || attempt.examId !== data.examId || !exam) return res.status(403).json({ error: 'An active authorized attempt is required' });
   if (data.evidenceKey && !data.evidenceKey.startsWith(`organizations/${organizationId}/attempts/${attempt.id}/evidence/`)) return res.status(403).json({ error: 'Evidence does not belong to this active attempt' });
   const policy = policyOf(exam);
   const occurredAt = new Date();

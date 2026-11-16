@@ -98,7 +98,8 @@ import { CompanionStatus } from "./companion-status";
 import { ExamTimer, QuestionPalette, SubmitReviewDialog, SyncIndicator } from "./exam-ui";
 import { AnswerSync, pendingStore, type SyncSnapshot } from "./lib/answer-sync";
 import { createSubmitter } from "./lib/submit-flow";
-import { clockOffsetMs, isAnswered, loadMarks, progress as examProgress, remainingMs, saveMarks } from "./lib/exam-state";
+import { clockOffsetMs, isAnswered, loadMarks, progress as examProgress, remainingMs, saveMarks, serverAlignedNow } from "./lib/exam-state";
+import { PendingWrites } from "./lib/pending-writes";
 import {
   browserCompatibility,
   cameraStreamHasLiveTrack,
@@ -1051,12 +1052,16 @@ function StudentExam({ session }: { session: Session }) {
   const [singleWindowMessage, setSingleWindowMessage] = useState("");
   const [lockAttemptId, setLockAttemptId] = useState<string | null>(null);
   const [codingRunner, setCodingRunner] = useState({ available: false, unavailableReason: "Checking the isolated code runner…", history: [] as Array<{ id: string; kind: "run" | "submit"; status: string; createdAt: string }> });
-  const pendingAttemptRef = useRef<{ examId: string; candidateId: string; attemptId: string } | null>(null);
+  const pendingAttemptRef = useRef<{ organizationId: string; examId: string; candidateId: string; attemptId: string } | null>(null);
+  const pendingProctorWrites = useRef(new PendingWrites());
+  const submissionInProgress = useRef(false);
   const lockWaiters = useRef(new Map<string, (acquired: boolean) => void>());
   const startingAttempt = useRef(false);
   const contextBuffer = useRef<Array<{ capturedAt: number; blob: Blob }>>([]);
   const contextUploadEvents = useRef(new Set<string>());
   const recentSignalEvidence = useRef<{ evidenceKey: string; capturedAt: number } | null>(null);
+  const serverNow = () => serverAlignedNow(Date.now(), clockOffset.current);
+  const trackProctoringWrite = (work: Promise<unknown>) => pendingProctorWrites.current.track(work);
   const codingPersistence = useMemo(() => ({
     available: Boolean(payload?.attempt?.id),
     save: async ({ questionId, sourceCode }: { questionId: string; languageId: string; sourceCode: string }) => {
@@ -1150,30 +1155,57 @@ function StudentExam({ session }: { session: Session }) {
     form.append("contextType", contextType);
     form.append("sequence", String(sequence));
     form.append("capturedAt", new Date(capturedAt).toISOString());
-    await api.post(`/api/student/attempts/${payload!.attempt.id}/ai-context-frame`, form, { timeout: 16_000 });
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await api.post(`/api/student/attempts/${payload!.attempt.id}/ai-context-frame`, form, { timeout: 16_000 });
+        return;
+      } catch (error) {
+        lastError = error;
+        const retryable = !axios.isAxiosError(error) || !error.response || error.response.status >= 500;
+        if (!retryable || attempt > 0) throw error;
+      }
+    }
+    throw lastError;
   };
   const captureIncidentContext = async (eventId: string, occurredAt: string) => {
     if (contextUploadEvents.current.has(eventId)) return;
     contextUploadEvents.current.add(eventId);
     const incidentAt = Date.parse(occurredAt);
-    const before = contextBuffer.current
-      .filter(frame => frame.capturedAt <= incidentAt && frame.capturedAt >= incidentAt - 5_000)
-      .slice(-5);
-    for (const [sequence, frame] of before.entries()) {
-      try { await uploadContextFrame(eventId, "before", sequence, frame.capturedAt, frame.blob); }
-      catch { setAttentionWarning("Some camera images from just before the review signal could not be saved."); break; }
-    }
     const afterFrames: Array<{ sequence: number; capturedAt: number; blob: Blob }> = [];
     for (let sequence = 0; sequence < 5; sequence += 1) {
       if (sequence > 0) await new Promise(resolve => window.setTimeout(resolve, 700));
       try {
         const blob = await captureFrameBlob();
         if (!blob) throw new Error("No camera frame was available.");
-        afterFrames.push({ sequence, capturedAt: Date.now(), blob });
+        const capturedAt = serverNow();
+        if (!Number.isFinite(incidentAt) || capturedAt < incidentAt || capturedAt > incidentAt + 5_000) {
+          setAttentionWarning("The incident context window expired before another camera frame could be saved.");
+          break;
+        }
+        afterFrames.push({ sequence, capturedAt, blob });
       } catch {
         setAttentionWarning("Some camera images around the review signal could not be captured.");
         break;
       }
+    }
+    const before = contextBuffer.current
+      .filter(frame => frame.capturedAt <= incidentAt && frame.capturedAt >= incidentAt - 5_000)
+      .slice(-5);
+    let savedBeforeFrames = 0;
+    for (const [sequence, frame] of before.entries()) {
+      try {
+        await uploadContextFrame(eventId, "before", sequence, frame.capturedAt, frame.blob);
+        savedBeforeFrames += 1;
+      } catch {
+        setAttentionWarning("Some camera images from just before the review signal could not be saved.");
+        break;
+      }
+    }
+    if (!savedBeforeFrames) {
+      contextUploadEvents.current.delete(eventId);
+      setAttentionWarning("A before-context camera frame was unavailable; after-context frames were not saved.");
+      return;
     }
     for (const frame of afterFrames) {
       try { await uploadContextFrame(eventId, "after", frame.sequence, frame.capturedAt, frame.blob); }
@@ -1186,7 +1218,7 @@ function StudentExam({ session }: { session: Session }) {
     return captureStreamFrame(stream, 1600, 0.65);
   };
   const captureEvidence = async () => {
-    const now = Date.now();
+    const now = serverNow();
     const recentFrame = [...contextBuffer.current].reverse().find((frame) => now - frame.capturedAt <= 5_000);
     const blob = recentFrame?.blob ?? await captureFrameBlob();
     if (!blob) throw new Error("No recent camera frame was available.");
@@ -1209,9 +1241,11 @@ function StudentExam({ session }: { session: Session }) {
       let data = response.data;
       const attemptId = data?.attempt?.id;
       if (!attemptId) throw new Error("The server did not return an active attempt. Retry or contact your exam organizer.");
+      if (typeof data.attempt.organizationId !== "string") throw new Error("The server did not return the attempt organization. Retry or contact your exam organizer.");
       const requiredFullscreen = data.exam?.fullscreenRequired !== false;
       setFullscreenRequired(requiredFullscreen);
       pendingAttemptRef.current = {
+        organizationId: data.attempt.organizationId,
         examId: data.attempt.examId,
         candidateId: data.attempt.candidateId,
         attemptId,
@@ -1234,9 +1268,11 @@ function StudentExam({ session }: { session: Session }) {
       response = await api.post(startUrl, startBody);
       data = response.data;
       if (data.companionRequired || !Array.isArray(data.questions)) throw new Error("The Windows Companion has not confirmed its first heartbeat yet. Retry the automatic connection.");
+      if (data.attempt.organizationId !== pendingAttemptRef.current?.organizationId) throw new Error("The attempt organization changed while starting. Retry or contact your exam organizer.");
       // Align the countdown with the server clock so a wrong device clock cannot add or remove time.
       clockOffset.current = clockOffsetMs(response.headers?.date as string | undefined, Date.now());
       pendingAttemptRef.current = {
+        organizationId: data.attempt.organizationId,
         examId: data.attempt.examId,
         candidateId: data.attempt.candidateId,
         attemptId: data.attempt.id,
@@ -1320,24 +1356,25 @@ function StudentExam({ session }: { session: Session }) {
       message: string,
       details: Record<string, unknown> = {},
     ) => {
-      const occurredAt = new Date();
+      if (submissionInProgress.current) return;
+      const occurredAt = new Date(serverNow());
       setAttentionWarning(message);
-      void (async () => {
+      void trackProctoringWrite((async () => {
         let evidenceKey: string | undefined;
         if (type !== "multiple_window_hint") {
           try {
             const previousEvidence = recentSignalEvidence.current;
-            evidenceKey = previousEvidence && Date.now() - previousEvidence.capturedAt <= 5_000
+            evidenceKey = previousEvidence && serverNow() - previousEvidence.capturedAt <= 5_000
               ? previousEvidence.evidenceKey
               : await captureEvidence();
-            recentSignalEvidence.current = { evidenceKey, capturedAt: Date.now() };
+            recentSignalEvidence.current = { evidenceKey, capturedAt: serverNow() };
           } catch (captureError) {
             const reason = captureError instanceof Error ? captureError.message : "The camera image could not be saved.";
             setAttentionWarning(`${message} Camera evidence was unavailable: ${reason} The event will still be recorded.`);
           }
         }
         try {
-          await api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+          await api.post(`/api/organizations/${payload.attempt.organizationId}/proctoring/events`, {
             examId: payload.attempt.examId,
             candidateId: payload.attempt.candidateId,
             attemptId: payload.attempt.id,
@@ -1353,7 +1390,7 @@ function StudentExam({ session }: { session: Session }) {
             : "The server could not save the review event.";
           setAttentionWarning(`${message} The event could not be recorded: ${reason}`);
         }
-      })();
+      })());
     };
     const visibility = () => {
       if (document.visibilityState === "hidden") {
@@ -1396,7 +1433,7 @@ function StudentExam({ session }: { session: Session }) {
       window.removeEventListener("resize", resize);
       window.removeEventListener("beforeunload", unload);
     };
-  }, [payload, session.organization.id]);
+  }, [payload]);
   useEffect(() => {
     const activeAttempt = pendingAttemptRef.current;
     const activeAttemptId = lockAttemptId;
@@ -1432,7 +1469,7 @@ function StudentExam({ session }: { session: Session }) {
       setSingleWindowMessage(message);
       if (!reported && activeAttempt) {
         reported = true;
-        void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+        if (!submissionInProgress.current) void trackProctoringWrite(api.post(`/api/organizations/${activeAttempt.organizationId}/proctoring/events`, {
           examId: activeAttempt.examId,
           candidateId: activeAttempt.candidateId,
           attemptId: activeAttemptId,
@@ -1440,7 +1477,7 @@ function StudentExam({ session }: { session: Session }) {
           occurredAt: new Date().toISOString(),
           source: "browser",
           details: { clientWarning: true, enforcement: "single_window_lock" },
-        }).catch(() => undefined);
+        })).catch(() => undefined);
       }
     };
     const lockManager = (navigator as any).locks;
@@ -1518,7 +1555,7 @@ function StudentExam({ session }: { session: Session }) {
         // A malformed lock is harmless and will expire on its own.
       }
     };
-  }, [lockAttemptId, receipt, session.organization.id]);
+  }, [lockAttemptId, receipt]);
   const save = async (questionId: string, value: unknown) => {
     if (singleWindowBlocked) return;
     // Keep what the candidate typed on screen immediately; the engine saves it (latest value only, in order, with retries).
@@ -1533,7 +1570,7 @@ function StudentExam({ session }: { session: Session }) {
       (window as any).__examguardScreenStream = stream;
       track.addEventListener("ended", () => {
         setAttentionWarning("Full-display sharing stopped. Screen evidence is no longer being captured; tell your exam organizer if this was accidental.");
-        void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+        if (!submissionInProgress.current) void trackProctoringWrite(api.post(`/api/organizations/${payload.attempt.organizationId}/proctoring/events`, {
           examId: payload.attempt.examId,
           candidateId: payload.attempt.candidateId,
           attemptId: payload.attempt.id,
@@ -1541,7 +1578,7 @@ function StudentExam({ session }: { session: Session }) {
           occurredAt: new Date().toISOString(),
           source: "browser",
           details: { clientWarning: true, displaySurface: "monitor" },
-        }).catch(() => undefined);
+        })).catch(() => undefined);
       }, { once: true });
       setAttentionWarning("Full-display sharing is active again.");
     } catch (resumeError) {
@@ -1550,7 +1587,7 @@ function StudentExam({ session }: { session: Session }) {
   };
   const submitter = useRef<ReturnType<typeof createSubmitter> | null>(null);
   const submit = async (automatic = false) => {
-    if (!payload || singleWindowBlocked) return;
+    if (!payload || singleWindowBlocked || submissionInProgress.current) return;
     const activeScreen = fullDisplayStreamIsActive((window as any).__examguardScreenStream as MediaStream | undefined);
     if (!activeScreen) {
       setAttentionWarning("Full-display sharing is not active. Resume sharing before you submit.");
@@ -1559,6 +1596,7 @@ function StudentExam({ session }: { session: Session }) {
     submitter.current ??= createSubmitter({
       flush: async () => (await sync.current?.flush()) ?? true,
       post: async () => {
+        await pendingProctorWrites.current.flush();
         const result = (await api.post(`/api/student/attempts/${payload.attempt.id}/submit`)).data;
         // Submission is authoritative on the server; stop local radio scanning
         // immediately afterwards. This bridge endpoint is loopback + origin restricted.
@@ -1571,6 +1609,7 @@ function StudentExam({ session }: { session: Session }) {
       },
       interpretError: (e) => { const body = axios.isAxiosError(e) ? e.response?.data : undefined; return { receiptCode: body?.receiptCode, message: body?.error }; },
     });
+    submissionInProgress.current = true;
     setError(""); setSubmitBusy(true);
     const outcome = await submitter.current.run(automatic);
     setSubmitBusy(false);
@@ -1585,8 +1624,13 @@ function StudentExam({ session }: { session: Session }) {
       const screenStream = (window as any).__examguardScreenStream as MediaStream | undefined;
       screenStream?.getTracks().forEach((track) => track.stop());
       delete (window as any).__examguardScreenStream;
-    } else if (outcome.kind === "blocked_unsaved") setError("Some answers couldn't be saved yet. Check your connection and try again. Nothing has been lost.");
-    else if (outcome.kind === "error") setError(outcome.message);
+    } else if (outcome.kind === "blocked_unsaved") {
+      submissionInProgress.current = false;
+      setError("Some answers couldn't be saved yet. Check your connection and try again. Nothing has been lost.");
+    } else if (outcome.kind === "error") {
+      submissionInProgress.current = false;
+      setError(outcome.message);
+    }
   };
   const createCompanionPairing = async (attemptId = payload?.attempt?.id): Promise<boolean> => {
     if (!attemptId) return false;
@@ -1627,7 +1671,7 @@ function StudentExam({ session }: { session: Session }) {
     let sending = false;
     let resumeAfterCurrent = false;
     const analyzeFrame = async () => {
-      if (stopped || document.visibilityState !== "visible") return;
+      if (stopped || submissionInProgress.current || document.visibilityState !== "visible") return;
       if (sending) return;
       sending = true;
       try {
@@ -1649,9 +1693,12 @@ function StudentExam({ session }: { session: Session }) {
           recorded?: Array<{ type?: string; eventId?: string; occurredAt?: string }>;
           evidenceAttached?: boolean;
         }>(`/api/student/attempts/${activeAttemptId}/ai-frame`, form, { timeout: 16_000 });
+        clockOffset.current = clockOffsetMs(response.headers?.date as string | undefined, Date.now());
         if (!response.data.analysis) throw new Error("The AI service did not confirm frame analysis.");
         for (const signal of response.data.recorded ?? []) {
-          if (signal.eventId && signal.occurredAt) void captureIncidentContext(signal.eventId, signal.occurredAt);
+          if (signal.eventId && signal.occurredAt) {
+            void trackProctoringWrite(captureIncidentContext(signal.eventId, signal.occurredAt)).catch(() => undefined);
+          }
         }
         const evidenceStatus = response.data.evidenceAttached
           ? "confirmed incident image saved"
@@ -1673,9 +1720,13 @@ function StudentExam({ session }: { session: Session }) {
         sending = false;
         if (resumeAfterCurrent) {
           resumeAfterCurrent = false;
-          if (!stopped && document.visibilityState === "visible") void analyzeFrame();
+          if (!stopped && document.visibilityState === "visible") runAnalysis();
         }
       }
+    };
+    const runAnalysis = () => {
+      if (submissionInProgress.current) return;
+      void trackProctoringWrite(analyzeFrame()).catch(() => undefined);
     };
     const analyzeWhenVisible = () => {
       if (document.visibilityState !== "visible") return;
@@ -1684,11 +1735,11 @@ function StudentExam({ session }: { session: Session }) {
         setAiStatus("Exam tab is active again; waiting for the current frame request before resuming.");
         return;
       }
-      void analyzeFrame();
+      runAnalysis();
     };
-    const interval = window.setInterval(() => void analyzeFrame(), 6000);
+    const interval = window.setInterval(runAnalysis, 6000);
     document.addEventListener("visibilitychange", analyzeWhenVisible);
-    void analyzeFrame();
+    runAnalysis();
     return () => {
       stopped = true;
       window.clearInterval(interval);
@@ -1710,7 +1761,7 @@ function StudentExam({ session }: { session: Session }) {
       try {
         const blob = await captureFrameBlob();
         if (!blob || stopped) return;
-        const capturedAt = Date.now();
+        const capturedAt = serverNow();
         contextBuffer.current = [...contextBuffer.current, { capturedAt, blob }]
           .filter(frame => frame.capturedAt >= capturedAt - 5_000)
           .slice(-6);
@@ -1767,7 +1818,7 @@ function StudentExam({ session }: { session: Session }) {
     if (!activeAttemptId || receipt || !track) return;
     const handleEnded = () => {
       setAttentionWarning("Full-display sharing stopped. Screen evidence is no longer being captured; tell your exam organizer if this was accidental.");
-      void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+      if (!submissionInProgress.current) void trackProctoringWrite(api.post(`/api/organizations/${payload.attempt.organizationId}/proctoring/events`, {
         examId: payload.attempt.examId,
         candidateId: payload.attempt.candidateId,
         attemptId: activeAttemptId,
@@ -1775,11 +1826,11 @@ function StudentExam({ session }: { session: Session }) {
         occurredAt: new Date().toISOString(),
         source: "browser",
         details: { clientWarning: true, displaySurface: "monitor" },
-      }).catch(() => undefined);
+      })).catch(() => undefined);
     };
     track.addEventListener("ended", handleEnded);
     return () => track.removeEventListener("ended", handleEnded);
-  }, [payload?.attempt?.candidateId, payload?.attempt?.examId, payload?.attempt?.id, receipt, session.organization.id]);
+  }, [payload?.attempt?.candidateId, payload?.attempt?.examId, payload?.attempt?.id, payload?.attempt?.organizationId, receipt]);
   useEffect(() => {
     const activeAttemptId = payload?.attempt?.id;
     const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
@@ -1811,7 +1862,7 @@ function StudentExam({ session }: { session: Session }) {
       eventReported = true;
       contextBuffer.current = [];
       contextUploadEvents.current.clear();
-      void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
+      if (!submissionInProgress.current) void trackProctoringWrite(api.post(`/api/organizations/${payload.attempt.organizationId}/proctoring/events`, {
         examId: payload.attempt.examId,
         candidateId: payload.attempt.candidateId,
         attemptId: activeAttemptId,
@@ -1824,7 +1875,7 @@ function StudentExam({ session }: { session: Session }) {
           trackKind: track.kind,
           reason: "media_track_ended",
         },
-      }).catch((reportError) => {
+      })).catch((reportError) => {
         if (!active) return;
         const message = axios.isAxiosError(reportError) ? reportError.response?.data?.error : undefined;
         setCameraStatus(`Camera disconnected. Its status could not be recorded: ${message ?? "check the connection"}.`);
@@ -1847,7 +1898,7 @@ function StudentExam({ session }: { session: Session }) {
       stream.removeEventListener("inactive", reportEnded);
       navigator.mediaDevices?.removeEventListener("devicechange", handleDeviceChange);
     };
-  }, [payload?.attempt?.candidateId, payload?.attempt?.examId, payload?.attempt?.id, receipt, session.organization.id, cameraStreamVersion]);
+  }, [payload?.attempt?.candidateId, payload?.attempt?.examId, payload?.attempt?.id, payload?.attempt?.organizationId, receipt, cameraStreamVersion]);
   useEffect(() => {
     const hasCodingQuestions = Boolean(payload?.questions?.some((item: any) => item.type === "coding"));
     if (payload && left === 0 && !hasCodingQuestions) void submit(true);

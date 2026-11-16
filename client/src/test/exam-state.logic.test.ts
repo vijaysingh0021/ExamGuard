@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clockOffsetMs, formatClock, isAnswered, loadMarks, progress, questionState, remainingMs, saveMarks, timerAnnouncement, timerTone } from "../lib/exam-state";
+import { clockOffsetMs, formatClock, isAnswered, loadMarks, progress, questionState, remainingMs, saveMarks, serverAlignedNow, timerAnnouncement, timerTone } from "../lib/exam-state";
 
 describe("server-aligned timer and deadline boundaries", () => {
   const deadline = "2026-11-07T10:00:00.000Z"; const at = (iso: string) => Date.parse(iso);
@@ -12,6 +12,7 @@ describe("server-aligned timer and deadline boundaries", () => {
     const deviceNow = at("2026-11-07T09:50:00.000Z"); // device is 5 minutes slow
     const offset = clockOffsetMs("Sat, 07 Nov 2026 09:55:00 GMT", deviceNow);
     expect(offset).toBe(5 * 60_000);
+    expect(serverAlignedNow(deviceNow, offset)).toBe(at("2026-11-07T09:55:00.000Z"));
     expect(remainingMs(deadline, deviceNow, offset)).toBe(5 * 60_000);
     expect(remainingMs(deadline, deviceNow, 0)).toBe(10 * 60_000); // without correction the candidate would believe they have 5 extra minutes
   });

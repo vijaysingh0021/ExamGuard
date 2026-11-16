@@ -8,6 +8,7 @@ export function clockOffsetMs(dateHeader: string | undefined | null, clientNowMs
   const offset = server - clientNowMs;
   return Math.abs(offset) > 12 * 3_600_000 ? 0 : Math.round(offset); // an offset this large is a bad header, not a real clock
 }
+export const serverAlignedNow = (clientNowMs: number, offsetMs: number) => clientNowMs + offsetMs;
 export const remainingMs = (deadlineIso: string, clientNowMs: number, offsetMs = 0) => Math.max(0, new Date(deadlineIso).getTime() - (clientNowMs + offsetMs));
 
 export function formatClock(ms: number): string {
