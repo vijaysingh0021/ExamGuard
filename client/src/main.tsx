@@ -66,7 +66,7 @@ import { Badge, Button, CopyableId } from "./components/ui";
 import { Checkbox, Input, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./components/ui";
 import { Dialog, DialogContent } from "./components/ui/dialog";
 import { ReasonDialog } from "./components/shared";
-import { api, publicApi } from "./lib/api";
+import { api, publicApi, resolveCompanionApiOrigin } from "./lib/api";
 import { dateTimeLocalValue, readPagination } from "./lib/pagination";
 import { canAccessExamBuilder, canDecideIncidents, canEditOrganization, canExportReports, canManageCandidates, canManageExams } from "./lib/permissions";
 import "./index.css";
@@ -1651,7 +1651,7 @@ function StudentExam({ session }: { session: Session }) {
         method: "POST",
         headers: { "Content-Type": "application/json", ...companionBridgeAuthorization() },
         cache: "no-store",
-        body: JSON.stringify({ apiUrl: new URL(api.defaults.baseURL || window.location.origin, window.location.origin).origin, pairingToken: data.pairingToken, consentGranted: true }),
+        body: JSON.stringify({ apiUrl: resolveCompanionApiOrigin(), pairingToken: data.pairingToken, consentGranted: true }),
       });
       const bridgeResult = await bridgeResponse.json().catch(() => ({}));
       if (!bridgeResponse.ok || bridgeResult.status !== "connected") throw new Error(bridgeResult.error ?? "The Windows Companion did not confirm the connection.");

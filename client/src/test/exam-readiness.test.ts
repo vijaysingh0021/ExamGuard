@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { resolveCompanionApiOrigin } from "../lib/api";
 import {
   browserCompatibility,
   cameraStreamHasLiveTrack,
@@ -132,6 +133,12 @@ describe("examination media readiness", () => {
     expect(response.status).toBe("ready");
     const authorization = new Headers(requestHeaders).get("Authorization");
     expect(authorization).toMatch(/^Bearer [a-f0-9]{64}$/);
+  });
+
+  it("uses the backend API origin for Companion pairing instead of the frontend origin", () => {
+    expect(resolveCompanionApiOrigin(["https://api.examguard.example.com/api", "https://examguard-sooty.vercel.app"]))
+      .toBe("https://api.examguard.example.com");
+    expect(() => resolveCompanionApiOrigin([])).toThrow(/configured backend API origin/i);
   });
 
   it("reports rejected local bridge authorization and permission failures for user recovery", async () => {

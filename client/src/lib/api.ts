@@ -3,6 +3,41 @@ import axios from "axios";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || undefined;
 
+export function resolveCompanionApiOrigin(candidateUrls: Array<string | undefined> = [API_BASE_URL, typeof window !== "undefined" ? window.location.origin : undefined]): string {
+  const uniqueCandidates = [...new Set(candidateUrls.filter((value): value is string => Boolean(value)))];
+  const currentOrigin = typeof window !== "undefined" ? window.location.origin : undefined;
+
+  for (const candidate of uniqueCandidates) {
+    try {
+      const url = new URL(candidate, typeof window !== "undefined" ? window.location.origin : "http://localhost");
+      if (!url.origin) continue;
+
+      if (currentOrigin && url.origin === currentOrigin) {
+        const host = url.hostname.toLowerCase();
+        if (host === "localhost" || host === "127.0.0.1" || host === "[::1]") return url.origin;
+        continue;
+      }
+
+      return url.origin;
+    } catch {
+      // Invalid or relative values are ignored; the caller must provide a real API origin.
+    }
+  }
+
+  if (currentOrigin && (currentOrigin === "http://localhost" || currentOrigin.startsWith("http://localhost:") || currentOrigin === "http://127.0.0.1" || currentOrigin.startsWith("http://127.0.0.1:") || currentOrigin === "http://[::1]" || currentOrigin.startsWith("http://[::1]:"))) {
+    const localMatch = uniqueCandidates.find(candidate => {
+      try {
+        return new URL(candidate, "http://localhost").origin === currentOrigin;
+      } catch {
+        return false;
+      }
+    });
+    if (localMatch) return currentOrigin;
+  }
+
+  throw new Error("The Companion bridge requires a configured backend API origin. Set VITE_API_URL to the API origin (for example https://api.examguard.example.com) and reload the exam page.");
+}
+
 /**
  * Authenticated API client shared by all protected ExamGuard workflows.
  */
