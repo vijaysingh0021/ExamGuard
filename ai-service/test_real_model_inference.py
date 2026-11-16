@@ -39,6 +39,19 @@ def analyze_image(image, name):
 
 
 class RealModelInferenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.previous_min_interval = main.INFERENCE_MIN_INTERVAL_SECONDS
+        main.INFERENCE_MIN_INTERVAL_SECONDS = 0
+        main.initialize_models()
+
+    @classmethod
+    def tearDownClass(cls):
+        main.close_models()
+        main.INFERENCE_MIN_INTERVAL_SECONDS = cls.previous_min_interval
+        super().tearDownClass()
+
     def setUp(self):
         if main.yolo is None or not main.phone_class_ids(main.MODEL_CLASSES):
             self.skipTest(MODEL_SKIP_REASON)

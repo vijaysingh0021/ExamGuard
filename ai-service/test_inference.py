@@ -1,6 +1,8 @@
 import asyncio
 from io import BytesIO
 from types import SimpleNamespace
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -35,8 +37,10 @@ class FakeCoordinates:
 class FakeYolo:
     def __init__(self, class_name):
         self.names = {0: class_name}
+        self.source_shape = None
 
-    def predict(self, **_kwargs):
+    def predict(self, **kwargs):
+        self.source_shape = kwargs["source"].shape[:2]
         box = SimpleNamespace(
             cls=FakeValue(0),
             conf=FakeValue(0.91),
@@ -106,10 +110,14 @@ class FakeFaceDetector:
             return SimpleNamespace(detections=[])
         return SimpleNamespace(detections=self.detections)
 
+    def close(self):
+        pass
+
 
 class FakeFaceMesh:
-    def __init__(self, faces):
+    def __init__(self, faces, error=None):
         self.faces = faces
+        self.error = error
 
     def __enter__(self):
         return self
@@ -118,10 +126,115 @@ class FakeFaceMesh:
         return False
 
     def process(self, _image):
+        if self.error:
+            raise self.error
         return SimpleNamespace(multi_face_landmarks=self.faces)
+
+    def close(self):
+        pass
+
+
+class ModelInitializationTests(unittest.TestCase):
+    def test_initialization_loads_each_model_once_and_closes_mediapipe(self):
+        class ClosableModel:
+            names = {67: "cell phone"}
+
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        yolo_model = ClosableModel()
+        detector = ClosableModel()
+        mesh = ClosableModel()
+
+        with (
+            patch.object(main, "_models_initialized", False),
+            patch.object(main, "MODEL_PATH", __file__),
+            patch.object(main, "MODEL_CLASSES", {}),
+            patch.object(main, "MODEL_LOAD_ERROR", None),
+            patch.object(main, "yolo", None),
+            patch.object(main, "face_detector", None),
+            patch.object(main, "face_mesh", None),
+            patch.object(main, "load_yolo_model", return_value=yolo_model) as load_yolo,
+            patch.object(main.mp.solutions.face_detection, "FaceDetection", return_value=detector) as load_detector,
+            patch.object(main.mp.solutions.face_mesh, "FaceMesh", return_value=mesh) as load_mesh,
+        ):
+            main.initialize_models()
+            main.initialize_models()
+
+            load_yolo.assert_called_once_with(__file__)
+            load_detector.assert_called_once()
+            load_mesh.assert_called_once()
+            self.assertEqual(main.health()["phone_model"], "ready")
+            self.assertEqual(main.health()["mediapipe"], "ready")
+            self.assertEqual(main.health()["looking_away"], "ready")
+
+            main.close_models()
+
+            self.assertEqual(detector.close_calls, 1)
+            self.assertEqual(mesh.close_calls, 1)
+
+    def test_shutdown_waits_for_inference_before_closing_models(self):
+        async def exercise_shutdown():
+            inference_lock = main._inference_lock
+            self.assertTrue(inference_lock.acquire(blocking=False))
+            models_closed = threading.Event()
+            shutdown_waiting = asyncio.Event()
+            original_to_thread = asyncio.to_thread
+
+            async def observed_to_thread(function, *args, **kwargs):
+                shutdown_waiting.set()
+                return await original_to_thread(function, *args, **kwargs)
+
+            async def run_lifespan():
+                async with main.lifespan(main.app):
+                    pass
+
+            try:
+                with (
+                    patch.object(main, "initialize_models"),
+                    patch.object(main, "close_models", side_effect=models_closed.set),
+                    patch.object(asyncio, "to_thread", new=observed_to_thread),
+                ):
+                    shutdown = asyncio.create_task(run_lifespan())
+                    await shutdown_waiting.wait()
+                    self.assertFalse(models_closed.is_set())
+                    inference_lock.release()
+                    await shutdown
+                    self.assertTrue(models_closed.is_set())
+            finally:
+                if inference_lock.locked():
+                    inference_lock.release()
+
+        asyncio.run(exercise_shutdown())
 
 
 class HeadPoseTests(unittest.TestCase):
+    def setUp(self):
+        self.previous_runtime = (
+            main.yolo,
+            main.face_detector,
+            main.face_mesh,
+            main.INFERENCE_MIN_INTERVAL_SECONDS,
+            main._last_inference_started_at,
+        )
+        main.yolo = None
+        main.face_detector = FakeFaceDetector(detections=[])
+        main.face_mesh = FakeFaceMesh([])
+        main.INFERENCE_MIN_INTERVAL_SECONDS = 0
+        main._last_inference_started_at = 0
+
+    def tearDown(self):
+        (
+            main.yolo,
+            main.face_detector,
+            main.face_mesh,
+            main.INFERENCE_MIN_INTERVAL_SECONDS,
+            main._last_inference_started_at,
+        ) = self.previous_runtime
+
     def test_normalizes_equivalent_upright_face_rotation(self):
         self.assertAlmostEqual(normalize_pitch_degrees(-163.44), -16.56)
         self.assertAlmostEqual(normalize_pitch_degrees(163.44), 16.56)
@@ -165,6 +278,23 @@ class HeadPoseTests(unittest.TestCase):
         self.assertEqual(result["phone_boxes"], [])
         self.assertEqual(result["camera_health"], "obstructed")
 
+    def test_large_frame_is_resized_with_boxes_scaled_to_original_pixels(self):
+        image = np.zeros((600, 1200, 3), dtype=np.uint8)
+        frame = make_upload(encode_test_image(image))
+        yolo = FakeYolo("cell phone")
+
+        with (
+            patch.object(main, "MAX_INFERENCE_SIDE", 960),
+            patch.object(main, "yolo", yolo),
+        ):
+            result = asyncio.run(main.analyze(frame))
+
+        self.assertEqual(yolo.source_shape, (480, 960))
+        self.assertEqual(result["phone_boxes"][0]["x1"], 150.0)
+        self.assertEqual(result["phone_boxes"][0]["y1"], 125.0)
+        self.assertEqual(result["phone_boxes"][0]["x2"], 325.0)
+        self.assertEqual(result["phone_boxes"][0]["y2"], 400.0)
+
     def test_synthetic_no_face_image_reports_no_face_without_head_pose(self):
         image = np.zeros((480, 640, 3), dtype=np.uint8)
         frame = make_upload(encode_test_image(image))
@@ -187,11 +317,11 @@ class HeadPoseTests(unittest.TestCase):
 
         with (
             patch.object(
-                main.mp.solutions.face_detection,
-                "FaceDetection",
-                return_value=FakeFaceDetector(detections, expected_shape=(480, 640)),
+                main,
+                "face_detector",
+                FakeFaceDetector(detections, expected_shape=(480, 640)),
             ),
-            patch.object(main.mp.solutions.face_mesh, "FaceMesh", return_value=FakeFaceMesh([])),
+            patch.object(main, "face_mesh", FakeFaceMesh([])),
             patch.object(
                 main,
                 "estimate_head_pose_for_face",
@@ -245,7 +375,19 @@ class HeadPoseTests(unittest.TestCase):
     def test_face_model_errors_are_reported_as_service_unavailable(self):
         frame = make_test_frame()
         detector = FakeFaceDetector(error=RuntimeError("test inference failure"))
-        with patch.object(main.mp.solutions.face_detection, "FaceDetection", return_value=detector):
+        with patch.object(main, "face_detector", detector):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(main.analyze(frame))
+        self.assertEqual(raised.exception.status_code, 503)
+
+    def test_head_pose_model_errors_are_reported_as_service_unavailable(self):
+        frame = make_test_frame()
+        detector = FakeFaceDetector([make_face_detection(0.2, 0.2, 0.3, 0.4)])
+        mesh = FakeFaceMesh([], error=RuntimeError("test inference failure"))
+        with (
+            patch.object(main, "face_detector", detector),
+            patch.object(main, "face_mesh", mesh),
+        ):
             with self.assertRaises(HTTPException) as raised:
                 asyncio.run(main.analyze(frame))
         self.assertEqual(raised.exception.status_code, 503)
@@ -314,7 +456,7 @@ class HeadPoseTests(unittest.TestCase):
         frame = make_test_frame()
         detector = FakeFaceDetector(detections=[])
         with (
-            patch.object(main.mp.solutions.face_detection, "FaceDetection", return_value=detector),
+            patch.object(main, "face_detector", detector),
             patch.object(main, "yolo", FailingYolo()),
         ):
             with self.assertRaises(HTTPException) as raised:
@@ -331,7 +473,7 @@ class HeadPoseTests(unittest.TestCase):
         frame = make_test_frame()
         detector = FakeFaceDetector(detections=[])
         with (
-            patch.object(main.mp.solutions.face_detection, "FaceDetection", return_value=detector),
+            patch.object(main, "face_detector", detector),
             patch.object(main, "yolo", EmptyYolo()),
         ):
             with self.assertRaises(HTTPException) as raised:
@@ -356,6 +498,99 @@ class HeadPoseTests(unittest.TestCase):
 
         no_face = assess_visual_readability([device], 0, [], None, (600, 640, 3), "ok")
         self.assertEqual(no_face["status"], "not_indicated")
+
+
+class InferenceControlTests(unittest.TestCase):
+    def setUp(self):
+        self.previous_runtime = (
+            main.INFERENCE_MIN_INTERVAL_SECONDS,
+            main.INFERENCE_TIMEOUT_SECONDS,
+            main._last_inference_started_at,
+        )
+        main.INFERENCE_MIN_INTERVAL_SECONDS = 0
+        main._last_inference_started_at = 0
+
+    def tearDown(self):
+        (
+            main.INFERENCE_MIN_INTERVAL_SECONDS,
+            main.INFERENCE_TIMEOUT_SECONDS,
+            main._last_inference_started_at,
+        ) = self.previous_runtime
+
+    def test_concurrent_inference_is_rejected_without_waiting(self):
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        def blocked_inference(_content, _content_type):
+            worker_started.set()
+            if not release_worker.wait(3):
+                raise RuntimeError("test inference was not released")
+            return {"completed": True}
+
+        async def exercise():
+            first = asyncio.create_task(main.analyze(make_test_frame()))
+            self.assertTrue(await asyncio.to_thread(worker_started.wait, 1))
+
+            with self.assertRaises(HTTPException) as raised:
+                await main.analyze(make_test_frame())
+            self.assertEqual(raised.exception.status_code, 503)
+            self.assertEqual(main.health()["phone_model"], "unavailable")
+
+            release_worker.set()
+            self.assertEqual(await first, {"completed": True})
+
+        try:
+            with patch.object(main, "_analyze_content", side_effect=blocked_inference):
+                asyncio.run(exercise())
+        finally:
+            release_worker.set()
+
+    def test_inference_throttle_returns_retry_after_without_running_model(self):
+        main.INFERENCE_MIN_INTERVAL_SECONDS = 5
+        main._last_inference_started_at = time.monotonic()
+        with patch.object(main, "_analyze_content") as inference:
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(main.analyze(make_test_frame()))
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertIn("Retry-After", raised.exception.headers)
+        inference.assert_not_called()
+
+    def test_inference_timeout_keeps_capacity_busy_until_worker_finishes(self):
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_finished = threading.Event()
+        main.INFERENCE_TIMEOUT_SECONDS = 0.02
+
+        def blocked_inference(_content, _content_type):
+            worker_started.set()
+            if not release_worker.wait(3):
+                raise RuntimeError("test inference was not released")
+            worker_finished.set()
+            return {"completed": True}
+
+        async def exercise():
+            first = asyncio.create_task(main.analyze(make_test_frame()))
+            self.assertTrue(await asyncio.to_thread(worker_started.wait, 1))
+
+            with self.assertRaises(HTTPException) as timed_out:
+                await first
+            self.assertEqual(timed_out.exception.status_code, 504)
+
+            with self.assertRaises(HTTPException) as still_busy:
+                await main.analyze(make_test_frame())
+            self.assertEqual(still_busy.exception.status_code, 503)
+
+            release_worker.set()
+            self.assertTrue(await asyncio.to_thread(worker_finished.wait, 2))
+            await asyncio.sleep(0)
+            self.assertEqual(await main.analyze(make_test_frame()), {"completed": True})
+
+        try:
+            with patch.object(main, "_analyze_content", side_effect=blocked_inference):
+                asyncio.run(exercise())
+        finally:
+            release_worker.set()
 
 
 if __name__ == "__main__":

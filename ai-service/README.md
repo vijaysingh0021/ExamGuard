@@ -19,6 +19,31 @@ MediaPipe supports face landmarks for face presence, multiple faces, and approxi
 
 Do not send continuous video. Send only disclosed, sampled frames needed for a configured review signal. This service stores no frames; private evidence retention must be explicit and handled by the API/storage layer.
 
+## Constrained-instance settings
+
+The service loads YOLO, MediaPipe face detection, and face mesh once during
+application startup and waits for active inference before closing MediaPipe
+models at shutdown. `/health` reports model availability without running
+inference; the authenticated `/health/ready` reports each required capability
+so the backend can fail closed when a model is unavailable.
+
+The Docker defaults are intended to bound concurrent work on small CPU
+instances while preserving the original response fields:
+
+- `AI_MAX_INFERENCE_SIDE=960` caps the longest processed image edge and keeps
+  aspect ratio. Returned pixel-coordinate device boxes are scaled back to the
+  uploaded image dimensions.
+- `AI_INFERENCE_MIN_INTERVAL_SECONDS=1` throttles rapid requests; an inference
+  already running is never overlapped.
+- `AI_INFERENCE_TIMEOUT_SECONDS=10` returns an explicit timeout response while
+  allowing the current worker to finish before accepting another inference.
+- `AI_TORCH_THREADS=1` and the OpenMP/BLAS thread settings prevent CPU
+  oversubscription. Uvicorn runs a single worker to avoid duplicate model sets.
+
+Override these environment variables only after validating latency, memory,
+and detection behavior on the target instance. The input byte and pixel limits,
+authentication, and private evidence handling are unchanged.
+
 Face detection uses MediaPipe's long-range model (`model_selection=1`).
 On the checked group sample it detected eight faces; the short-range model
 detected none. It also detected the single face in `camera_test.jpg`. When a

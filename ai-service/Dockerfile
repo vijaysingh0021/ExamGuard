@@ -2,6 +2,14 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    AI_TORCH_THREADS=1 \
+    AI_MAX_INFERENCE_SIDE=960 \
+    AI_INFERENCE_MIN_INTERVAL_SECONDS=1 \
+    AI_INFERENCE_TIMEOUT_SECONDS=10 \
     YOLO_MODEL_PATH=/app/models/yolo11n.pt
 
 WORKDIR /app
@@ -19,5 +27,5 @@ COPY assistant ./assistant
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
 

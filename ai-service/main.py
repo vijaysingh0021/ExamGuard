@@ -1,10 +1,15 @@
 ﻿"""Opt-in single-frame analysis. Frames are processed in memory, not persisted."""
 
+import asyncio
+from contextlib import asynccontextmanager
 import os
 import hmac
 import logging
 import sys
+import threading
 import time
+from math import ceil
+from typing import AsyncGenerator
 
 import cv2
 import mediapipe as mp
@@ -17,8 +22,28 @@ from dotenv import load_dotenv
 # same private service token without putting it in browser-visible settings.
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 
-app = FastAPI(title="ExamGuard AI service")
 logger = logging.getLogger("examguard.ai")
+
+
+def positive_int_setting(name: str, default: int, minimum: int = 1) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return value
+
+
+def nonnegative_float_setting(name: str, default: float) -> float:
+    value = float(os.getenv(name, str(default)))
+    if not np.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return value
+
+
+def positive_float_setting(name: str, default: float) -> float:
+    value = float(os.getenv(name, str(default)))
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return value
 
 
 def require_service_auth(authorization: str | None = Header(default=None)):
@@ -32,6 +57,7 @@ def require_service_auth(authorization: str | None = Header(default=None)):
         raise HTTPException(401, "Invalid service credential")
     return True
 
+
 MODEL_PATH = os.getenv("YOLO_MODEL_PATH")
 
 # Head-pose thresholds in degrees. These are initial configurable values.
@@ -41,12 +67,136 @@ HEAD_POSE_MARGIN = float(os.getenv("HEAD_POSE_MARGIN", "5"))
 PHONE_CONFIDENCE_THRESHOLD = float(os.getenv("PHONE_CONFIDENCE_THRESHOLD", "0.35"))
 FACE_CONFIDENCE_THRESHOLD = float(os.getenv("FACE_CONFIDENCE_THRESHOLD", "0.5"))
 
-MODEL_LOAD_ERROR = None
-MODEL_CLASSES = {}
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+MAX_INFERENCE_SIDE = positive_int_setting("AI_MAX_INFERENCE_SIDE", 960, minimum=32)
+INFERENCE_MIN_INTERVAL_SECONDS = nonnegative_float_setting("AI_INFERENCE_MIN_INTERVAL_SECONDS", 1.0)
+INFERENCE_TIMEOUT_SECONDS = positive_float_setting("AI_INFERENCE_TIMEOUT_SECONDS", 10.0)
+TORCH_NUM_THREADS = positive_int_setting("AI_TORCH_THREADS", 1)
 
+MODEL_LOAD_ERROR = None
+MODEL_CLASSES = {}
+yolo = None
+face_detector = None
+face_mesh = None
+_models_initialized = False
+_model_initialization_lock = threading.Lock()
+_inference_lock = threading.Lock()
+_throttle_lock = threading.Lock()
+_last_inference_started_at = 0.0
+
+
+def load_yolo_model(model_path: str):
+    from ultralytics import YOLO
+
+    return YOLO(model_path)
+
+
+def initialize_models() -> None:
+    """Load each inference model once per process; readiness reflects partial failures."""
+    global MODEL_CLASSES, MODEL_LOAD_ERROR, _models_initialized, face_detector, face_mesh, yolo
+
+    with _model_initialization_lock:
+        if _models_initialized:
+            return
+        _models_initialized = True
+        errors = []
+
+        cv2.setNumThreads(1)
+        try:
+            import torch
+
+            torch.set_num_threads(TORCH_NUM_THREADS)
+            try:
+                torch.set_num_interop_threads(TORCH_NUM_THREADS)
+            except RuntimeError as exc:
+                logger.warning("Could not set PyTorch inter-op thread count (%s)", type(exc).__name__)
+        except Exception as exc:
+            logger.warning("PyTorch CPU thread configuration failed (%s)", type(exc).__name__)
+
+        if MODEL_PATH and os.path.isfile(MODEL_PATH):
+            try:
+                yolo = load_yolo_model(MODEL_PATH)
+                MODEL_CLASSES = class_names_by_id(yolo.names)
+            except Exception as exc:
+                errors.append(f"YOLO: {type(exc).__name__}")
+                logger.error("YOLO model could not be loaded (%s)", type(exc).__name__)
+        else:
+            errors.append("YOLO weights unavailable")
+            logger.error("YOLO model could not be loaded (weights path unavailable)")
+
+        try:
+            face_detector = mp.solutions.face_detection.FaceDetection(
+                model_selection=1,
+                min_detection_confidence=FACE_CONFIDENCE_THRESHOLD,
+            )
+        except Exception as exc:
+            errors.append(f"FaceDetection: {type(exc).__name__}")
+            logger.error("MediaPipe face detector could not be loaded (%s)", type(exc).__name__)
+
+        try:
+            face_mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True,
+                max_num_faces=1,
+                refine_landmarks=False,
+                min_detection_confidence=0.5,
+            )
+        except Exception as exc:
+            errors.append(f"FaceMesh: {type(exc).__name__}")
+            logger.error("MediaPipe face mesh could not be loaded (%s)", type(exc).__name__)
+
+        MODEL_LOAD_ERROR = "; ".join(errors) or None
+        supported_phone_classes = phone_class_ids(MODEL_CLASSES)
+        logger.info(
+            "AI service startup python=%s mediapipe_detection=%s mediapipe_mesh=%s "
+            "opencv=%s numpy=%s phone_model=%s model_path_available=%s "
+            "model_classes=%d torch_threads=%d",
+            sys.version.split()[0],
+            face_detector is not None,
+            face_mesh is not None,
+            cv2.__version__,
+            np.__version__,
+            "ready" if yolo is not None and supported_phone_classes else "unavailable",
+            bool(MODEL_PATH and os.path.isfile(MODEL_PATH)),
+            len(MODEL_CLASSES),
+            TORCH_NUM_THREADS,
+        )
+
+
+def close_models() -> None:
+    global MODEL_CLASSES, MODEL_LOAD_ERROR, _models_initialized, face_detector, face_mesh, yolo
+
+    for model_name, model in (("face mesh", face_mesh), ("face detector", face_detector)):
+        if model is None:
+            continue
+        try:
+            model.close()
+        except Exception as exc:
+            logger.warning("Could not close the MediaPipe %s (%s)", model_name, type(exc).__name__)
+    with _model_initialization_lock:
+        face_mesh = None
+        face_detector = None
+        yolo = None
+        MODEL_CLASSES = {}
+        MODEL_LOAD_ERROR = None
+        _models_initialized = False
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+    initialize_models()
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(_inference_lock.acquire)
+        try:
+            close_models()
+        finally:
+            _inference_lock.release()
+
+
+app = FastAPI(title="ExamGuard AI service", lifespan=lifespan)
 
 def class_names_by_id(names):
     if isinstance(names, dict):
@@ -186,28 +336,6 @@ def detect_face_boxes_with_tiles(image, detector):
     return merge_face_boxes(face_boxes)
 
 
-try:
-    from ultralytics import YOLO
-    yolo = YOLO(MODEL_PATH) if MODEL_PATH and os.path.isfile(MODEL_PATH) else None
-    if yolo is not None:
-        MODEL_CLASSES = class_names_by_id(yolo.names)
-except Exception as exc:
-    yolo = None
-    MODEL_LOAD_ERROR = type(exc).__name__
-    logger.error("YOLO model could not be loaded (%s)", MODEL_LOAD_ERROR)
-
-logger.info(
-    "AI service startup python=%s mediapipe=ready opencv=%s numpy=%s "
-    "phone_model=%s model_path_available=%s model_classes=%d cuda=unmanaged",
-    sys.version.split()[0],
-    cv2.__version__,
-    np.__version__,
-    "ready" if yolo is not None else "unavailable",
-    bool(MODEL_PATH and os.path.isfile(MODEL_PATH)),
-    len(MODEL_CLASSES),
-)
-
-
 @app.get("/health")
 def health():
     supported_phone_classes = phone_class_ids(MODEL_CLASSES)
@@ -219,14 +347,14 @@ def health():
             "numpy": np.__version__,
             "fastapi": "ready"
         },
-        "mediapipe": "ready",
+        "mediapipe": "ready" if face_detector is not None else "unavailable",
         "phone_model": "ready" if yolo is not None and supported_phone_classes else "unavailable",
         "model_path_available": bool(MODEL_PATH and os.path.isfile(MODEL_PATH)),
         "model_load_error": MODEL_LOAD_ERROR,
         "phone_classes": [MODEL_CLASSES[class_id] for class_id in sorted(supported_phone_classes)],
         "visible_device_classes": sorted({kind for name in MODEL_CLASSES.values() if (kind := device_kind_for_class(str(name))) is not None}),
-        "looking_away": "ready",
-        "multiple_faces": "ready",
+        "looking_away": "ready" if face_mesh is not None else "unavailable",
+        "multiple_faces": "ready" if face_detector is not None else "unavailable",
         "head_pose_thresholds": {
             "yaw_degrees": YAW_THRESHOLD,
             "pitch_degrees": PITCH_THRESHOLD,
@@ -405,13 +533,27 @@ def classify_looking_away(head_pose):
     return "looking_away" if turned_sideways or tilted_up_or_down else "looking_forward"
 
 
-@app.post("/analyze", dependencies=[Depends(require_service_auth)])
-async def analyze(frame: UploadFile):
-    started_at = time.perf_counter()
-    if frame.content_type and frame.content_type not in SUPPORTED_IMAGE_TYPES:
-        raise HTTPException(415, "Upload an image file")
+def resize_for_inference(image):
+    original_height, original_width = image.shape[:2]
+    largest_side = max(original_width, original_height)
+    if largest_side <= MAX_INFERENCE_SIDE:
+        return image, original_width, original_height
 
-    content = await frame.read(MAX_IMAGE_BYTES + 1)
+    scale = MAX_INFERENCE_SIDE / largest_side
+    resized_width = max(1, round(original_width * scale))
+    resized_height = max(1, round(original_height * scale))
+    resized = cv2.resize(
+        image,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_AREA,
+    )
+    return resized, original_width, original_height
+
+
+def _analyze_content(content: bytes, content_type: str | None):
+    started_at = time.perf_counter()
+    if content_type and content_type not in SUPPORTED_IMAGE_TYPES:
+        raise HTTPException(415, "Upload an image file")
 
     if not content:
         raise HTTPException(400, "Uploaded image is empty")
@@ -419,7 +561,7 @@ async def analyze(frame: UploadFile):
     if len(content) > MAX_IMAGE_BYTES:
         raise HTTPException(413, "Image exceeds the 5 MB limit")
 
-    if not image_signature_matches(content, frame.content_type):
+    if not image_signature_matches(content, content_type):
         raise HTTPException(415, "Image content does not match a supported JPEG, PNG, or WebP format")
 
     try:
@@ -437,13 +579,16 @@ async def analyze(frame: UploadFile):
     if height < 32 or width < 32 or height * width > MAX_IMAGE_PIXELS:
         raise HTTPException(422, "Image dimensions must be at least 32x32 and no larger than 40 megapixels")
 
+    image, original_width, original_height = resize_for_inference(image)
+    height, width = image.shape[:2]
+    scale_x = original_width / width
+    scale_y = original_height / height
+
     # Detect and count faces.
+    if face_detector is None:
+        raise HTTPException(503, "Face-detection model is unavailable")
     try:
-        with mp.solutions.face_detection.FaceDetection(
-            model_selection=1,
-            min_detection_confidence=FACE_CONFIDENCE_THRESHOLD
-        ) as detector:
-            face_boxes = detect_face_boxes_with_tiles(image, detector)
+        face_boxes = detect_face_boxes_with_tiles(image, face_detector)
     except Exception as exc:
         logger.error("Face-detection inference failed (%s)", type(exc).__name__)
         raise HTTPException(503, "Face-detection inference is unavailable") from exc
@@ -468,36 +613,29 @@ async def analyze(frame: UploadFile):
     looking_away = "unavailable"
     face_pose_estimates = []
     if face_count:
-        try:
-            with mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True,
-                max_num_faces=1,
-                refine_landmarks=False,
-                min_detection_confidence=0.5
-            ) as face_mesh:
-                for index, face_box in enumerate(face_boxes):
-                    try:
-                        pose = (
-                            estimate_head_pose(image, face_mesh)
-                            if face_count == 1
-                            else estimate_head_pose_for_face(image, face_box, face_mesh)
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Head-pose inference unavailable for detected face %d (%s)",
-                            index + 1,
-                            type(exc).__name__,
-                        )
-                        pose = None
-                    face_pose_estimates.append({
-                        "face_box": face_box,
-                        "head_pose": pose,
-                        "looking_away": classify_looking_away(pose),
-                    })
-                    if face_count == 1:
-                        head_pose = pose
-        except Exception as exc:
-            logger.warning("Head-pose inference unavailable (%s)", type(exc).__name__)
+        if face_mesh is None:
+            raise HTTPException(503, "Head-pose model is unavailable")
+        for index, face_box in enumerate(face_boxes):
+            try:
+                pose = (
+                    estimate_head_pose(image, face_mesh)
+                    if face_count == 1
+                    else estimate_head_pose_for_face(image, face_box, face_mesh)
+                )
+            except Exception as exc:
+                logger.error(
+                    "Head-pose inference failed for detected face %d (%s)",
+                    index + 1,
+                    type(exc).__name__,
+                )
+                raise HTTPException(503, "Head-pose inference is unavailable") from exc
+            face_pose_estimates.append({
+                "face_box": face_box,
+                "head_pose": pose,
+                "looking_away": classify_looking_away(pose),
+            })
+            if face_count == 1:
+                head_pose = pose
 
         if face_count == 1:
             looking_away = classify_looking_away(head_pose)
@@ -544,21 +682,27 @@ async def analyze(frame: UploadFile):
 
                 confidence = float(box.conf.item())
                 coordinates = box.xyxy[0].tolist()
+                coordinates = [
+                    float(coordinates[0]) * scale_x,
+                    float(coordinates[1]) * scale_y,
+                    float(coordinates[2]) * scale_x,
+                    float(coordinates[3]) * scale_y,
+                ]
                 if device_kind and confidence >= PHONE_CONFIDENCE_THRESHOLD:
                     if len(visible_devices) < 30:
                         visible_devices.append({
                             "kind": device_kind,
                             "label": class_name,
                             "confidence": round(confidence, 3),
-                            "box": [round(float(value), 2) for value in coordinates],
+                            "box": [round(value, 2) for value in coordinates],
                         })
                 if class_id in supported_phone_classes and confidence >= PHONE_CONFIDENCE_THRESHOLD:
                     phone_scores.append(confidence)
                     phone_boxes.append({
-                        "x1": round(float(coordinates[0]), 2),
-                        "y1": round(float(coordinates[1]), 2),
-                        "x2": round(float(coordinates[2]), 2),
-                        "y2": round(float(coordinates[3]), 2),
+                        "x1": round(coordinates[0], 2),
+                        "y1": round(coordinates[1], 2),
+                        "x2": round(coordinates[2], 2),
+                        "y2": round(coordinates[3], 2),
                         "confidence": round(confidence, 3),
                         "label": class_name
                     })
@@ -577,7 +721,7 @@ async def analyze(frame: UploadFile):
         face_count,
         face_boxes,
         head_pose,
-        image.shape,
+        (original_height, original_width, 3),
         camera_health,
     )
     return {
@@ -607,3 +751,62 @@ async def analyze(frame: UploadFile):
             "Head orientation is an approximate signal, not eye-gaze tracking."
         )
     }
+
+
+def release_inference_slot(future: asyncio.Future) -> None:
+    try:
+        if not future.cancelled():
+            error = future.exception()
+            if error is not None and not isinstance(error, HTTPException):
+                logger.error("AI inference worker failed (%s)", type(error).__name__)
+    finally:
+        if _inference_lock.locked():
+            _inference_lock.release()
+
+
+@app.post("/analyze", dependencies=[Depends(require_service_auth)])
+async def analyze(frame: UploadFile):
+    global _last_inference_started_at
+
+    if frame.content_type and frame.content_type not in SUPPORTED_IMAGE_TYPES:
+        raise HTTPException(415, "Upload an image file")
+    if not _inference_lock.acquire(blocking=False):
+        raise HTTPException(
+            503,
+            "AI inference is busy; retry after the current frame completes",
+            headers={"Retry-After": "1"},
+        )
+
+    inference_running_in_worker = False
+    try:
+        now = time.monotonic()
+        with _throttle_lock:
+            elapsed = now - _last_inference_started_at
+            retry_after = INFERENCE_MIN_INTERVAL_SECONDS - elapsed
+            if retry_after > 0:
+                raise HTTPException(
+                    429,
+                    "AI inference is being throttled",
+                    headers={"Retry-After": str(max(1, ceil(retry_after)))},
+                )
+            _last_inference_started_at = now
+
+        content = await frame.read(MAX_IMAGE_BYTES + 1)
+        loop = asyncio.get_running_loop()
+        inference = loop.run_in_executor(None, _analyze_content, content, frame.content_type)
+        inference.add_done_callback(release_inference_slot)
+        inference_running_in_worker = True
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(inference),
+                timeout=INFERENCE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            logger.warning("AI inference exceeded the %.2f-second timeout", INFERENCE_TIMEOUT_SECONDS)
+            raise HTTPException(504, "AI inference timed out") from exc
+    finally:
+        try:
+            await frame.close()
+        finally:
+            if not inference_running_in_worker:
+                _inference_lock.release()
