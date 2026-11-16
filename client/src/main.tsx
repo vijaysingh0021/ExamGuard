@@ -101,6 +101,7 @@ import { createSubmitter } from "./lib/submit-flow";
 import { clockOffsetMs, isAnswered, loadMarks, progress as examProgress, remainingMs, saveMarks } from "./lib/exam-state";
 import {
   browserCompatibility,
+  cameraStreamHasLiveTrack,
   cameraStreamIsActive,
   checkCompanionBridge,
   createReadinessCheck,
@@ -725,13 +726,13 @@ function ReadinessChecks({ onStart, error, fullscreenRequired, organizationId, e
   const stopScreen = () => {
     screenStream.current?.getTracks().forEach((track) => track.stop());
     screenStream.current = null;
+    delete (window as any).__examguardScreenStream;
     setScreen("Not enabled");
     markChecked("screen_sharing");
   };
   useEffect(() => () => {
-    cameraStream.current?.getTracks().forEach(track => track.stop());
+    // StudentExam owns camera and display streams across the readiness-to-exam handoff.
     microphoneStream.current?.getTracks().forEach(track => track.stop());
-    screenStream.current?.getTracks().forEach(track => track.stop());
     audioContext.current?.close().catch(() => undefined);
   }, []);
   useEffect(() => {
@@ -782,6 +783,13 @@ function ReadinessChecks({ onStart, error, fullscreenRequired, organizationId, e
     return () => { active = false; window.clearInterval(interval); };
   }, [organizationId, examId, refreshKey]);
   const checkCamera = async () => {
+    const existingTrack = cameraStream.current?.getVideoTracks().find(track => track.readyState === "live" && track.enabled);
+    if (cameraStreamHasLiveTrack(cameraStream.current) && existingTrack && cameraStream.current) {
+      if (videoRef.current) videoRef.current.srcObject = cameraStream.current;
+      setCamera(existingTrack.muted ? "Camera track is paused — wait for it to resume or reconnect it." : "Camera ready");
+      markChecked("camera");
+      return;
+    }
     stopCamera();
     setCamera("Checking camera access…");
     try {
@@ -794,15 +802,15 @@ function ReadinessChecks({ onStart, error, fullscreenRequired, organizationId, e
         track.addEventListener("ended", () => {
           setCamera("Camera disconnected — reconnect the camera and retry.");
           markChecked("camera");
-        }, { once: true });
+        });
         track.addEventListener("mute", () => {
           setCamera("Camera track is paused — reconnect it and retry.");
           markChecked("camera");
-        }, { once: true });
+        });
         track.addEventListener("unmute", () => {
           setCamera(cameraStreamIsActive(stream) ? "Camera ready" : "Camera is not active — reconnect it and retry.");
           markChecked("camera");
-        }, { once: true });
+        });
       });
     } catch (e) {
       setCamera(e instanceof Error ? e.message : "Camera access could not be verified.");
@@ -986,7 +994,7 @@ function ReadinessChecks({ onStart, error, fullscreenRequired, organizationId, e
       </div>
       <p role="status" className="mt-2 text-xs text-slate-600">{practiceCompleted ? "Practice interaction completed." : "Select the requested answer to complete this check."}</p>
     </fieldset>
-    <label className="mt-3 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-950"><input type="checkbox" className="mt-1" checked={monitoringConsent} onChange={event => { setMonitoringConsent(event.target.checked); markChecked("monitoring_consent"); }} /><span><b>Monitoring consent required.</b> I consent to periodic camera-frame AI analysis, full-display still images, and Bluetooth/Wi-Fi access-point observations from the Windows Companion. This is not continuous video. Images are private and reviewed by authorized people; automated signals are not proof of misconduct. Audio is not recorded or uploaded. I can stop sharing or withdraw consent, but monitoring will be interrupted. My institution must publish and apply an evidence-retention schedule. A normal browser cannot prevent switching to other applications.</span></label>
+    <label className="mt-3 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-950"><input type="checkbox" className="mt-1" checked={monitoringConsent} onChange={event => { setMonitoringConsent(event.target.checked); markChecked("monitoring_consent"); }} /><span><b>Monitoring consent required.</b> I consent to periodic camera-frame AI analysis, full-display still images, and Bluetooth/Wi-Fi access-point observations from the Windows Companion. This is not continuous video. Camera frames are analyzed every six seconds and are not retained by default; a frame is stored privately only when the existing 3-of-5 rule confirms a review signal. Full-display stills and linked incident context are also retained under my institution's published schedule. Automated signals are not proof of misconduct. Audio is not recorded or uploaded. I can stop sharing or withdraw consent, but monitoring will be interrupted. A normal browser cannot prevent switching to other applications.</span></label>
     <p className="mt-3 text-xs leading-5 text-slate-500">Browser camera, microphone, and screen capture are user-controlled. The server independently rechecks examination eligibility, authenticated AI availability, and private storage before creating an attempt; it does not trust browser claims about local hardware.</p>
     {(error || startError) && <p role="alert" className="mt-4 text-sm text-red-700">{startError || error}</p>}
     <button type="button" onClick={async () => {
@@ -1036,6 +1044,8 @@ function StudentExam({ session }: { session: Session }) {
   const [pairingError, setPairingError] = useState("");
   const [pairingLoading, setPairingLoading] = useState(false);
   const [aiStatus, setAiStatus] = useState("Starting AI monitoring…");
+  const [cameraStatus, setCameraStatus] = useState("Waiting for camera handoff.");
+  const [cameraStreamVersion, setCameraStreamVersion] = useState(0);
   const [attentionWarning, setAttentionWarning] = useState("");
   const [singleWindowBlocked, setSingleWindowBlocked] = useState(false);
   const [singleWindowMessage, setSingleWindowMessage] = useState("");
@@ -1104,9 +1114,12 @@ function StudentExam({ session }: { session: Session }) {
     const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
     stream?.getTracks().forEach((track) => track.stop());
     delete (window as any).__examguardCameraStream;
+    const screenStream = (window as any).__examguardScreenStream as MediaStream | undefined;
+    screenStream?.getTracks().forEach((track) => track.stop());
+    delete (window as any).__examguardScreenStream;
   }, []);
   const captureStreamFrame = async (stream: MediaStream | undefined, maxWidth: number, quality: number) => {
-    if (!stream?.active) return null;
+    if (!stream?.active || !stream.getVideoTracks().some(track => track.readyState === "live" && track.enabled && !track.muted)) return null;
     const video = document.createElement("video");
     video.srcObject = stream; video.muted = true; video.playsInline = true;
     try {
@@ -1119,7 +1132,8 @@ function StudentExam({ session }: { session: Session }) {
       const context = canvas.getContext("2d");
       if (!context) return null;
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      return await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+      return blob && blob.size > 0 ? blob : null;
     } finally {
       video.pause();
       video.srcObject = null;
@@ -1228,6 +1242,9 @@ function StudentExam({ session }: { session: Session }) {
         attemptId: data.attempt.id,
       };
       setLockAttemptId(data.attempt.id);
+      const cameraStream = (window as any).__examguardCameraStream as MediaStream | undefined;
+      setCameraStatus(cameraStreamIsActive(cameraStream) ? "Camera active" : "Camera unavailable. Reconnect it to continue monitoring.");
+      setCameraStreamVersion(version => version + 1);
       setPayload(data);
       setFullscreenLost(requiredFullscreen && !document.fullscreenElement);
       setAnswers(Object.fromEntries(data.answers.map((answer: any) => [String(answer.questionId), answer.value])));
@@ -1246,6 +1263,23 @@ function StudentExam({ session }: { session: Session }) {
       }
     } finally {
       startingAttempt.current = false;
+    }
+  };
+  const reconnectCamera = async () => {
+    if (!payload?.attempt?.id || receipt) return;
+    setCameraStatus("Requesting camera access…");
+    try {
+      const stream = await requestCameraStream(navigator.mediaDevices ?? null);
+      const previous = (window as any).__examguardCameraStream as MediaStream | undefined;
+      if (previous && previous !== stream) previous.getTracks().forEach(track => track.stop());
+      (window as any).__examguardCameraStream = stream;
+      setCameraStreamVersion(version => version + 1);
+      setCameraStatus("Camera active");
+      setAiStatus("Camera reconnected. Waiting for the next confirmed frame analysis.");
+    } catch (reconnectError) {
+      const message = reconnectError instanceof Error ? reconnectError.message : "Camera access could not be restored.";
+      setCameraStatus(`Camera unavailable: ${message}`);
+      setAiStatus("Camera recovery failed. Allow camera access in browser settings, close other camera apps, then retry.");
     }
   };
   useEffect(() => {
@@ -1591,51 +1625,77 @@ function StudentExam({ session }: { session: Session }) {
     if (!activeAttemptId || receipt) return;
     let stopped = false;
     let sending = false;
+    let resumeAfterCurrent = false;
     const analyzeFrame = async () => {
-      if (stopped || sending || document.visibilityState !== "visible") return;
+      if (stopped || document.visibilityState !== "visible") return;
+      if (sending) return;
       sending = true;
       try {
         const blob = await captureFrameBlob();
         if (stopped) return;
         if (!blob) {
-          setAiStatus("Camera frame not ready — AI check will retry.");
+          setAiStatus("No non-empty camera frame is available; frame analysis will retry.");
           return;
         }
         const form = new FormData();
         form.append("frame", blob, "camera-frame.jpg");
         const response = await api.post<{
-          analysis?: {
+          analysis: {
             face_count: number;
             multiple_faces: boolean;
             phone_detection: "detected" | "not_detected" | "unavailable";
             phone_confidence?: number | null;
           };
           recorded?: Array<{ type?: string; eventId?: string; occurredAt?: string }>;
+          evidenceAttached?: boolean;
         }>(`/api/student/attempts/${activeAttemptId}/ai-frame`, form, { timeout: 16_000 });
+        if (!response.data.analysis) throw new Error("The AI service did not confirm frame analysis.");
         for (const signal of response.data.recorded ?? []) {
           if (signal.eventId && signal.occurredAt) void captureIncidentContext(signal.eventId, signal.occurredAt);
         }
-        if (!stopped && import.meta.env.DEV && response.data.analysis) {
+        const evidenceStatus = response.data.evidenceAttached
+          ? "confirmed incident image saved"
+          : "no incident image retained for this frame";
+        if (!stopped && import.meta.env.DEV) {
           const { face_count, multiple_faces, phone_detection, phone_confidence } = response.data.analysis;
           const confidence = typeof phone_confidence === "number" ? ` ${phone_confidence.toFixed(2)}` : "";
           const recorded = response.data.recorded?.map((signal) => signal.type).filter(Boolean).join(", ") || "none";
-          setAiStatus(`Dev AI: ${face_count} faces; multiple ${multiple_faces ? "yes" : "no"}; phone ${phone_detection}${confidence}; event ${recorded}`);
+          setAiStatus(`AI analysis confirmed: ${face_count} faces; multiple ${multiple_faces ? "yes" : "no"}; phone ${phone_detection}${confidence}; event ${recorded}; ${evidenceStatus}.`);
         } else if (!stopped) {
-          setAiStatus("Active — AI frame checks are running");
+          setAiStatus(`AI frame analysis confirmed; ${evidenceStatus}.`);
         }
       } catch (analysisError) {
         if (!stopped) {
           const message = axios.isAxiosError(analysisError) ? analysisError.response?.data?.error : undefined;
-          setAiStatus(message ?? "AI monitoring temporarily unavailable — contact your organizer");
+          setAiStatus(`Camera frame analysis or upload failed: ${message ?? (analysisError instanceof Error ? analysisError.message : "check the connection and retry")}`);
         }
       } finally {
         sending = false;
+        if (resumeAfterCurrent) {
+          resumeAfterCurrent = false;
+          if (!stopped && document.visibilityState === "visible") void analyzeFrame();
+        }
       }
     };
-    void analyzeFrame();
+    const analyzeWhenVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      if (sending) {
+        resumeAfterCurrent = true;
+        setAiStatus("Exam tab is active again; waiting for the current frame request before resuming.");
+        return;
+      }
+      void analyzeFrame();
+    };
     const interval = window.setInterval(() => void analyzeFrame(), 6000);
-    return () => { stopped = true; window.clearInterval(interval); };
-  }, [payload?.attempt?.id, receipt]);
+    document.addEventListener("visibilitychange", analyzeWhenVisible);
+    void analyzeFrame();
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", analyzeWhenVisible);
+      resumeAfterCurrent = false;
+    };
+  }, [payload?.attempt?.id, receipt, cameraStreamVersion]);
   useEffect(() => {
     const activeAttemptId = payload?.attempt?.id;
     if (!activeAttemptId || receipt) {
@@ -1643,8 +1703,10 @@ function StudentExam({ session }: { session: Session }) {
       return;
     }
     let stopped = false;
+    let captureInFlight = false;
     const capture = async () => {
-      if (stopped || document.visibilityState !== "visible") return;
+      if (stopped || captureInFlight || document.visibilityState !== "visible") return;
+      captureInFlight = true;
       try {
         const blob = await captureFrameBlob();
         if (!blob || stopped) return;
@@ -1653,16 +1715,19 @@ function StudentExam({ session }: { session: Session }) {
           .filter(frame => frame.capturedAt >= capturedAt - 5_000)
           .slice(-6);
       } catch { /* Camera failures are reported by the monitoring request. */ }
+      finally { captureInFlight = false; }
     };
     void capture();
     const interval = window.setInterval(() => void capture(), 1_000);
+    document.addEventListener("visibilitychange", capture);
     return () => {
       stopped = true;
       window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", capture);
       contextBuffer.current = [];
       contextUploadEvents.current.clear();
     };
-  }, [payload?.attempt?.id, receipt]);
+  }, [payload?.attempt?.id, receipt, cameraStreamVersion]);
   useEffect(() => {
     const activeAttemptId = payload?.attempt?.id;
     if (!activeAttemptId || receipt) return;
@@ -1719,8 +1784,33 @@ function StudentExam({ session }: { session: Session }) {
     const activeAttemptId = payload?.attempt?.id;
     const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
     if (!activeAttemptId || receipt || !stream) return;
-    const handleEnded = (event: Event) => {
-      const track = event.target as MediaStreamTrack;
+    let active = true;
+    let eventReported = false;
+    const track = stream.getVideoTracks()[0];
+    if (!track) {
+      setCameraStatus("Camera unavailable. Reconnect it to continue monitoring.");
+      return;
+    }
+    const updateStatus = () => {
+      if (track.readyState !== "live" || !stream.active) {
+        setCameraStatus("Camera disconnected. Reconnect it to continue monitoring.");
+        setAiStatus("Camera is unavailable. Reconnect it; frame analysis cannot continue without an active camera.");
+      } else if (track.muted) {
+        setCameraStatus("Camera temporarily paused by the browser or device. Wait for it to resume or reconnect.");
+        setAiStatus("Camera track is paused; frame analysis will resume when the camera is available.");
+      } else if (!track.enabled) {
+        setCameraStatus("Camera track is disabled. Reconnect it to continue monitoring.");
+        setAiStatus("Camera track is disabled; frame analysis cannot continue until it is restored.");
+      } else {
+        setCameraStatus("Camera active");
+      }
+    };
+    const reportEnded = () => {
+      updateStatus();
+      if (eventReported) return;
+      eventReported = true;
+      contextBuffer.current = [];
+      contextUploadEvents.current.clear();
       void api.post(`/api/organizations/${session.organization.id}/proctoring/events`, {
         examId: payload.attempt.examId,
         candidateId: payload.attempt.candidateId,
@@ -1734,15 +1824,30 @@ function StudentExam({ session }: { session: Session }) {
           trackKind: track.kind,
           reason: "media_track_ended",
         },
-      }).catch(() => undefined);
-      contextBuffer.current = [];
-      contextUploadEvents.current.clear();
-      setAiStatus("Camera disconnected — reconnect the camera to continue monitoring");
+      }).catch((reportError) => {
+        if (!active) return;
+        const message = axios.isAxiosError(reportError) ? reportError.response?.data?.error : undefined;
+        setCameraStatus(`Camera disconnected. Its status could not be recorded: ${message ?? "check the connection"}.`);
+      });
     };
-    const tracks = stream.getVideoTracks();
-    tracks.forEach((track) => track.addEventListener("ended", handleEnded));
-    return () => tracks.forEach((track) => track.removeEventListener("ended", handleEnded));
-  }, [payload?.attempt?.candidateId, payload?.attempt?.examId, payload?.attempt?.id, receipt, session.organization.id]);
+    const handleMute = () => updateStatus();
+    const handleUnmute = () => updateStatus();
+    const handleDeviceChange = () => updateStatus();
+    track.addEventListener("ended", reportEnded);
+    track.addEventListener("mute", handleMute);
+    track.addEventListener("unmute", handleUnmute);
+    stream.addEventListener("inactive", reportEnded);
+    navigator.mediaDevices?.addEventListener("devicechange", handleDeviceChange);
+    updateStatus();
+    return () => {
+      active = false;
+      track.removeEventListener("ended", reportEnded);
+      track.removeEventListener("mute", handleMute);
+      track.removeEventListener("unmute", handleUnmute);
+      stream.removeEventListener("inactive", reportEnded);
+      navigator.mediaDevices?.removeEventListener("devicechange", handleDeviceChange);
+    };
+  }, [payload?.attempt?.candidateId, payload?.attempt?.examId, payload?.attempt?.id, receipt, session.organization.id, cameraStreamVersion]);
   useEffect(() => {
     const hasCodingQuestions = Boolean(payload?.questions?.some((item: any) => item.type === "coding"));
     if (payload && left === 0 && !hasCodingQuestions) void submit(true);
@@ -1830,9 +1935,10 @@ function StudentExam({ session }: { session: Session }) {
           {payload.exam.isPractice && <p className="text-sm font-medium text-amber-800">Practice mode — this attempt is not graded or included in official reports.</p>}
           <p className="text-sm text-slate-500">{payload.exam.instructions}</p>
         </div>
-        <div className="flex flex-wrap items-center gap-4"><span className="text-xs font-semibold text-slate-600">{pairingLoading ? "Connecting Companion…" : "Companion required"}</span><CompanionStatus attemptId={payload.attempt.id} /><span className="text-xs font-semibold text-emerald-700">One active ExamGuard exam enforced</span><span className="max-w-48 text-right text-xs text-slate-500">{aiStatus}</span><div className="flex flex-col items-end gap-1"><ExamTimer ms={left} /><SyncIndicator online={online} sync={syncSnap} /></div></div>
+        <div className="flex flex-wrap items-center gap-4"><span className="text-xs font-semibold text-slate-600">{pairingLoading ? "Connecting Companion…" : "Companion required"}</span><CompanionStatus attemptId={payload.attempt.id} /><span className="text-xs font-semibold text-emerald-700">One active ExamGuard exam enforced</span><span className={`max-w-48 text-right text-xs ${cameraStatus === "Camera active" ? "text-emerald-700" : "text-amber-800"}`}>Browser camera: {cameraStatus}</span><span className="max-w-48 text-right text-xs text-slate-500">{aiStatus}</span><div className="flex flex-col items-end gap-1"><ExamTimer ms={left} /><SyncIndicator online={online} sync={syncSnap} /></div></div>
       </div>
       {error && !reviewing && <p role="alert" className="mb-3 text-sm text-red-600">{error}</p>}
+      {cameraStatus !== "Camera active" && <div role="alert" className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"><span><b>Browser camera needs attention.</b> {cameraStatus} Allow camera access in browser site settings, close other apps using the camera, then reconnect. The Windows Companion status is shown separately.</span><button type="button" onClick={() => void reconnectCamera()} className="font-semibold underline">Reconnect camera</button></div>}
       {attentionWarning && <div role="alert" className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"><span><b>Attention required.</b> {attentionWarning}</span><div className="flex items-center gap-3">{!fullDisplayStreamIsActive((window as any).__examguardScreenStream as MediaStream | undefined) && <button type="button" onClick={() => void resumeScreenSharing()} className="font-semibold underline">Resume full-display sharing</button>}{!document.fullscreenElement && <button type="button" onClick={() => { void document.documentElement.requestFullscreen?.().catch(() => setAttentionWarning("Fullscreen could not be restored. Continue only after your organizer helps resolve the browser issue.")); }} className="font-semibold underline">Return to fullscreen</button>}<button type="button" onClick={() => setAttentionWarning("")} className="font-semibold">Dismiss</button></div></div>}
       <div className="grid gap-5 lg:grid-cols-[1fr_250px]">
         <section className="card">

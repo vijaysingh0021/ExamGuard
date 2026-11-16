@@ -3,6 +3,8 @@ using System;
 using System.Drawing;
 using System.Linq;
 using Microsoft.Win32;
+using System.IO;
+using System.IO.Pipes;
 using System.Net.Http;
 using System.Net;
 using System.Net.Http.Headers;
@@ -21,17 +23,122 @@ namespace ExamGuard.DeviceMonitor;
 
 internal static class Program
 {
+    private const string ActivationPipeName = "ExamGuard.DeviceMonitor.Activation";
+    private const byte ActivateCommand = 1;
     private static Mutex? singleInstance;
 
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
         singleInstance = new Mutex(true, "ExamGuard.DeviceMonitor.SingleInstance", out var ownsMutex);
         if (!ownsMutex)
+        {
+            if (args.Any(IsStartProtocolArgument) && !SignalExistingInstance())
+            {
+                MessageBox.Show(
+                    "The running ExamGuard Companion could not be activated.",
+                    "ExamGuard Companion",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
             return;
+        }
+
         ApplicationConfiguration.Initialize();
-        try { Application.Run(new MonitorForm()); }
-        finally { singleInstance.ReleaseMutex(); singleInstance.Dispose(); }
+        var form = new MonitorForm();
+        _ = form.Handle;
+        using var activationCancellation = new CancellationTokenSource();
+        var activationTask = RunActivationServerAsync(form, activationCancellation.Token);
+        try { Application.Run(form); }
+        finally
+        {
+            activationCancellation.Cancel();
+            try { activationTask.GetAwaiter().GetResult(); }
+            finally { singleInstance.ReleaseMutex(); singleInstance.Dispose(); }
+        }
+    }
+
+    private static bool IsStartProtocolArgument(string argument) =>
+        Uri.TryCreate(argument, UriKind.Absolute, out var uri) &&
+        string.Equals(uri.Scheme, "examguard-companion", StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(uri.Host, "start", StringComparison.OrdinalIgnoreCase);
+
+    private static bool SignalExistingInstance()
+    {
+        const int timeoutMilliseconds = 5000;
+        var elapsedMilliseconds = 0;
+        while (elapsedMilliseconds < timeoutMilliseconds)
+        {
+            try
+            {
+                using var pipe = new NamedPipeClientStream(
+                    ".",
+                    ActivationPipeName,
+                    PipeDirection.Out,
+                    PipeOptions.Asynchronous);
+                pipe.Connect(250);
+                pipe.WriteByte(ActivateCommand);
+                pipe.Flush();
+                return true;
+            }
+            catch (Exception ex) when (ex is IOException or TimeoutException or UnauthorizedAccessException)
+            {
+                Thread.Sleep(100);
+                elapsedMilliseconds += 350;
+            }
+        }
+
+        return false;
+    }
+
+    private static async Task RunActivationServerAsync(
+        MonitorForm form,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                using var pipe = new NamedPipeServerStream(
+                    ActivationPipeName,
+                    PipeDirection.In,
+                    1,
+                    PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                await pipe.WaitForConnectionAsync(cancellationToken);
+
+                using var readTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                readTimeout.CancelAfter(TimeSpan.FromSeconds(2));
+                var command = new byte[1];
+                try
+                {
+                    var bytesRead = await pipe.ReadAsync(command.AsMemory(), readTimeout.Token);
+                    if (bytesRead == 1 && command[0] == ActivateCommand)
+                        await form.ActivateFromProtocolAsync();
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    // Ignore incomplete local IPC clients and continue accepting activation requests.
+                }
+                catch (IOException)
+                {
+                    // A client may disconnect before sending its command.
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (ObjectDisposedException) when (form.IsDisposed || cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (InvalidOperationException) when (form.IsDisposed || cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            form.Add($"Single-instance activation channel failed: {ex.Message}");
+        }
     }
 }
 
@@ -115,6 +222,7 @@ internal sealed class MonitorForm : Form
     private readonly NotifyIcon trayIcon;
     private readonly CancellationTokenSource bridgeCancellation = new();
     private Task? bridgeTask;
+    private bool bridgeStartAttempted;
     private System.Threading.Timer? heartbeatTimer;
     private System.Threading.Timer? wifiScanTimer;
 
@@ -243,14 +351,12 @@ internal sealed class MonitorForm : Form
             }
         };
 
-        FormClosing += async (_, e) =>
+        FormClosing += (_, e) =>
         {
-            if (scanning && !closing)
+            if (e.CloseReason == CloseReason.UserClosing && !closing)
             {
                 e.Cancel = true;
-                await StopAsync();
-                closing = true;
-                Close();
+                HideToTray();
             }
         };
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) HideToTray(); };
@@ -266,8 +372,16 @@ internal sealed class MonitorForm : Form
     {
         Show();
         WindowState = FormWindowState.Normal;
+        BringToFront();
         Activate();
     }
+
+    internal Task ActivateFromProtocolAsync() =>
+        InvokeOnUiAsync(() =>
+        {
+            RestoreFromTray();
+            return Task.CompletedTask;
+        });
 
     private async Task CloseFromTrayAsync()
     {
@@ -470,19 +584,24 @@ internal sealed class MonitorForm : Form
         }
     }
 
-    private async Task StartLocalBridgeAsync()
+    private Task StartLocalBridgeAsync()
     {
+        if (bridgeStartAttempted)
+            return Task.CompletedTask;
+
+        bridgeStartAttempted = true;
         try
         {
+            bridge.Server.ExclusiveAddressUse = true;
             bridge.Start();
             Add("Local browser bridge is ready on 127.0.0.1:43117.");
             bridgeTask = Task.Run(() => LocalBridgeLoopAsync(bridgeCancellation.Token));
         }
         catch (SocketException ex)
         {
-            Add($"Local browser bridge could not start: {ex.SocketErrorCode}. Another process may already be using port 43117.");
+            Add($"Local browser bridge could not start on 127.0.0.1:43117: {ex.SocketErrorCode} ({ex.Message}).");
         }
-        await Task.CompletedTask;
+        return Task.CompletedTask;
     }
 
     private async Task LocalBridgeLoopAsync(CancellationToken cancellationToken)
@@ -495,10 +614,24 @@ internal sealed class MonitorForm : Form
                 client = await bridge.AcceptTcpClientAsync(cancellationToken);
             }
             catch (OperationCanceledException) { break; }
-            catch (SocketException) { break; }
+            catch (SocketException ex)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    break;
+                Add($"Local browser bridge accept failed: {ex.SocketErrorCode} ({ex.Message}).");
+                try
+                {
+                    await Task.Delay(250, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                continue;
+            }
             catch (ObjectDisposedException) { break; }
 
-            _ = Task.Run(() => HandleLocalBridgeRequestAsync(client), cancellationToken);
+            _ = Task.Run(() => HandleLocalBridgeRequestAsync(client));
         }
     }
 
@@ -1029,7 +1162,7 @@ internal sealed class MonitorForm : Form
         wifiStatus.Text = value;
     }
 
-    private void Add(string message)
+    internal void Add(string message)
     {
         if (IsDisposed || Disposing)
             return;

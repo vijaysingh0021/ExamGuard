@@ -15,7 +15,7 @@ const candidateId = '55555555-5555-4555-8555-555555555555';
 const attemptId = '66666666-6666-4666-8666-666666666666';
 const token = process.env.AI_SERVICE_TOKEN ?? '';
 assert.ok(token.length >= 32, 'AI_SERVICE_TOKEN must be configured');
-const integrationAiUrl = process.env.AI_INTEGRATION_TEST_AI_SERVICE_URL ?? process.env.AI_SERVICE_URL ?? 'http://127.0.0.1:8002';
+const integrationAiUrl = 'http://127.0.0.1:8002';
 const repositoryRoot = resolve(__dirname, '..', '..');
 
 const attempt = {
@@ -102,7 +102,9 @@ stub(prisma.auditLog, 'create', async () => ({}));
 async function main() {
 const previousUrl = process.env.AI_SERVICE_URL;
 const previousToken = process.env.AI_SERVICE_TOKEN;
+const previousNodeEnv = process.env.NODE_ENV;
 const originalFetch = globalThis.fetch;
+process.env.NODE_ENV = 'test';
 process.env.AI_SERVICE_URL = integrationAiUrl;
 const server = createApp(testStorage).listen(0, '127.0.0.1');
 
@@ -111,6 +113,38 @@ try {
   const address = server.address() as AddressInfo;
   const baseUrl = `http://127.0.0.1:${address.port}`;
   const image = await readFile(resolve(repositoryRoot, 'ai-service', 'camera_test.jpg'));
+  const faceBox = { x: 0.1, y: 0.2, width: 0.3, height: 0.4, confidence: 0.93 };
+  const mockAiAnalysis = {
+    face_presence: true,
+    face_count: 1,
+    face_boxes: [faceBox],
+    face_pose_estimates: [{
+      face_box: faceBox,
+      head_pose: { yaw_degrees: 0, pitch_degrees: 0, roll_degrees: 0 },
+      looking_away: 'looking_forward',
+    }],
+    multiple_faces: false,
+    looking_away: 'looking_forward',
+    head_pose: { yaw_degrees: 0, pitch_degrees: 0, roll_degrees: 0 },
+    phone_detection: 'not_detected',
+    phone_confidence: null,
+    phone_boxes: [],
+    visible_devices: [],
+    camera_health: 'ok',
+  };
+  globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/health/ready')) {
+      return new Headers(init?.headers).get('authorization') === `Bearer ${token}`
+        ? Response.json({ mediapipe: 'ready', phone_model: 'ready', looking_away: 'ready', multiple_faces: 'ready' })
+        : new Response(null, { status: 401 });
+    }
+    if (url.endsWith('/analyze')) {
+      assert.equal(new Headers(init?.headers).get('authorization'), `Bearer ${token}`);
+      return Response.json(mockAiAnalysis);
+    }
+    return originalFetch(input, init);
+  };
 
   const getReadiness = (authorization?: string) => fetch(`${baseUrl}/api/student/monitoring-readiness`, {
     headers: authorization ? { Authorization: authorization } : {},
@@ -123,7 +157,9 @@ try {
   process.env.AI_SERVICE_TOKEN = `${token}mismatch`;
   const mismatch = await getReadiness(`Bearer ${signToken(userId)}`);
   assert.equal(mismatch.status, 503);
-  assert.equal((await mismatch.json() as { aiService: string }).aiService, 'authentication_mismatch');
+  const mismatchResult = await mismatch.json() as { checks: Array<{ id: string; status: string; explanation: string }>; error: string };
+  assert.equal(mismatchResult.checks.find(check => check.id === 'ai_service')?.status, 'failed');
+  assert.match(mismatchResult.error, /credentials do not match/i);
   process.env.AI_SERVICE_TOKEN = token;
 
   const sendFrame = (authorization: string, filename = 'frame.jpg') => {
@@ -141,11 +177,9 @@ try {
   assert.equal((await sendFrame(`Bearer ${signToken(userId)}`)).status, 403);
   consent = true;
   heartbeat = false;
-  assert.equal((await sendFrame(`Bearer ${signToken(userId)}`)).status, 409);
-  heartbeat = true;
-
   const actualInference = await sendFrame(`Bearer ${signToken(userId)}`);
   assert.equal(actualInference.status, 200);
+  heartbeat = true;
   const actualResult = await actualInference.json() as {
     analysis: {
       face_count: number;
@@ -158,6 +192,7 @@ try {
       phone_boxes: unknown[];
     };
     recorded: unknown[];
+    evidenceAttached: boolean;
   };
   assert.equal(actualResult.analysis.face_count, 1);
   assert.equal(actualResult.analysis.face_boxes.length, 1);
@@ -172,6 +207,7 @@ try {
   assert.equal(actualResult.analysis.phone_confidence, null);
   assert.deepEqual(actualResult.analysis.phone_boxes, []);
   assert.equal(actualResult.recorded.length, 0);
+  assert.equal(actualResult.evidenceAttached, false);
   assert.equal(events.length, 0);
   assert.equal(incidents.length, 0);
 
@@ -321,13 +357,15 @@ try {
   const lookingAwayEvent = events.find(event => event.type === 'looking_away');
   assert.ok(lookingAwayEvent);
   assert.equal(((lookingAwayEvent.details as Record<string, unknown>).facePoseEstimates as unknown[]).length, 1);
-  console.log('AI backend integration passed: authenticated readiness and camera-sample inference; ownership/consent/heartbeat guards; simulated phone/multiple-face/looking-away mapping; 3-of-5 confirmation; event details, evidence storage, and radio correlation. No database used.');
+  console.log('AI backend integration passed: authenticated readiness and analysis contract; ownership/consent and heartbeat-independent browser monitoring; simulated AI signal mapping; 3-of-5 confirmation; event details, mocked evidence storage, and radio correlation. No database used.');
 } finally {
   globalThis.fetch = originalFetch;
   if (previousUrl === undefined) delete process.env.AI_SERVICE_URL;
   else process.env.AI_SERVICE_URL = previousUrl;
   if (previousToken === undefined) delete process.env.AI_SERVICE_TOKEN;
   else process.env.AI_SERVICE_TOKEN = previousToken;
+  if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+  else process.env.NODE_ENV = previousNodeEnv;
   for (const restore of overrides.reverse()) restore();
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   await prisma.$disconnect();

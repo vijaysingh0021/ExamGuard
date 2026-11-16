@@ -95,6 +95,10 @@ function hasLiveTrack(stream: MediaStream | null | undefined, kind: 'audio' | 'v
   return Boolean(tracks?.some(track => track.readyState === 'live' && track.enabled && !track.muted));
 }
 
+export function cameraStreamHasLiveTrack(stream: MediaStream | null | undefined): boolean {
+  return Boolean(stream?.getVideoTracks().some(track => track.readyState === 'live' && track.enabled));
+}
+
 export function cameraStreamIsActive(stream: MediaStream | null | undefined): boolean {
   return hasLiveTrack(stream, 'video');
 }

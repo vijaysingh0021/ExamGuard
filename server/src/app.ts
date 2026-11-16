@@ -2037,8 +2037,6 @@ app.post('/api/student/attempts/:attemptId/ai-frame', authenticate, aiFrameLimit
   if (!attempt) return res.status(409).json({ error: 'An active authorized attempt is required' });
   if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v2') return res.status(403).json({ error: 'Monitoring consent is not recorded for this attempt' });
   if (!req.file || !['image/jpeg', 'image/png', 'image/webp'].includes(req.file.mimetype)) return res.status(415).json({ error: 'A JPEG, PNG, or WebP camera frame is required' });
-  const companionHeartbeat = await prisma.radioObservation.findFirst({ where: { organizationId: attempt.organizationId, attemptId, source: 'scanner_health', kind: 'heartbeat', scannerStatus: 'active', observedAt: { gt: new Date(Date.now() - 90_000) } }, select: { id: true } });
-  if (!companionHeartbeat) return res.status(409).json({ error: 'The required Windows Companion is not reporting. Reconnect it to continue monitoring.' });
   const serviceUrl = process.env.AI_SERVICE_URL;
   const serviceToken = process.env.AI_SERVICE_TOKEN;
   if (!serviceUrl || !serviceToken || serviceToken.length < 32) return res.status(503).json({ error: 'The AI service is not securely configured. Set AI_SERVICE_URL and the same 32-character AI_SERVICE_TOKEN on the API and AI service.' });
@@ -2113,7 +2111,7 @@ app.post('/api/student/attempts/:attemptId/ai-frame', authenticate, aiFrameLimit
     camera_obstructed: analysis.camera_health === 'obstructed',
     potential_visual_assistance: analysis.potential_visual_assistance.flagged,
   });
-  if (!qualified.length) return res.json({ analysis, recorded: [], temporalRule: '3_of_5_frames' });
+  if (!qualified.length) return res.json({ analysis, recorded: [], evidenceAttached: false, temporalRule: '3_of_5_frames' });
 
   const config = await orgConfig(attempt.organizationId);
   const examRecord = await prisma.exam.findUniqueOrThrow({ where: { id: attempt.examId } });
@@ -2126,7 +2124,7 @@ app.post('/api/student/attempts/:attemptId/ai-frame', authenticate, aiFrameLimit
     if (await prisma.proctoringEvent.findFirst({ where: { organizationId: attempt.organizationId, fingerprint }, select: { id: true } })) duplicates.push({ type, deduplicated: true });
     else freshSignals.push({ type, occurredAt, fingerprint });
   }
-  if (!freshSignals.length) return res.json({ analysis, recorded: duplicates, temporalRule: '3_of_5_frames' });
+  if (!freshSignals.length) return res.json({ analysis, recorded: duplicates, evidenceAttached: false, temporalRule: '3_of_5_frames' });
 
   const storage = req.app.get('storage') as StorageInterface;
   if (!storage.storageConfigured()) return res.status(503).json({ error: 'AI signals were observed repeatedly, but private evidence storage is not configured. Configure private object storage before using AI incident capture.' });
@@ -2434,6 +2432,15 @@ app.get('/api/organizations/:organizationId/evidence', authenticate, authorize(.
     ...(['bluetooth_le', 'wifi', 'scanner_health'].includes(filters.search) ? [{ source: filters.search }] : []),
     ...(['advertisement', 'access_point', 'scan_unavailable', 'permission_denied', 'scan_error', 'scan_stopped'].includes(filters.search) ? [{ kind: filters.search }] : []),
   ] : undefined;
+  const incidentFilters: any[] = [
+    ...(filters.incidentId ? [{ incidents: { some: { incidentId: filters.incidentId } } }] : []),
+    ...(filters.reviewStatus === 'pending_review' ? [{ incidents: { some: { incident: { status: { in: ['open', 'awaiting_student'] } } } } }] : []),
+    ...(filters.reviewStatus === 'reviewed' ? [
+      { incidents: { some: { incident: { status: { in: ['dismissed', 'resolved'] } } } } },
+      { incidents: { none: { incident: { status: { in: ['open', 'awaiting_student', 'escalated'] } } } } },
+    ] : []),
+    ...(filters.reviewStatus === 'escalated' ? [{ incidents: { some: { incident: { status: 'escalated' } } } }] : []),
+  ];
   const eventWhere: any = {
     organizationId,
     candidate: { is: { organizationId } },
@@ -2448,9 +2455,7 @@ app.get('/api/organizations/:organizationId/evidence', authenticate, authorize(.
     ...(filters.type === 'image' ? { evidenceKey: { not: null } } : {}),
     ...(filters.type === 'browser_event' ? { source: 'browser', evidenceKey: null } : {}),
     ...(filters.type === 'ai_signal' ? { source: 'ai_service' } : {}),
-    ...(filters.reviewStatus === 'pending_review' ? { incidents: { some: { incident: { status: { in: ['open', 'awaiting_student'] } } } } } : {}),
-    ...(filters.reviewStatus === 'reviewed' ? { AND: [{ incidents: { some: { incident: { status: { in: ['dismissed', 'resolved'] } } } } }, { incidents: { none: { incident: { status: { in: ['open', 'awaiting_student', 'escalated'] } } } } }] } : {}),
-    ...(filters.reviewStatus === 'escalated' ? { incidents: { some: { incident: { status: 'escalated' } } } } : {}),
+    ...(incidentFilters.length ? { AND: incidentFilters } : {}),
   };
   const radioWhere: any = {
     organizationId,
@@ -2483,8 +2488,8 @@ app.get('/api/organizations/:organizationId/evidence', authenticate, authorize(.
     ] } : {}),
   };
   const includeEvents = !filters.type || ['image', 'browser_event', 'ai_signal'].includes(filters.type);
-  const includeRadio = !filters.type || filters.type === 'radio_observation';
-  const includeCode = !filters.type || filters.type === 'coding_submission';
+  const includeRadio = !filters.incidentId && (!filters.type || filters.type === 'radio_observation');
+  const includeCode = !filters.incidentId && (!filters.type || filters.type === 'coding_submission');
   const offset = evidenceOffset(filters.page, filters.pageSize);
   const [eventCount, radioCount, codeCount, events, radiosResult, codeSubmissions] = await Promise.all([
     includeEvents ? prisma.proctoringEvent.count({ where: eventWhere }) : 0,

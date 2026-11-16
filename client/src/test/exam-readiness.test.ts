@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   browserCompatibility,
+  cameraStreamHasLiveTrack,
   cameraStreamIsActive,
   checkCompanionBridge,
   fullDisplayStreamIsActive,
@@ -61,7 +62,15 @@ describe("examination media readiness", () => {
     expect(await requestCameraStream({ getUserMedia: vi.fn().mockResolvedValue(cameraStream) })).toBe(cameraStream);
     expect(await requestMicrophoneStream({ getUserMedia: vi.fn().mockResolvedValue(microphoneStream) })).toBe(microphoneStream);
     expect(cameraStreamIsActive(cameraStream)).toBe(true);
+    expect(cameraStreamHasLiveTrack(cameraStream)).toBe(true);
     expect(microphoneStreamIsActive(microphoneStream)).toBe(true);
+    camera.muted = true;
+    expect(cameraStreamIsActive(cameraStream)).toBe(false);
+    expect(cameraStreamHasLiveTrack(cameraStream)).toBe(true);
+    camera.muted = false;
+    camera.enabled = false;
+    expect(cameraStreamHasLiveTrack(cameraStream)).toBe(false);
+    camera.enabled = true;
     camera.stop();
     microphone.stop();
     expect(cameraStreamIsActive(cameraStream)).toBe(false);

@@ -24,6 +24,7 @@ import {
 const candidateId = '550e8400-e29b-41d4-a716-446655440001';
 const examId = '550e8400-e29b-41d4-a716-446655440002';
 const attemptId = '550e8400-e29b-41d4-a716-446655440003';
+const incidentId = '550e8400-e29b-41d4-a716-446655440004';
 
 test('evidence inventory pagination defaults and maximums are validated', () => {
   assert.deepEqual(evidenceInventoryQuerySchema.parse({}), { page: 1, pageSize: 50 });
@@ -33,9 +34,10 @@ test('evidence inventory pagination defaults and maximums are validated', () => 
   assert.equal(evidenceInventoryQuerySchema.safeParse({ page: 0 }).success, false);
 });
 
-test('evidence inventory validates candidate, exam, attempt, type and review filters', () => {
-  assert.equal(evidenceInventoryQuerySchema.safeParse({ candidateId, examId, attemptId, type: 'radio_observation', reviewStatus: 'pending_review' }).success, true);
+test('evidence inventory validates candidate, exam, attempt, incident, type and review filters', () => {
+  assert.equal(evidenceInventoryQuerySchema.safeParse({ candidateId, examId, attemptId, incidentId, type: 'radio_observation', reviewStatus: 'pending_review' }).success, true);
   assert.equal(evidenceInventoryQuerySchema.safeParse({ candidateId: 'bad' }).success, false);
+  assert.equal(evidenceInventoryQuerySchema.safeParse({ incidentId: 'bad' }).success, false);
   assert.equal(evidenceInventoryQuerySchema.safeParse({ type: 'screen_recording' }).success, false);
   assert.equal(evidenceInventoryQuerySchema.safeParse({ reviewStatus: 'dismissed' }).success, false);
 });

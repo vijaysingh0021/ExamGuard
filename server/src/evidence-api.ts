@@ -9,6 +9,7 @@ export const evidenceInventoryQuerySchema = z.object({
   candidateId: z.string().uuid().optional(),
   examId: z.string().uuid().optional(),
   attemptId: z.string().uuid().optional(),
+  incidentId: z.string().uuid().optional(),
   type: z.enum(['image', 'browser_event', 'ai_signal', 'radio_observation', 'coding_submission']).optional(),
   reviewStatus: z.enum(['pending_review', 'reviewed', 'escalated']).optional(),
   from: z.string().datetime().optional(),
