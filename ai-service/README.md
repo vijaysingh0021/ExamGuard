@@ -44,6 +44,16 @@ Override these environment variables only after validating latency, memory,
 and detection behavior on the target instance. The input byte and pixel limits,
 authentication, and private evidence handling are unchanged.
 
+## Face-count response contract
+
+The maximum supported face count per frame is 20, matching the backend's strict
+AI response schema. Full-frame and tiled detections are never truncated. If
+aggregation finds more than 20 faces, `/analyze` returns HTTP 422 with
+`detail.code=face_count_limit_exceeded`, the detected count, and the maximum;
+the backend surfaces that rejection instead of recording a successful
+analysis. Change the limit only in both services and keep the boundary tests
+in sync.
+
 Face detection uses MediaPipe's long-range model (`model_selection=1`).
 On the checked group sample it detected eight faces; the short-range model
 detected none. It also detected the single face in `camera_test.jpg`. When a

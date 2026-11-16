@@ -5,27 +5,21 @@ import jwt from 'jsonwebtoken';
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import type { StorageInterface } from '../src/storage.js';
-import '../src/config.js';
 
-// Safety guard: refuse to run if database is not examguard_test
-const configuredDatabaseUrl = process.env.DATABASE_URL;
-if (!configuredDatabaseUrl) {
-  throw new Error('DATABASE_URL must be loaded from the root .env file.');
+const configuredTestDatabaseUrl = process.env.TEST_DATABASE_URL;
+if (!configuredTestDatabaseUrl) {
+  throw new Error('TEST_DATABASE_URL must be explicitly configured for evidence-upload tests.');
 }
-const testDatabaseUrl = new URL(configuredDatabaseUrl);
+const testDatabaseUrl = new URL(configuredTestDatabaseUrl);
 if (
-  !['localhost', '127.0.0.1', '[::1]'].includes(testDatabaseUrl.hostname) ||
+  !['localhost', '127.0.0.1'].includes(testDatabaseUrl.hostname) ||
   !['postgres:', 'postgresql:'].includes(testDatabaseUrl.protocol)
 ) {
-  throw new Error('SAFETY VIOLATION: Tests require a local PostgreSQL database.');
+  throw new Error('SAFETY VIOLATION: Evidence-upload tests require a local PostgreSQL database.');
 }
-testDatabaseUrl.pathname = '/examguard_test';
 const TEST_DATABASE_URL = testDatabaseUrl.toString();
-if (new URL(TEST_DATABASE_URL).pathname !== '/examguard_test') {
-  throw new Error('SAFETY VIOLATION: Test database must be examguard_test.');
-}
-if (!TEST_DATABASE_URL.includes('examguard_test')) {
-  throw new Error('SAFETY VIOLATION: Test database must be examguard_test');
+if (decodeURIComponent(new URL(TEST_DATABASE_URL).pathname.replace(/^\/+/, '')) !== 'examguard_test') {
+  throw new Error('SAFETY VIOLATION: TEST_DATABASE_URL must target examguard_test.');
 }
 
 Object.assign(process.env, {
@@ -86,6 +80,7 @@ async function cleanup() {
 
   await prisma.incidentEvent.deleteMany({ where: { event: eventScope } });
   await prisma.proctoringEvent.deleteMany({ where: eventScope });
+  await prisma.incident.deleteMany({ where: { organizationId: { in: [TEST_ORG_ID, OTHER_ORG_ID] } } });
   await prisma.evidenceObject.deleteMany({ where: { attemptId: { in: attemptIds } } });
 
   // Delete all exam attempts first (including for other exams)
@@ -93,7 +88,7 @@ async function cleanup() {
     where: { OR: [{ id: { in: attemptIds } }, { examId: TEST_EXAM_ID }] }
   });
 
-  await prisma.attemptAnswer.deleteMany({ where: { attemptId: TEST_ATTEMPT_ID } });
+  await prisma.attemptAnswer.deleteMany({ where: { attemptId: { in: attemptIds } } });
   await prisma.question.deleteMany({ where: { examId: TEST_EXAM_ID } });
   await prisma.membership.deleteMany({ where: { userId: TEST_USER_ID } });
 
@@ -122,6 +117,25 @@ async function cleanup() {
   await prisma.candidate.deleteMany({ where: { OR: [{ id: SECOND_CANDIDATE_ID }, { id: OTHER_CANDIDATE_ID }] } });
   await prisma.auditLog.deleteMany({ where: { organizationId: { in: [TEST_ORG_ID, OTHER_ORG_ID] } } });
   await prisma.organization.deleteMany({ where: { OR: [{ id: TEST_ORG_ID }, { id: OTHER_ORG_ID }] } });
+}
+
+async function assertNoTestRecords() {
+  const counts = {
+    incidentEvents: await prisma.incidentEvent.count({ where: { event: { attemptId: { in: [TEST_ATTEMPT_ID, SECOND_ATTEMPT_ID, OTHER_ATTEMPT_ID, EXPIRED_ATTEMPT_ID, SUBMITTED_ATTEMPT_ID] } } } }),
+    proctoringEvents: await prisma.proctoringEvent.count({ where: { attemptId: { in: [TEST_ATTEMPT_ID, SECOND_ATTEMPT_ID, OTHER_ATTEMPT_ID, EXPIRED_ATTEMPT_ID, SUBMITTED_ATTEMPT_ID] } } }),
+    incidents: await prisma.incident.count({ where: { organizationId: { in: [TEST_ORG_ID, OTHER_ORG_ID] } } }),
+    evidenceObjects: await prisma.evidenceObject.count({ where: { attemptId: { in: [TEST_ATTEMPT_ID, SECOND_ATTEMPT_ID, OTHER_ATTEMPT_ID, EXPIRED_ATTEMPT_ID, SUBMITTED_ATTEMPT_ID] } } }),
+    attempts: await prisma.examAttempt.count({ where: { id: { in: [TEST_ATTEMPT_ID, SECOND_ATTEMPT_ID, OTHER_ATTEMPT_ID, EXPIRED_ATTEMPT_ID, SUBMITTED_ATTEMPT_ID] } } }),
+    answers: await prisma.attemptAnswer.count({ where: { attemptId: { in: [TEST_ATTEMPT_ID, SECOND_ATTEMPT_ID, OTHER_ATTEMPT_ID, EXPIRED_ATTEMPT_ID, SUBMITTED_ATTEMPT_ID] } } }),
+    exams: await prisma.exam.count({ where: { id: { in: [TEST_EXAM_ID, OTHER_EXAM_ID, EXPIRED_EXAM_ID, SUBMITTED_EXAM_ID] } } }),
+    questions: await prisma.question.count({ where: { examId: { in: [TEST_EXAM_ID, OTHER_EXAM_ID, EXPIRED_EXAM_ID, SUBMITTED_EXAM_ID] } } }),
+    memberships: await prisma.membership.count({ where: { userId: { in: [TEST_USER_ID, SECOND_USER_ID, OTHER_USER_ID] } } }),
+    auditLogs: await prisma.auditLog.count({ where: { organizationId: { in: [TEST_ORG_ID, OTHER_ORG_ID] } } }),
+    candidates: await prisma.candidate.count({ where: { organizationId: { in: [TEST_ORG_ID, OTHER_ORG_ID] } } }),
+    users: await prisma.user.count({ where: { id: { in: [TEST_USER_ID, SECOND_USER_ID, OTHER_USER_ID] } } }),
+    organizations: await prisma.organization.count({ where: { id: { in: [TEST_ORG_ID, OTHER_ORG_ID] } } }),
+  };
+  assert.deepEqual(counts, Object.fromEntries(Object.keys(counts).map(key => [key, 0])), 'Test cleanup must leave no fixture records.');
 }
 
 async function setupTestData() {
@@ -311,9 +325,13 @@ test.before(async () => {
 });
 
 test.after(async () => {
-  await cleanup();
-  await prisma.$disconnect();
-  process.env = previousEnv;
+  try {
+    await cleanup();
+    await assertNoTestRecords();
+  } finally {
+    await prisma.$disconnect();
+    process.env = previousEnv;
+  }
 });
 
 // Test 1: Candidate uploads evidence to their own active attempt - should succeed (returns 201 with mocked storage)

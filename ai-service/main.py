@@ -1,6 +1,7 @@
 ﻿"""Opt-in single-frame analysis. Frames are processed in memory, not persisted."""
 
 import asyncio
+from collections import deque
 from contextlib import asynccontextmanager
 import os
 import hmac
@@ -69,6 +70,7 @@ FACE_CONFIDENCE_THRESHOLD = float(os.getenv("FACE_CONFIDENCE_THRESHOLD", "0.5"))
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
+MAX_SUPPORTED_FACE_COUNT = 20
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_INFERENCE_SIDE = positive_int_setting("AI_MAX_INFERENCE_SIDE", 960, minimum=32)
 INFERENCE_MIN_INTERVAL_SECONDS = nonnegative_float_setting("AI_INFERENCE_MIN_INTERVAL_SECONDS", 1.0)
@@ -85,12 +87,42 @@ _model_initialization_lock = threading.Lock()
 _inference_lock = threading.Lock()
 _throttle_lock = threading.Lock()
 _last_inference_started_at = 0.0
+RECENT_INFERENCE_LATENCIES_MS = deque(maxlen=256)
+_latency_history_lock = threading.Lock()
+YOLO_DEVICE = "cpu"
 
 
 def load_yolo_model(model_path: str):
+    global YOLO_DEVICE
+
     from ultralytics import YOLO
 
-    return YOLO(model_path)
+    model = YOLO(model_path)
+    YOLO_DEVICE = "cpu"
+    if os.getenv("AI_USE_CUDA", "0") != "1":
+        return model
+
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            logger.info("CUDA was requested but is unavailable; using CPU inference")
+            return model
+        model.to("cuda")
+        YOLO_DEVICE = "cuda"
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception as exc:  # pragma: no cover - depends on CUDA runtime
+            logger.warning("Could not enable cuDNN benchmarking (%s)", type(exc).__name__)
+        logger.info("YOLO model moved to CUDA for faster inference on supported hardware")
+    except Exception as exc:  # pragma: no cover - depends on hardware availability
+        logger.warning("CUDA acceleration for YOLO was unavailable (%s); using CPU inference", type(exc).__name__)
+        try:
+            model.to("cpu")
+        except Exception as fallback_exc:
+            logger.error("Could not restore YOLO model to CPU (%s)", type(fallback_exc).__name__)
+            raise RuntimeError("YOLO could not be initialized on CUDA or CPU") from fallback_exc
+    return model
 
 
 def initialize_models() -> None:
@@ -103,7 +135,10 @@ def initialize_models() -> None:
         _models_initialized = True
         errors = []
 
+        cv2.setUseOptimized(True)
         cv2.setNumThreads(1)
+        os.environ.setdefault("OMP_NUM_THREADS", str(TORCH_NUM_THREADS))
+        os.environ.setdefault("MKL_NUM_THREADS", str(TORCH_NUM_THREADS))
         try:
             import torch
 
@@ -349,12 +384,14 @@ def health():
         },
         "mediapipe": "ready" if face_detector is not None else "unavailable",
         "phone_model": "ready" if yolo is not None and supported_phone_classes else "unavailable",
+        "phone_model_device": YOLO_DEVICE if yolo is not None else "unavailable",
         "model_path_available": bool(MODEL_PATH and os.path.isfile(MODEL_PATH)),
         "model_load_error": MODEL_LOAD_ERROR,
         "phone_classes": [MODEL_CLASSES[class_id] for class_id in sorted(supported_phone_classes)],
         "visible_device_classes": sorted({kind for name in MODEL_CLASSES.values() if (kind := device_kind_for_class(str(name))) is not None}),
         "looking_away": "ready" if face_mesh is not None else "unavailable",
         "multiple_faces": "ready" if face_detector is not None else "unavailable",
+        "latency_ms": latency_summary_ms(),
         "head_pose_thresholds": {
             "yaw_degrees": YAW_THRESHOLD,
             "pitch_degrees": PITCH_THRESHOLD,
@@ -533,6 +570,57 @@ def classify_looking_away(head_pose):
     return "looking_away" if turned_sideways or tilted_up_or_down else "looking_forward"
 
 
+def latency_summary_ms(latencies_ms=None):
+    """Summarize recent inference latency using median and nearest-rank tails.
+
+    P50 is the conventional median and is shown after one sample. P95 uses
+    nearest-rank and is shown after 20 samples; P99 uses nearest-rank and is
+    shown after 100 samples. A snapshot of shared history is copied under lock,
+    while sorting and percentile calculations happen outside the lock.
+    """
+    if latencies_ms is None:
+        with _latency_history_lock:
+            snapshot = tuple(RECENT_INFERENCE_LATENCIES_MS)
+    else:
+        snapshot = tuple(latencies_ms)
+    values = sorted(float(value) for value in snapshot)
+    if not values:
+        return {
+            "p50_ms": 0.0,
+            "p95_ms": None,
+            "p99_ms": None,
+            "count": 0,
+            "percentile_method": {
+                "p50": "median",
+                "p95": "nearest_rank",
+                "p99": "nearest_rank",
+            },
+            "minimum_samples": {"p50": 1, "p95": 20, "p99": 100},
+        }
+
+    def percentile(percent):
+        rank = ceil((percent / 100.0) * len(values)) - 1
+        return values[min(len(values) - 1, max(0, rank))]
+
+    return {
+        "p50_ms": round((values[(len(values) - 1) // 2] + values[len(values) // 2]) / 2, 2),
+        "p95_ms": round(percentile(95), 2) if len(values) >= 20 else None,
+        "p99_ms": round(percentile(99), 2) if len(values) >= 100 else None,
+        "count": len(values),
+        "percentile_method": {
+            "p50": "median",
+            "p95": "nearest_rank",
+            "p99": "nearest_rank",
+        },
+        "minimum_samples": {"p50": 1, "p95": 20, "p99": 100},
+    }
+
+
+def record_inference_latency(latency_ms):
+    with _latency_history_lock:
+        RECENT_INFERENCE_LATENCIES_MS.append(float(latency_ms))
+
+
 def resize_for_inference(image):
     original_height, original_width = image.shape[:2]
     largest_side = max(original_width, original_height)
@@ -610,6 +698,20 @@ def _analyze_content(content: bytes, content_type: str | None):
     inference_stages_ms["face_detection_ms"] = (time.perf_counter() - stage_started_at) * 1000
 
     face_count = len(face_boxes)
+    if face_count > MAX_SUPPORTED_FACE_COUNT:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "face_count_limit_exceeded",
+                "detected_face_count": face_count,
+                "max_face_count": MAX_SUPPORTED_FACE_COUNT,
+                "message": (
+                    f"Frame contains {face_count} detected faces, exceeding the "
+                    f"supported maximum of {MAX_SUPPORTED_FACE_COUNT}; no "
+                    "detections were truncated."
+                ),
+            },
+        )
     multiple_faces = face_count > 1
     face_boxes = [
         {
@@ -671,6 +773,7 @@ def _analyze_content(content: bytes, content_type: str | None):
             predictions = yolo.predict(
                 source=image,
                 conf=PHONE_CONFIDENCE_THRESHOLD,
+                device=YOLO_DEVICE,
                 verbose=False
             )
         except Exception as exc:
@@ -748,6 +851,8 @@ def _analyze_content(content: bytes, content_type: str | None):
     inference_stages_ms["postprocessing_ms"] = (time.perf_counter() - stage_started_at) * 1000
     total_inference_ms = (time.perf_counter() - started_at) * 1000
     inference_stages_ms["total_ms"] = total_inference_ms
+    record_inference_latency(total_inference_ms)
+
     return {
         "face_presence": face_count > 0,
         "face_count": face_count,
@@ -767,6 +872,7 @@ def _analyze_content(content: bytes, content_type: str | None):
             "luminance_stddev": round(frame_stddev, 2)
         },
         "inference_ms": round(total_inference_ms, 2),
+        "latency_summary_ms": latency_summary_ms(),
         "inference_stages_ms": {
             stage: round(duration, 2)
             for stage, duration in inference_stages_ms.items()

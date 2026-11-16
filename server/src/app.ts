@@ -152,15 +152,16 @@ const shuffle = <T>(items: T[]) => { const copy = [...items]; for (let i = copy.
 const proctorEventInput = z.object({ examId: z.string().uuid(), candidateId: z.string().uuid(), sessionId: z.string().uuid().optional(), attemptId: z.string().uuid(), type: z.enum(['face_missing', 'multiple_faces', 'looking_away', 'phone_detected', 'camera_obstructed', 'visibility_hidden', 'fullscreen_exit', 'window_blur', 'focus_regain', 'multiple_window_hint', 'network_interruption', 'camera_permission_lost', 'screen_sharing_stopped']), occurredAt: z.string().datetime(), source: z.literal('browser'), details: z.record(z.unknown()).optional(), evidenceKey: z.string().max(512).optional() });
 const radioObservationInput = z.object({ organizationId: z.string().uuid(), examId: z.string().uuid(), candidateId: z.string().uuid(), attemptId: z.string().uuid(), source: z.enum(['bluetooth_le', 'wifi', 'scanner_health']), kind: z.enum(['advertisement', 'access_point', 'heartbeat', 'scan_unavailable', 'permission_denied', 'scan_error', 'scan_stopped']), rssi: z.number().int().min(-127).max(0).optional(), pseudonym: z.string().min(16).max(128).optional(), advertisedName: z.string().trim().min(1).max(80).refine(value => !/[\u0000-\u001f\u007f]/.test(value), 'Advertised name contains invalid control characters').optional(), scannerStatus: z.enum(['active', 'unavailable', 'permission_denied', 'stopped', 'error']), errorCode: z.string().max(120).optional() }).superRefine((data, ctx) => { if (data.kind === 'advertisement' || data.kind === 'access_point') { if (!data.pseudonym) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'A session-scoped pseudonym is required for a radio observation' }); if (data.scannerStatus !== 'active') ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Radio observations require an active scanner status' }); } if (data.advertisedName && data.source !== 'bluetooth_le') ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['advertisedName'], message: 'Advertised names are accepted only from Bluetooth LE' }); });
 
+const MAX_SUPPORTED_FACE_COUNT = 20;
 const aiFrameSchema = z.object({
   face_presence: z.boolean(),
-  face_count: z.number().int().min(0).max(20),
-  face_boxes: z.array(z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number(), confidence: z.number().min(0).max(1).nullable() })).max(20).default([]),
+  face_count: z.number().int().min(0).max(MAX_SUPPORTED_FACE_COUNT),
+  face_boxes: z.array(z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number(), confidence: z.number().min(0).max(1).nullable() })).max(MAX_SUPPORTED_FACE_COUNT).default([]),
   face_pose_estimates: z.array(z.object({
     face_box: z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number(), confidence: z.number().min(0).max(1).nullable() }),
     head_pose: z.object({ yaw_degrees: z.number(), pitch_degrees: z.number(), roll_degrees: z.number() }).nullable(),
     looking_away: z.enum(['looking_away', 'looking_forward', 'unavailable']),
-  })).max(20).default([]),
+  })).max(MAX_SUPPORTED_FACE_COUNT).default([]),
   multiple_faces: z.boolean(),
   looking_away: z.enum(['looking_away', 'looking_forward', 'unavailable']),
   head_pose: z.object({ yaw_degrees: z.number(), pitch_degrees: z.number(), roll_degrees: z.number() }).nullable().optional(),
@@ -215,9 +216,34 @@ const aiFrameSchema = z.object({
   camera_health: z.enum(['ok', 'obstructed']).default('ok'),
   frame_quality: z.object({ mean_luminance: z.number(), luminance_stddev: z.number() }).optional(),
   inference_ms: z.number().nonnegative().optional(),
+  inference_stages_ms: z.record(z.number().nonnegative()).optional(),
+  latency_summary_ms: z.object({
+    p50_ms: z.number().nonnegative(),
+    p95_ms: z.number().nonnegative().nullable(),
+    p99_ms: z.number().nonnegative().nullable(),
+    count: z.number().int().min(0).max(256),
+    percentile_method: z.object({
+      p50: z.literal('median'),
+      p95: z.literal('nearest_rank'),
+      p99: z.literal('nearest_rank'),
+    }).strict(),
+    minimum_samples: z.object({
+      p50: z.literal(1),
+      p95: z.literal(20),
+      p99: z.literal(100),
+    }).strict(),
+  }).strict().optional(),
   disclosure: z.string().max(1000).optional(),
   service_version: z.string().max(80).optional(),
   phone_model: z.string().max(40).optional()
+}).strict();
+const aiFaceCountLimitErrorSchema = z.object({
+  detail: z.object({
+    code: z.literal('face_count_limit_exceeded'),
+    detected_face_count: z.number().int().gt(MAX_SUPPORTED_FACE_COUNT),
+    max_face_count: z.literal(MAX_SUPPORTED_FACE_COUNT),
+    message: z.string().max(240),
+  }).strict(),
 }).strict();
 const aiFrameLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false });
 export function createApp(storageImpl?: StorageInterface): express.Express {
@@ -2077,10 +2103,43 @@ app.post('/api/student/attempts/:attemptId/ai-frame', authenticate, aiFrameLimit
   } catch {
     return res.status(503).json({ error: 'The AI service did not respond. Check its health and the private API-to-AI network connection.' });
   }
-  if (!inferenceResponse.ok) return res.status(503).json({ error: `The AI service returned HTTP ${inferenceResponse.status}.` });
-  let analysis: z.infer<typeof aiFrameSchema>;
-  try { analysis = aiFrameSchema.parse(await inferenceResponse.json()); }
-  catch { return res.status(502).json({ error: 'The AI service returned an invalid analysis response.' }); }
+  if (!inferenceResponse.ok) {
+    if (inferenceResponse.status === 422) {
+      let upstreamError: unknown;
+      try { upstreamError = await inferenceResponse.json(); }
+      catch { return res.status(503).json({ error: 'The AI service returned an invalid validation error.' }); }
+      const faceCountError = aiFaceCountLimitErrorSchema.safeParse(upstreamError);
+      if (faceCountError.success) {
+        const { detected_face_count: detectedFaceCount, max_face_count: maxFaceCount } = faceCountError.data.detail;
+        return res.status(422).json({
+          code: 'face_count_limit_exceeded',
+          detectedFaceCount,
+          maxFaceCount,
+          error: `The frame contains ${detectedFaceCount} detected faces, exceeding the supported maximum of ${maxFaceCount}. No detections were truncated; analysis for this frame was rejected.`,
+        });
+      }
+    }
+    return res.status(503).json({ error: `The AI service returned HTTP ${inferenceResponse.status}.` });
+  }
+  let inferenceBody: unknown;
+  try { inferenceBody = await inferenceResponse.json(); }
+  catch { return res.status(502).json({ error: 'The AI service returned invalid JSON.' }); }
+  const parsedAnalysis = aiFrameSchema.safeParse(inferenceBody);
+  if (!parsedAnalysis.success) {
+    const faceCountExceeded = parsedAnalysis.error.issues.some(issue =>
+      issue.code === 'too_big' &&
+      ['face_count', 'face_boxes', 'face_pose_estimates'].includes(String(issue.path[0])),
+    );
+    if (faceCountExceeded) {
+      return res.status(502).json({
+        code: 'face_count_contract_violation',
+        maxFaceCount: MAX_SUPPORTED_FACE_COUNT,
+        error: `The AI service exceeded the supported face-count limit of ${MAX_SUPPORTED_FACE_COUNT}; its response was rejected and no analysis was recorded.`,
+      });
+    }
+    return res.status(502).json({ error: 'The AI service returned an invalid analysis response.' });
+  }
+  const analysis: z.infer<typeof aiFrameSchema> = parsedAnalysis.data;
   const activeAttemptAfterInference = await prisma.examAttempt.findFirst({
     where: {
       id: attempt.id,

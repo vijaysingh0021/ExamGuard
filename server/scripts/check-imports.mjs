@@ -3,7 +3,8 @@
 // Static import check: every named import from a RELATIVE module must be exported by that module; every lucide icon must be in a known list if provided.
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
-const here = new URL('.', import.meta.url).pathname; const roots = process.argv.length > 2 ? process.argv.slice(2) : [join(here, '..', 'src'), join(here, '..', '..', 'client', 'src')]; const files = [];
+import { fileURLToPath } from 'node:url';
+const here = dirname(fileURLToPath(import.meta.url)); const roots = process.argv.length > 2 ? process.argv.slice(2) : [join(here, '..', 'src'), join(here, '..', '..', 'client', 'src')]; const files = [];
 for (const root of roots) (function walk(d){ for (const f of readdirSync(d)) { if (f==='node_modules'||f.startsWith('.')||f==='generated') continue; const p=join(d,f); statSync(p).isDirectory()?walk(p):/\.(ts|tsx)$/.test(f)&&files.push(p); } })(root);
 const resolveMod = (from, spec) => { const base = resolve(dirname(from), spec.replace(/\.js$/, '')); for (const c of [base+'.ts', base+'.tsx', join(base,'index.ts'), join(base,'index.tsx'), base]) if (existsSync(c) && statSync(c).isFile()) return c; return null; };
 const exportsOf = (file, seen = new Set()) => {

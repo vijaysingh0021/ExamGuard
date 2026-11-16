@@ -1,5 +1,7 @@
 import asyncio
 from io import BytesIO
+import os
+import sys
 from types import SimpleNamespace
 import threading
 import time
@@ -38,9 +40,11 @@ class FakeYolo:
     def __init__(self, class_name):
         self.names = {0: class_name}
         self.source_shape = None
+        self.device = None
 
     def predict(self, **kwargs):
         self.source_shape = kwargs["source"].shape[:2]
+        self.device = kwargs.get("device")
         box = SimpleNamespace(
             cls=FakeValue(0),
             conf=FakeValue(0.91),
@@ -135,6 +139,114 @@ class FakeFaceMesh:
 
 
 class ModelInitializationTests(unittest.TestCase):
+    def setUp(self):
+        self.previous_yolo_device = main.YOLO_DEVICE
+
+    def tearDown(self):
+        main.YOLO_DEVICE = self.previous_yolo_device
+
+    def test_latency_summary_reports_median_and_tail_percentiles(self):
+        summary = main.latency_summary_ms(list(range(1, 101)))
+
+        self.assertEqual(summary["count"], 100)
+        self.assertAlmostEqual(summary["p50_ms"], 50.5)
+        self.assertEqual(summary["p95_ms"], 95)
+        self.assertEqual(summary["p99_ms"], 99)
+        self.assertEqual(summary["percentile_method"], {
+            "p50": "median",
+            "p95": "nearest_rank",
+            "p99": "nearest_rank",
+        })
+        self.assertEqual(summary["minimum_samples"], {"p50": 1, "p95": 20, "p99": 100})
+
+    def test_latency_tail_percentiles_wait_for_minimum_sample_counts(self):
+        nineteen_samples = main.latency_summary_ms(list(range(1, 20)))
+        twenty_samples = main.latency_summary_ms(list(range(1, 21)))
+        ninety_nine_samples = main.latency_summary_ms(list(range(1, 100)))
+
+        self.assertEqual(nineteen_samples["p50_ms"], 10)
+        self.assertIsNone(nineteen_samples["p95_ms"])
+        self.assertEqual(twenty_samples["p95_ms"], 19)
+        self.assertIsNone(ninety_nine_samples["p99_ms"])
+
+    def test_latency_history_updates_and_snapshots_are_thread_safe(self):
+        with main._latency_history_lock:
+            previous_values = list(main.RECENT_INFERENCE_LATENCIES_MS)
+            main.RECENT_INFERENCE_LATENCIES_MS.clear()
+
+        failures = []
+
+        def write_samples():
+            try:
+                for value in range(1000):
+                    main.record_inference_latency(value)
+            except Exception as exc:
+                failures.append(exc)
+
+        writer = threading.Thread(target=write_samples)
+        writer.start()
+        try:
+            while writer.is_alive():
+                summary = main.latency_summary_ms()
+                self.assertLessEqual(summary["count"], main.RECENT_INFERENCE_LATENCIES_MS.maxlen)
+        finally:
+            writer.join()
+            with main._latency_history_lock:
+                main.RECENT_INFERENCE_LATENCIES_MS.clear()
+                main.RECENT_INFERENCE_LATENCIES_MS.extend(previous_values)
+
+        self.assertEqual(failures, [])
+        self.assertEqual(main.latency_summary_ms([10, 20, 30])["p50_ms"], 20)
+
+    def test_cuda_is_opt_in_and_cpu_is_used_when_not_requested(self):
+        model = self._load_model_with_cuda(enabled=False, available=True)
+
+        self.assertEqual(main.YOLO_DEVICE, "cpu")
+        self.assertEqual(model.to_calls, [])
+
+    def test_cuda_request_falls_back_to_cpu_when_unavailable(self):
+        model = self._load_model_with_cuda(enabled=True, available=False)
+
+        self.assertEqual(main.YOLO_DEVICE, "cpu")
+        self.assertEqual(model.to_calls, [])
+
+    def test_cuda_model_move_failure_restores_cpu(self):
+        model = self._load_model_with_cuda(enabled=True, available=True, cuda_error=RuntimeError("no device"))
+
+        self.assertEqual(main.YOLO_DEVICE, "cpu")
+        self.assertEqual(model.to_calls, ["cuda", "cpu"])
+
+    def test_cuda_device_is_selected_only_after_successful_model_move(self):
+        model = self._load_model_with_cuda(enabled=True, available=True)
+
+        self.assertEqual(main.YOLO_DEVICE, "cuda")
+        self.assertEqual(model.to_calls, ["cuda"])
+
+    def _load_model_with_cuda(self, enabled, available, cuda_error=None):
+        class FakeModel:
+            def __init__(self):
+                self.to_calls = []
+
+            def to(self, device):
+                self.to_calls.append(device)
+                if device == "cuda" and cuda_error:
+                    raise cuda_error
+                return self
+
+        model = FakeModel()
+        torch = SimpleNamespace(
+            cuda=SimpleNamespace(is_available=lambda: available),
+            backends=SimpleNamespace(cudnn=SimpleNamespace(benchmark=False)),
+        )
+        ultralytics = SimpleNamespace(YOLO=lambda _path: model)
+        with (
+            patch.dict(os.environ, {"AI_USE_CUDA": "1" if enabled else "0"}),
+            patch.dict(sys.modules, {"torch": torch, "ultralytics": ultralytics}),
+        ):
+            loaded = main.load_yolo_model("fake-model.pt")
+        self.assertIs(loaded, model)
+        return model
+
     def test_initialization_loads_each_model_once_and_closes_mediapipe(self):
         class ClosableModel:
             names = {67: "cell phone"}
@@ -349,6 +461,73 @@ class HeadPoseTests(unittest.TestCase):
             self.assertLessEqual(box["x"] + box["width"], 1)
             self.assertLessEqual(box["y"] + box["height"], 1)
 
+    def test_exactly_twenty_faces_are_supported_without_truncation(self):
+        boxes = [
+            {
+                "x": (index % 5) * 0.18,
+                "y": (index // 5) * 0.18,
+                "width": 0.15,
+                "height": 0.15,
+                "confidence": 0.9,
+            }
+            for index in range(20)
+        ]
+        pose = {"pitch_degrees": 0.0, "yaw_degrees": 0.0, "roll_degrees": 0.0}
+
+        with (
+            patch.object(main, "face_detector", FakeFaceDetector([])),
+            patch.object(main, "face_mesh", FakeFaceMesh([])),
+            patch.object(main, "yolo", None),
+            patch.object(main, "detect_face_boxes_with_tiles", return_value=boxes),
+            patch.object(main, "estimate_head_pose_for_face", return_value=pose) as estimate_pose,
+        ):
+            result = main._analyze_content(
+                encode_test_image(np.zeros((480, 640, 3), dtype=np.uint8)),
+                "image/jpeg",
+            )
+
+        self.assertEqual(main.MAX_SUPPORTED_FACE_COUNT, 20)
+        self.assertEqual(result["face_count"], 20)
+        self.assertEqual(len(result["face_boxes"]), 20)
+        self.assertEqual(len(result["face_pose_estimates"]), 20)
+        self.assertTrue(result["multiple_faces"])
+        self.assertEqual(result["looking_away"], "unavailable")
+        self.assertEqual(estimate_pose.call_count, 20)
+
+    def test_excess_faces_return_structured_422_without_truncation(self):
+        boxes = [
+            {
+                "x": (index % 5) * 0.18,
+                "y": (index // 5) * 0.18,
+                "width": 0.15,
+                "height": 0.15,
+                "confidence": 0.9,
+            }
+            for index in range(main.MAX_SUPPORTED_FACE_COUNT + 1)
+        ]
+
+        with (
+            patch.object(main, "face_detector", FakeFaceDetector([])),
+            patch.object(main, "face_mesh", FakeFaceMesh([])),
+            patch.object(main, "yolo", None),
+            patch.object(main, "detect_face_boxes_with_tiles", return_value=boxes),
+            patch.object(main, "estimate_head_pose_for_face") as estimate_pose,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                main._analyze_content(
+                    encode_test_image(np.zeros((480, 640, 3), dtype=np.uint8)),
+                    "image/jpeg",
+                )
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertEqual(raised.exception.detail, {
+            "code": "face_count_limit_exceeded",
+            "detected_face_count": 21,
+            "max_face_count": 20,
+            "message": "Frame contains 21 detected faces, exceeding the supported maximum of 20; no detections were truncated.",
+        })
+        estimate_pose.assert_not_called()
+
     def test_face_boxes_from_overlapping_tiles_are_deduplicated_by_overlap(self):
         boxes = [
             {"x": 0.10, "y": 0.20, "width": 0.20, "height": 0.30, "confidence": 0.8},
@@ -371,6 +550,185 @@ class HeadPoseTests(unittest.TestCase):
             self.assertGreaterEqual(y, 0)
             self.assertLessEqual(x + width, 1152)
             self.assertLessEqual(y + height, 768)
+
+
+class FaceAndFrameInferenceTests(unittest.TestCase):
+    def setUp(self):
+        self.previous_runtime = (
+            main.yolo,
+            main.face_detector,
+            main.face_mesh,
+            main.INFERENCE_MIN_INTERVAL_SECONDS,
+            main._last_inference_started_at,
+        )
+        main.yolo = None
+        main.face_detector = FakeFaceDetector(detections=[])
+        main.face_mesh = FakeFaceMesh([])
+        main.INFERENCE_MIN_INTERVAL_SECONDS = 0
+        main._last_inference_started_at = 0
+
+    def tearDown(self):
+        (
+            main.yolo,
+            main.face_detector,
+            main.face_mesh,
+            main.INFERENCE_MIN_INTERVAL_SECONDS,
+            main._last_inference_started_at,
+        ) = self.previous_runtime
+
+    @staticmethod
+    def make_scene(level=80):
+        image = np.full((480, 640, 3), level, dtype=np.uint8)
+        image[:, :, 0] = np.tile(np.arange(640, dtype=np.uint8), (480, 1))
+        return image
+
+    @staticmethod
+    def make_box(x=0.2):
+        return {"x": x, "y": 0.2, "width": 0.2, "height": 0.3, "confidence": 0.9}
+
+    def analyze_sequence(self, images, detections_by_frame, poses, delay_between_frames=0.0):
+        detection_calls = []
+        pose_values = iter(poses)
+
+        def detect(_image, _detector):
+            detection_calls.append(1)
+            return detections_by_frame[len(detection_calls) - 1]
+
+        def estimate_pose(*_args):
+            return next(pose_values)
+
+        with (
+            patch.object(main, "face_detector", object()),
+            patch.object(main, "face_mesh", object()),
+            patch.object(main, "yolo", None),
+            patch.object(main, "detect_face_boxes_with_tiles", side_effect=detect),
+            patch.object(main, "estimate_head_pose", side_effect=estimate_pose),
+            patch.object(main, "estimate_head_pose_for_face", side_effect=estimate_pose),
+        ):
+            results = []
+            for index, image in enumerate(images):
+                if index and delay_between_frames:
+                    time.sleep(delay_between_frames)
+                results.append(main._analyze_content(encode_test_image(image), "image/jpeg"))
+        return results, detection_calls
+
+    def test_head_movement_and_looking_away_are_recomputed_for_each_frame(self):
+        image = self.make_scene()
+        forward = {"yaw_degrees": 0.0, "pitch_degrees": 0.0, "roll_degrees": 0.0}
+        turned = {"yaw_degrees": 42.0, "pitch_degrees": 0.0, "roll_degrees": 0.0}
+
+        results, calls = self.analyze_sequence(
+            [image, image],
+            [[self.make_box()], [self.make_box()]],
+            [forward, turned],
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(results[0]["looking_away"], "looking_forward")
+        self.assertEqual(results[1]["looking_away"], "looking_away")
+        self.assertEqual(results[1]["head_pose"], turned)
+
+    def test_second_person_entering_invalidates_any_prior_single_face_state(self):
+        image = self.make_scene()
+        pose = {"yaw_degrees": 0.0, "pitch_degrees": 0.0, "roll_degrees": 0.0}
+        results, calls = self.analyze_sequence(
+            [image, image],
+            [[self.make_box()], [self.make_box(), self.make_box(0.6)]],
+            [pose, pose, pose],
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(results[0]["face_count"], 1)
+        self.assertEqual(results[1]["face_count"], 2)
+        self.assertTrue(results[1]["multiple_faces"])
+        self.assertEqual(results[1]["looking_away"], "unavailable")
+
+    def test_second_person_leaving_recomputes_candidate_pose(self):
+        image = self.make_scene()
+        pose = {"yaw_degrees": 0.0, "pitch_degrees": 0.0, "roll_degrees": 0.0}
+        results, calls = self.analyze_sequence(
+            [image, image],
+            [[self.make_box(), self.make_box(0.6)], [self.make_box()]],
+            [pose, pose, pose],
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(results[0]["face_count"], 2)
+        self.assertEqual(results[1]["face_count"], 1)
+        self.assertEqual(results[1]["looking_away"], "looking_forward")
+
+    def test_small_localized_change_still_runs_face_detection(self):
+        first = self.make_scene()
+        localized_change = first.copy()
+        localized_change[205:210, 205:210] = 255
+        results, calls = self.analyze_sequence(
+            [first, localized_change],
+            [[], [self.make_box()]],
+            [{"yaw_degrees": 0.0, "pitch_degrees": 0.0, "roll_degrees": 0.0}],
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(results[0]["face_presence"])
+        self.assertTrue(results[1]["face_presence"])
+
+    def test_camera_movement_still_runs_face_detection(self):
+        first = self.make_scene()
+        moved = np.roll(first, 24, axis=1)
+        results, calls = self.analyze_sequence(
+            [first, moved],
+            [[self.make_box()], []],
+            [{"yaw_degrees": 0.0, "pitch_degrees": 0.0, "roll_degrees": 0.0}],
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(results[0]["face_presence"])
+        self.assertFalse(results[1]["face_presence"])
+
+    def test_lighting_change_still_runs_face_detection(self):
+        first = self.make_scene(60)
+        brighter = cv2.convertScaleAbs(first, alpha=1.0, beta=70)
+        results, calls = self.analyze_sequence(
+            [first, brighter],
+            [[self.make_box()], []],
+            [{"yaw_degrees": 0.0, "pitch_degrees": 0.0, "roll_degrees": 0.0}],
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertNotEqual(
+            results[0]["frame_quality"]["mean_luminance"],
+            results[1]["frame_quality"]["mean_luminance"],
+        )
+        self.assertFalse(results[1]["face_presence"])
+
+    def test_identical_frames_are_reprocessed_past_the_former_cache_expiry(self):
+        image = self.make_scene()
+        results, calls = self.analyze_sequence(
+            [image, image],
+            [[self.make_box()], []],
+            [{"yaw_degrees": 0.0, "pitch_degrees": 0.0, "roll_degrees": 0.0}],
+            delay_between_frames=0.76,
+        )
+
+        self.assertFalse(hasattr(main, "_FACE_RESULT_CACHE"))
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(results[0]["face_presence"])
+        self.assertFalse(results[1]["face_presence"])
+
+    def test_empty_frame_and_face_disappearance_transitions_are_recomputed(self):
+        image = self.make_scene()
+        results, calls = self.analyze_sequence(
+            [image, image, image, image],
+            [[self.make_box()], [], [], [self.make_box()]],
+            [
+                {"yaw_degrees": 0.0, "pitch_degrees": 0.0, "roll_degrees": 0.0},
+                {"yaw_degrees": 0.0, "pitch_degrees": 0.0, "roll_degrees": 0.0},
+            ],
+        )
+
+        self.assertEqual(len(calls), 4)
+        self.assertEqual([result["face_count"] for result in results], [1, 0, 0, 1])
+        self.assertEqual(results[1]["looking_away"], "unavailable")
+        self.assertEqual(results[3]["looking_away"], "looking_forward")
 
     def test_face_model_errors_are_reported_as_service_unavailable(self):
         frame = make_test_frame()
@@ -430,11 +788,13 @@ class HeadPoseTests(unittest.TestCase):
         self.assertEqual(class_names_by_id(["person", "phone"]), {0: "person", 1: "phone"})
 
     def test_phone_prediction_is_reported_with_model_box_and_confidence(self):
-        with patch.object(main, "yolo", FakeYolo("cell phone")):
+        yolo = FakeYolo("cell phone")
+        with patch.object(main, "yolo", yolo):
             result = asyncio.run(main.analyze(make_test_frame()))
 
         self.assertEqual(result["phone_detection"], "detected")
         self.assertEqual(result["phone_model"], "configured")
+        self.assertEqual(yolo.device, "cpu")
         self.assertEqual(result["phone_confidence"], 0.91)
         self.assertEqual(result["phone_boxes"][0]["label"], "cell phone")
         self.assertEqual(
@@ -451,6 +811,17 @@ class HeadPoseTests(unittest.TestCase):
         )
         self.assertTrue(all(value >= 0 for value in result["inference_stages_ms"].values()))
         self.assertEqual(result["inference_stages_ms"]["total_ms"], result["inference_ms"])
+
+    def test_selected_yolo_device_is_used_for_prediction(self):
+        yolo = FakeYolo("cell phone")
+        with (
+            patch.object(main, "yolo", yolo),
+            patch.object(main, "YOLO_DEVICE", "cuda"),
+        ):
+            result = asyncio.run(main.analyze(make_test_frame()))
+
+        self.assertEqual(result["phone_detection"], "detected")
+        self.assertEqual(yolo.device, "cuda")
 
     def test_frame_quality_statistics_match_combined_numpy_statistics(self):
         image = np.random.default_rng(42).integers(0, 256, (64, 80, 3), dtype=np.uint8)

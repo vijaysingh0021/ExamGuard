@@ -267,6 +267,23 @@ test('AI frames use the configured service credential and are not recorded after
       camera_health: 'ok',
       frame_quality: { mean_luminance: 100, luminance_stddev: 20 },
       inference_ms: 10,
+      inference_stages_ms: {
+        image_decode_ms: 1,
+        resize_ms: 1,
+        face_detection_ms: 2,
+        head_pose_ms: 2,
+        phone_detection_ms: 2,
+        postprocessing_ms: 1,
+        total_ms: 10,
+      },
+      latency_summary_ms: {
+        p50_ms: 10,
+        p95_ms: null,
+        p99_ms: null,
+        count: 1,
+        percentile_method: { p50: 'median', p95: 'nearest_rank', p99: 'nearest_rank' },
+        minimum_samples: { p50: 1, p95: 20, p99: 100 },
+      },
       service_version: 'pipeline-test',
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   };
@@ -274,6 +291,17 @@ test('AI frames use the configured service credential and are not recorded after
     await withServer(fixture.storage, async baseUrl => {
       const accepted = await postAiFrame(baseUrl);
       assert.equal(accepted.status, 200);
+      assert.deepEqual(
+        (accepted.body.analysis as Record<string, unknown>).latency_summary_ms,
+        {
+          p50_ms: 10,
+          p95_ms: null,
+          p99_ms: null,
+          count: 1,
+          percentile_method: { p50: 'median', p95: 'nearest_rank', p99: 'nearest_rank' },
+          minimum_samples: { p50: 1, p95: 20, p99: 100 },
+        },
+      );
       assert.deepEqual(serviceRequests[0], {
         url: 'https://ai-test.run.app/analyze',
         authorization: `Bearer ${serviceToken}`,
@@ -284,6 +312,127 @@ test('AI frames use the configured service credential and are not recorded after
       assert.equal(closedDuringInference.status, 409);
       assert.equal(fixture.storedKeys.length, 0);
       assert.equal(serviceRequests.length, 2);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [key, value] of Object.entries(previousEnvironment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    restoreStubs(fixture.stubs);
+  }
+});
+
+test('AI face-count limit errors are surfaced and over-limit success responses are rejected', async () => {
+  const fixture = makeFixture();
+  const previousEnvironment = {
+    NODE_ENV: process.env.NODE_ENV,
+    AI_SERVICE_URL: process.env.AI_SERVICE_URL,
+    AI_SERVICE_TOKEN: process.env.AI_SERVICE_TOKEN,
+  };
+  const originalFetch = globalThis.fetch;
+  const serviceToken = randomUUID().repeat(3);
+  let responseMode: 'limit_error' | 'max_supported_success' | 'legacy_no_telemetry' | 'invalid_face_array' | 'over_limit_success' = 'max_supported_success';
+  process.env.NODE_ENV = 'production';
+  process.env.AI_SERVICE_URL = 'https://ai-test.run.app';
+  process.env.AI_SERVICE_TOKEN = serviceToken;
+  globalThis.fetch = async (input, init) => {
+    if (String(input) !== 'https://ai-test.run.app/analyze') return originalFetch(input, init);
+    if (responseMode === 'limit_error') {
+      return new Response(JSON.stringify({
+        detail: {
+          code: 'face_count_limit_exceeded',
+          detected_face_count: 21,
+          max_face_count: 20,
+          message: 'Frame contains 21 detected faces, exceeding the supported maximum of 20; no detections were truncated.',
+        },
+      }), { status: 422, headers: { 'Content-Type': 'application/json' } });
+    }
+    const faceBoxCount = responseMode === 'max_supported_success'
+      ? 20
+      : responseMode === 'legacy_no_telemetry' ? 1 : 21;
+    const faceBoxes = Array.from({ length: faceBoxCount }, (_, index) => ({
+      x: (index % 5) * 0.18,
+      y: Math.floor(index / 5) * 0.18,
+      width: 0.15,
+      height: 0.15,
+      confidence: 0.9,
+    }));
+    const faceCount = responseMode === 'invalid_face_array' ? 20 : faceBoxes.length;
+    return new Response(JSON.stringify({
+      face_presence: true,
+      face_count: faceCount,
+      face_boxes: faceBoxes,
+      face_pose_estimates: faceBoxes.slice(0, faceCount).map(face_box => ({
+        face_box,
+        head_pose: null,
+        looking_away: 'unavailable',
+      })),
+      multiple_faces: faceCount > 1,
+      looking_away: faceCount === 1 ? 'looking_forward' : 'unavailable',
+      phone_detection: 'not_detected',
+      phone_boxes: [],
+      visible_devices: [],
+      camera_health: 'ok',
+      frame_quality: { mean_luminance: 100, luminance_stddev: 20 },
+      ...(responseMode !== 'legacy_no_telemetry' ? {
+        inference_ms: 10,
+        inference_stages_ms: { face_detection_ms: 5, head_pose_ms: 3, total_ms: 10 },
+        latency_summary_ms: {
+          p50_ms: 10,
+          p95_ms: null,
+          p99_ms: null,
+          count: 1,
+          percentile_method: { p50: 'median', p95: 'nearest_rank', p99: 'nearest_rank' },
+          minimum_samples: { p50: 1, p95: 20, p99: 100 },
+        },
+      } : {}),
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+
+  try {
+    await withServer(fixture.storage, async baseUrl => {
+      const maximumSupported = await postAiFrame(baseUrl);
+      assert.ok([200, 201, 202].includes(maximumSupported.status));
+      assert.equal(
+        (maximumSupported.body.analysis as Record<string, unknown>).face_count,
+        20,
+      );
+      const recordedFrames = fixture.frames.length;
+      const storedEvidence = fixture.storedKeys.length;
+
+      responseMode = 'legacy_no_telemetry';
+      const legacyResponse = await postAiFrame(baseUrl);
+      assert.equal(legacyResponse.status, 200);
+      const legacyAnalysis = legacyResponse.body.analysis as Record<string, unknown>;
+      assert.equal(legacyAnalysis.face_count, 1);
+      assert.equal('inference_ms' in legacyAnalysis, false);
+      assert.equal('inference_stages_ms' in legacyAnalysis, false);
+      assert.equal('latency_summary_ms' in legacyAnalysis, false);
+
+      responseMode = 'invalid_face_array';
+      const invalidArray = await postAiFrame(baseUrl);
+      assert.equal(invalidArray.status, 502);
+      assert.equal(invalidArray.body.code, 'face_count_contract_violation');
+      assert.equal(invalidArray.body.maxFaceCount, 20);
+
+      responseMode = 'limit_error';
+      const tooManyFaces = await postAiFrame(baseUrl);
+      assert.equal(tooManyFaces.status, 422);
+      assert.equal(tooManyFaces.body.code, 'face_count_limit_exceeded');
+      assert.equal(tooManyFaces.body.detectedFaceCount, 21);
+      assert.equal(tooManyFaces.body.maxFaceCount, 20);
+      assert.match(String(tooManyFaces.body.error), /No detections were truncated/);
+
+      responseMode = 'over_limit_success';
+      const invalidSuccess = await postAiFrame(baseUrl);
+      assert.equal(invalidSuccess.status, 502);
+      assert.equal(invalidSuccess.body.code, 'face_count_contract_violation');
+      assert.equal(invalidSuccess.body.maxFaceCount, 20);
+      assert.match(String(invalidSuccess.body.error), /no analysis was recorded/);
+
+      assert.equal(fixture.frames.length, recordedFrames);
+      assert.equal(fixture.storedKeys.length, storedEvidence);
     });
   } finally {
     globalThis.fetch = originalFetch;

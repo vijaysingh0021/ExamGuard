@@ -3,9 +3,11 @@ import react from "@vitejs/plugin-react";
 import { fileURLToPath, URL } from "node:url";
 
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), "");
+  const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
+  const env = loadEnv(mode, repositoryRoot, "VITE_");
   const apiTarget = env.VITE_API_PROXY_TARGET || "http://localhost:4000";
   return {
+  envDir: repositoryRoot,
   plugins: [react()],
   resolve: {
     alias: {
@@ -13,9 +15,12 @@ export default defineConfig(({ mode }) => {
     },
   },
   server: {
+    port: Number(env.VITE_PORT || 5173),
+    strictPort: true,
     proxy: {
       "/api": apiTarget,
       "/health": apiTarget,
+      "/socket.io": { target: apiTarget, ws: true },
     },
   },
   test: {

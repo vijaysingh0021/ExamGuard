@@ -25,9 +25,9 @@ ExamGuard is a multi-tenant examination platform designed for universities and e
 - **Authentication**:
   - JWT-based sessions.
   - OIDC (Google/Microsoft) with PKCE.
-  - Argon2/Bcrypt for password hashing.
+  - `bcryptjs` for password hashing.
 - **Real-time**: Socket.IO for live proctoring notifications.
-- **File Storage**: S3-compatible private storage (AWS SDK).
+- **File Storage**: Private Supabase Storage accessed with the official Supabase SDK; evidence downloads are proxied through short-lived API tokens.
 - **Validation**: Zod.
 
 ### 3. AI Service

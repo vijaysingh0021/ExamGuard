@@ -146,7 +146,7 @@ export function SystemAdminPage() {
     const interval = window.setInterval(() => { void load(); }, 30_000);
     return () => window.clearInterval(interval);
   }, [load]);
-  const decide = async (path: string, action: string, id: string) => {
+  const decide = async (path: 'institution-requests' | 'staff-verifications', action: string, id: string) => {
     setSavingId(id);
     setError('');
     try {

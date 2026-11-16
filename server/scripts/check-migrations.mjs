@@ -32,7 +32,7 @@ for (const d of dirs) {
     const cols = new Set(); for (const line of m[2].split('\n')) { const c = line.match(/^\s*"(\w+)"\s+"?[A-Za-z]/); if (c) cols.add(c[1]); } actual.set(m[1], cols);
   }
   for (const m of sql.matchAll(/ALTER TABLE "(\w+)"([\s\S]*?);/g)) {
-    for (const a of m[2].matchAll(/ADD COLUMN\s+"(\w+)"/g)) actual.get(m[1])?.add(a[1]);
+    for (const a of m[2].matchAll(/ADD COLUMN(?:\s+IF\s+NOT\s+EXISTS)?\s+"(\w+)"/g)) actual.get(m[1])?.add(a[1]);
     for (const a of m[2].matchAll(/DROP COLUMN\s+"(\w+)"/g)) actual.get(m[1])?.delete(a[1]);
     for (const a of m[2].matchAll(/RENAME COLUMN\s+"(\w+)"\s+TO\s+"(\w+)"/g)) { actual.get(m[1])?.delete(a[1]); actual.get(m[1])?.add(a[2]); }
   }

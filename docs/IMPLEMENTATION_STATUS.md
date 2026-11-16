@@ -1,5 +1,7 @@
 # ExamGuard Implementation Status
 
+> **Current-status notice (2026-11-17):** This document contains historical phase notes and test counts. Use the current [project verification report](./PROJECT_VERIFICATION_REPORT.md) for verified test results, release blockers, and readiness; it supersedes the older status claims below.
+
 ## Master Progress Summary
 
 ExamGuard has achieved significant progress across all engineering phases. The following status reflects verified implementation, development status, and outstanding requirements.
@@ -57,7 +59,7 @@ ExamGuard has achieved significant progress across all engineering phases. The f
 
 ### Security Hardening (Phase 7 - COMPLETED ✅)
 - **Comprehensive Review**: IDOR, XSS, CSRF, rate-limiting analysis ✅ COMPLETED
-- **Infrastructure**: S3 file storage isolation configured ✅ COMPLETED
+- **Infrastructure**: Private Supabase Storage integration configured ✅ COMPLETED
 - **Testing**: Security validation ✅ COMPLETED (29/29 tests passing)
 - **Monitoring**: Logging and alerting systems established ✅ COMPLETED
 
@@ -216,7 +218,7 @@ ExamGuard has achieved significant progress across all engineering phases. The f
 ### Source Code Modifications
 - **client/src/exam-builder.tsx**: Enhanced with TypeScript types and base64 extraction
 - **server/src/app.ts**: Import fixes and upload validation integration
-- **server/src/storage.ts**: S3 configuration and file handling
+- **server/src/storage.ts**: Supabase Storage configuration and file handling
 
 ### Documentation Updates
 - **docs/ARCHITECTURE.md**: Complete system architecture overview
@@ -263,7 +265,7 @@ ExamGuard has achieved significant progress across all engineering phases. The f
 - [ ] Comprehensive security review required
 - [ ] IDOR, XSS, CSRF testing
 - [ ] Rate limiting implementation
-- [ ] S3 storage security verification
+- [ ] Supabase Storage bucket privacy verification
 
 ### Phase 8 Status: TESTING & PERFORMANCE - PENDING
 - [ ] Frontend component testing

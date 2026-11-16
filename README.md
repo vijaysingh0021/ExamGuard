@@ -1,30 +1,33 @@
 # ExamGuard
 
-Multi-institute online examinations and AI-assisted integrity operations. The React/Vite client lives in `client/`; the Express/PostgreSQL (Prisma) API lives in `server/`. `ai-service/` and `device-monitor/` are intentional service boundaries; no dedicated hardware integration is included.
+Multi-institute online examinations and AI-assisted integrity operations. The React/Vite client lives in `client/`; the Express/PostgreSQL (Prisma) API lives in `server/`. `ai-service/` and `device-monitor/` are separate service boundaries; the Windows Companion provides optional OS-supported BLE and Wi-Fi observations that still require physical hardware validation.
 
 ## Run locally
 
-1. Install PostgreSQL 16+ and create an empty database plus a user for it. In development the user also needs the `CREATEDB` permission, because Prisma uses a temporary shadow database when it creates migrations.
-2. Copy `.env.example` to `.env` and set `DATABASE_URL` and a 32+ character `JWT_SECRET`.
-3. Run `npm install`, then from `server/` run `npx prisma migrate deploy` (or `npx prisma migrate dev` while changing the schema) and `npx prisma generate`.
+1. Install PostgreSQL 16+ and create the local `examguard_local` database plus a user for it. In development the user also needs the `CREATEDB` permission only when creating migrations, because Prisma uses a temporary shadow database.
+2. Copy `.env.example` to `.env` and set `DATABASE_URL`, a random 32+ character `JWT_SECRET`, and `AI_SERVICE_TOKEN`. Keep `NODE_ENV=development` and `LOCAL_EVIDENCE_DIR=./.local-evidence` for local use.
+3. Run `npm ci`, then from `server/` run `npx prisma migrate deploy` (or `npx prisma migrate dev` while changing the schema) and `npx prisma generate`.
 4. Create the AI service environment and install its dependencies: `python -m venv ai-service/.venv`, then `ai-service\.venv\Scripts\python.exe -m pip install -r ai-service\requirements.txt` in PowerShell.
-5. Configure `AI_SERVICE_TOKEN` (at least 32 characters) and `YOLO_MODEL_PATH` in `.env`, pointing to a supported local YOLO model. Use `AI_SERVICE_URL=http://127.0.0.1:8001`.
-6. Run `npm run dev` from the repository root and open `http://localhost:5173`. This starts the client, API, and local AI service together.
+5. Set `YOLO_MODEL_PATH` in `.env` to an existing local YOLO weights file with a recognized phone class. The same 32+ character `AI_SERVICE_TOKEN` is loaded by the API and AI service from the root `.env`. Use `AI_SERVICE_URL=http://127.0.0.1:8001`.
+6. Run `npm.cmd run dev` from the repository root in PowerShell and open `http://localhost:5173`. This starts the client, API, and local AI service together; the API exits if PostgreSQL is unavailable.
 
 The API deliberately exits when the PostgreSQL configuration or connection fails. It does not fall back to a different database.
 
 ### Demo data
 
-To add clearly labelled development data after the migrations are applied, use a non-production database and run (PowerShell):
+To add clearly labelled development data after the migrations are applied, use an isolated loopback PostgreSQL database and a unique local password of at least 12 characters:
 
 ```powershell
 $env:DEMO_SEED = 'yes'
+$env:DEMO_SEED_PASSWORD = '<unique-local-password>'
 npm.cmd run seed
 ```
 
-The demo password is `ExamGuard-Demo-2026!` for all seeded roles. Sign in with `platform.admin@demo.examguard.test` (system administrator), `aarav.admin@demo.examguard.test` (university administrator), `priya.teacher@demo.examguard.test` (coordinator), `karan.proctor@demo.examguard.test` (proctor), or `aditi.candidate@demo.examguard.test` (student). These `.test` addresses are fake and cannot receive email; the seed adds labelled sample exams, questions, candidates, and assignments. See [docs/DEVELOPMENT_DEMO.md](docs/DEVELOPMENT_DEMO.md) for all panel login paths and safety details.
+All demo accounts use the password supplied in `DEMO_SEED_PASSWORD`; the seed refuses remote or production-like database targets and does not print the password. Sign in with `platform.admin@demo.examguard.test` (system administrator), `aarav.admin@demo.examguard.test` (university administrator), `priya.teacher@demo.examguard.test` (coordinator), `karan.proctor@demo.examguard.test` (proctor), or `aditi.candidate@demo.examguard.test` (student). These `.test` addresses are fake and cannot receive email; the seed adds labelled sample exams, questions, candidates, and assignments. See [docs/DEVELOPMENT_DEMO.md](docs/DEVELOPMENT_DEMO.md) for all panel login paths and safety details.
 
-For local coordinator identity applications, keep `LOCAL_EVIDENCE_DIR=./.local-evidence` enabled in `.env`; uploads are stored privately on this machine. Coordinators request access at `/coordinator/register`, submit a government ID, university ID, and authorization letter, and remain unable to sign in until the university administrator approves them in **People and roles**. Use private object storage instead of local storage for deployment.
+Local development uses the opt-in `LOCAL_EVIDENCE_DIR=./.local-evidence` store when `NODE_ENV` is not `production`; new evidence stays private on this machine. For remote evidence storage, set `SUPABASE_URL`, the server-only `SUPABASE_SERVICE_ROLE_KEY`, and `OBJECT_STORAGE_BUCKET`. Production does not fall back to local storage and requires a private Supabase Storage bucket.
+
+Coordinators request access at `/coordinator/register`, submit a government ID, university ID, and authorization letter, and remain unable to sign in until the university administrator approves them in **People and roles**.
 
 Student applications at `/student/register` also require a government-issued ID. It is stored in private evidence storage and is available to the institution administrator during the application review in **Candidates**. The account remains inactive until approval.
 
@@ -35,6 +38,8 @@ PostgreSQL has no automatic expiry of short-lived rows. Remove expired password-
 ## Verification
 
 Run `npm run lint`, `npm run typecheck`, `npm test`, and `npm run build`.
+
+The complete backend suite requires `TEST_DATABASE_URL` to be set explicitly for a PostgreSQL database named `examguard_test` on `localhost` or `127.0.0.1`. Set it in the shell that runs `npm test`; the runner uses that value as `DATABASE_URL` and refuses remote hosts or other database names. Use a dedicated test-owner role and do not point this variable at the development or production database.
 
 Deployment, mail, private storage, hosted AI-service setup, and OAuth callback registration are documented in [docs/deployment.md](docs/deployment.md). Share [the candidate exam setup guide](docs/CANDIDATE_EXAM_GUIDE.md) with students before their exam.
 
@@ -54,7 +59,7 @@ Teachers and institute administrators can mark an exam as practice. Practice att
 
 ## Private candidate documents
 
-Candidate photos and optional ID documents are accepted only through authenticated candidate routes and are stored under organization-scoped keys in a private S3-compatible bucket. Configure all `OBJECT_STORAGE_*` values before using uploads. The server never returns a public storage URL or storage credential. Use a bucket policy that blocks public access and encrypts objects at rest.
+Candidate photos and optional ID documents are accepted only through authenticated candidate routes and are stored under organization-scoped keys in a private Supabase Storage bucket. Configure `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and `OBJECT_STORAGE_BUCKET` before using remote uploads. The service role key stays on the backend, evidence is served through short-lived API URLs, and the bucket must remain private.
 
 Exam attempts have a server-created deadline and cannot be autosaved or submitted once closed. Question delivery omits `correctAnswer`; answers are available only after a future authorized results-release workflow.
 
@@ -75,9 +80,13 @@ node server/scripts/check-imports.mjs; node server/scripts/check-api-contract.mj
 ```
 Background jobs stay off (`BACKGROUND_JOBS_ENABLED=false`) until the migrations are applied to an isolated development database.
 
-If port `4000` is already in use, run the API on another port and point Vite at it:
+If a local service already uses a default port, set the API, AI, and Vite ports together. `CLIENT_URL` must match `VITE_PORT` for backend CORS and Companion pairing:
+
 ```powershell
-$env:PORT="4001"
-$env:VITE_API_PROXY_TARGET="http://localhost:4001"
-npm run dev
+$env:PORT = '4001'
+$env:CLIENT_URL = 'http://localhost:5174'
+$env:VITE_API_PROXY_TARGET = 'http://127.0.0.1:4001'
+$env:VITE_PORT = '5174'
+$env:AI_SERVICE_URL = 'http://127.0.0.1:8002'
+npm.cmd run dev
 ```

@@ -1,10 +1,9 @@
 import bcrypt from 'bcryptjs';
 import { connectDatabase } from '../src/db.js';
 import { prisma } from '../src/prisma.js';
+import { getDemoSeedConfiguration } from './seed-config.js';
 
-const password = process.env.DEMO_SEED_PASSWORD ?? 'ExamGuard-Demo-2026!';
-const databaseName = decodeURIComponent(new URL(process.env.DATABASE_URL ?? 'postgresql://invalid/').pathname.slice(1)).toLowerCase();
-if (process.env.DEMO_SEED !== 'yes' || password.length < 12 || /(^|[-_])(prod|production)([-_]|$)/.test(databaseName)) throw new Error('Refusing to seed. Set DEMO_SEED=yes and use a non-production PostgreSQL database name in DATABASE_URL.');
+const { password } = getDemoSeedConfiguration(process.env);
 
 const people = [
   ['Aarav Sharma', 'aarav.admin@demo.examguard.test', 'institute_admin'],
@@ -34,7 +33,7 @@ const questions = [
 async function seed() {
   await connectDatabase();
   const org = await prisma.organization.upsert({ where: { slug: 'examguard-demo-institute' }, update: {}, create: { name: '[DEMO] ExamGuard Demo Institute', slug: 'examguard-demo-institute' } });
-  const passwordHash = await bcrypt.hash(password!, 12);
+  const passwordHash = await bcrypt.hash(password, 12);
   const identities = new Map<string, { id: string; name: string; candidateCode?: string }>();
   for (const [name, email, role, candidateCode] of people) {
     const isPlatformAdmin = role === 'platform_admin';
@@ -69,7 +68,7 @@ async function seed() {
   for (const candidateId of candidateIds) {
     await prisma.examAssignment.upsert({ where: { examId_candidateId: { examId: exam.id, candidateId } }, update: {}, create: { organizationId: org.id, examId: exam.id, candidateId } });
   }
-  console.info(`Development demo data is ready. Demo account password: ${password}. No monitoring observations were created.`);
+  console.info('Development demo data is ready. No monitoring observations were created.');
 }
 
 seed()

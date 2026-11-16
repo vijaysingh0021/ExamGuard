@@ -24,15 +24,11 @@ services:
         sync: false
       - key: AI_SERVICE_TOKEN
         sync: false
-      - key: OBJECT_STORAGE_ENDPOINT
+      - key: SUPABASE_URL
         sync: false
-      - key: OBJECT_STORAGE_REGION
+      - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: OBJECT_STORAGE_BUCKET
-        sync: false
-      - key: OBJECT_STORAGE_ACCESS_KEY_ID
-        sync: false
-      - key: OBJECT_STORAGE_SECRET_ACCESS_KEY
         sync: false
       - key: EMAIL_PROVIDER
         value: brevo

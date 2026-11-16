@@ -1,6 +1,8 @@
 
 # ExamGuard completion status
 
+> **Current-status notice (2026-11-17):** The phased notes below are historical. The current verified release state and remaining blockers are in [docs/PROJECT_VERIFICATION_REPORT.md](docs/PROJECT_VERIFICATION_REPORT.md).
+
 ## Completed
 
 - Preserved the existing tenant-scoped Express/PostgreSQL examination, grading, verification, reporting, and proctoring implementation.
@@ -20,7 +22,7 @@
 ## External configuration required
 
 - PostgreSQL connection details (`DATABASE_URL`) and applied Prisma migrations.
-- A private S3-compatible bucket for candidate documents.
+- A private Supabase Storage bucket for candidate documents.
 - A mail-webhook endpoint for password-reset delivery.
 - Google and/or Microsoft application registrations, client credentials, and exact API callback URLs.
 - Optional FastAPI dependencies and a validated YOLO model if camera/phone analysis is required.
@@ -172,7 +174,7 @@ The app intentionally does not claim browser detection of nearby devices, Wi-Fi/
 - The existing webhook email provider remains the delivery boundary; if it is unavailable, the request remains generic and no usable OTP is issued.
 - Password reset rate limiting remains process-local through the existing express-rate-limit infrastructure; a distributed deployment would require a shared limiter store.
 
-### Incremental implementation plan
+### Historical incremental implementation plan (superseded)
 
 1. Evidence Center plain-language presentation and advanced-details disclosure.
 2. Student explanation request, response, attachment and reviewer decision workflow.
