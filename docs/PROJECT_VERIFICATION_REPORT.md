@@ -38,6 +38,12 @@ This dated follow-up supersedes earlier test counts and adds the production-orig
 - Cloud Run was not independently queried because the service URL was not provided and reading `.env` was prohibited. The current local readiness UI did show authenticated AI-service readiness.
 - The Companion executable was not replaced or relaunched after the required approval request could not be answered. No package signing certificate or release workflow was available in the repository.
 
+### Git and hosted deployment status
+
+- Commit `79eee826f92cce15b03cf685ffa6f8a8ff23db16` was pushed to `origin/main`. It contains only the 21 explicitly staged source, test, and documentation files. `.env` was not tracked or committed; the unrelated `ai-optimization-review.txt` and `device-monitor/Program.cs.backup` remain untracked and untouched.
+- The GitHub Actions lookup returned **zero workflow runs** for the push. The public Render health endpoint returned HTTP 200, and the public Vercel landing page loaded, but neither result identifies the deployed commit. Render/Vercel deployment completion is therefore **not confirmed**.
+- After the push, a fresh stable-Vercel-origin browser request to the local Companion still returned HTTP 401. This is consistent with the currently running old Companion binary; the source fix has not been installed on the machine. No Cloud Run deployment or production AI health check was confirmed.
+
 ## Executive summary
 
 The local backend, frontend, AI service, and build checks were verified using an isolated loopback PostgreSQL `examguard_test` database. The test process received an explicit `TEST_DATABASE_URL`; tests left no application records, and the temporary test cluster was stopped and removed after validation.
