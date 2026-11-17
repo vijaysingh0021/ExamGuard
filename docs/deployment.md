@@ -136,10 +136,11 @@ or the short-lived API URL; a cleanup failure is reported separately and fails
 the command. Run it only against the intended Supabase project.
 
 The backend already publishes incident events through Socket.IO. The incident
-timeline now subscribes when an authorized staff member filters by a valid
-exam UUID and refreshes the review queue on incoming events. This requires the
-Render API to be awake and reachable; free-tier restarts can interrupt the
-connection.
+timeline subscribes when an authorized staff member filters by a valid exam
+UUID and refreshes the review queue on incoming events. It also polls the API
+every 10 seconds while the page is open, including when no exam UUID is selected
+or the socket is unavailable. This requires the Render API to be awake and
+reachable; free-tier restarts can interrupt the socket connection.
 
 ## Prerequisites
 

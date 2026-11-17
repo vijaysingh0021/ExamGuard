@@ -2646,6 +2646,8 @@ function Incidents({ session }: { session: Session }) {
         pagination: readPagination(response),
       };
     },
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: false,
   });
 
   const data = Array.isArray(incidentPage.items)
