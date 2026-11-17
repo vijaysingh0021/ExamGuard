@@ -11,7 +11,13 @@ import { StorageInterface, realStorage, verifyPrivateEvidenceToken } from './sto
 import { dedupeWindow, fingerprintFor, reviewPriority } from './proctor.js';
 import { aiSignalsForFrame } from './ai-monitoring.js';
 import { radioProximity, supportsPotentialVisualAssistance } from './radio-proximity.js';
-import { radioObservationSelect, withAdvertisedNameCompatibility } from './radio-observation.js';
+import {
+  radioObservationBatchInput,
+  radioObservationInput,
+  radioObservationSelect,
+  radioRepeatSignalDedupeKey,
+  withAdvertisedNameCompatibility,
+} from './radio-observation.js';
 import { registerOpsRoutes } from './ops-routes.js';
 import { registerReviewRoutes } from './review-routes.js';
 import { registerEmailRoutes } from './email-routes.js';
@@ -150,7 +156,6 @@ const codingQuestionFields = (data: z.infer<typeof codingQuestionInput>) => ({
 const orgConfig = (organizationId: string) => prisma.proctoringConfig.upsert({ where: { organizationId }, update: {}, create: { organizationId } });
 const shuffle = <T>(items: T[]) => { const copy = [...items]; for (let i = copy.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [copy[i], copy[j]] = [copy[j], copy[i]]; } return copy; };
 const proctorEventInput = z.object({ examId: z.string().uuid(), candidateId: z.string().uuid(), sessionId: z.string().uuid().optional(), attemptId: z.string().uuid(), type: z.enum(['face_missing', 'multiple_faces', 'looking_away', 'phone_detected', 'camera_obstructed', 'visibility_hidden', 'fullscreen_exit', 'window_blur', 'focus_regain', 'multiple_window_hint', 'network_interruption', 'camera_permission_lost', 'screen_sharing_stopped']), occurredAt: z.string().datetime(), source: z.literal('browser'), details: z.record(z.unknown()).optional(), evidenceKey: z.string().max(512).optional() });
-const radioObservationInput = z.object({ organizationId: z.string().uuid(), examId: z.string().uuid(), candidateId: z.string().uuid(), attemptId: z.string().uuid(), source: z.enum(['bluetooth_le', 'wifi', 'scanner_health']), kind: z.enum(['advertisement', 'access_point', 'heartbeat', 'scan_unavailable', 'permission_denied', 'scan_error', 'scan_stopped']), rssi: z.number().int().min(-127).max(0).optional(), pseudonym: z.string().min(16).max(128).optional(), advertisedName: z.string().trim().min(1).max(80).refine(value => !/[\u0000-\u001f\u007f]/.test(value), 'Advertised name contains invalid control characters').optional(), scannerStatus: z.enum(['active', 'unavailable', 'permission_denied', 'stopped', 'error']), errorCode: z.string().max(120).optional() }).superRefine((data, ctx) => { if (data.kind === 'advertisement' || data.kind === 'access_point') { if (!data.pseudonym) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'A session-scoped pseudonym is required for a radio observation' }); if (data.scannerStatus !== 'active') ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Radio observations require an active scanner status' }); } if (data.advertisedName && data.source !== 'bluetooth_le') ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['advertisedName'], message: 'Advertised names are accepted only from Bluetooth LE' }); });
 
 const MAX_SUPPORTED_FACE_COUNT = 20;
 const aiFrameSchema = z.object({
@@ -2444,42 +2449,176 @@ app.get('/api/student/companion-pairing', authenticateCompanion, async (req: Aut
   if (!attempt) return res.status(409).json({ error: 'This pairing is no longer active. Return to the active exam and generate a new pairing token.' });
   res.json({ context: { organizationId: companion.organizationId, examId: companion.examId, candidateId: companion.candidateId, attemptId: companion.attemptId }, expiresAt: companion.expiresAt ? new Date(companion.expiresAt * 1000).toISOString() : undefined });
 } catch (error) { next(error); } });
+const ingestRadioObservations = async (
+  req: AuthRequest,
+  context: { organizationId: string; examId: string; candidateId: string; attemptId: string },
+  records: z.infer<typeof radioObservationBatchInput>['observations'],
+) => {
+  const companion = (req as AuthRequest & { companion: CompanionClaims }).companion;
+  if (context.organizationId !== companion.organizationId ||
+      context.examId !== companion.examId ||
+      context.candidateId !== companion.candidateId ||
+      context.attemptId !== companion.attemptId) {
+    return { status: 403 as const, body: { error: 'Observation context does not match this companion pairing.' } };
+  }
+
+  const candidate = await prisma.candidate.findFirst({
+    where: { id: context.candidateId, organizationId: companion.organizationId, userId: companion.userId },
+  });
+  const receivedAt = new Date();
+  const attempt = candidate && await prisma.examAttempt.findFirst({
+    where: {
+      id: context.attemptId,
+      organizationId: candidate.organizationId,
+      candidateId: candidate.id,
+      examId: context.examId,
+      userId: companion.userId,
+      status: 'in_progress',
+      deadlineAt: { gt: receivedAt },
+    },
+  });
+  if (!candidate || !attempt) {
+    return { status: 403 as const, body: { error: 'An active authorized attempt is required' } };
+  }
+  if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v2') {
+    return { status: 403 as const, body: { error: 'Monitoring consent is not recorded for this attempt' } };
+  }
+
+  const items = [];
+  for (const data of records) {
+    const observedAt = data.observedAt ? new Date(data.observedAt) : receivedAt;
+    if (observedAt.getTime() < receivedAt.getTime() - 15 * 60_000 ||
+        observedAt.getTime() > receivedAt.getTime() + 30_000) {
+      return { status: 400 as const, body: { error: 'Observation timestamp is outside the permitted delivery window.' } };
+    }
+
+    const organizationId = candidate.organizationId;
+    const fingerprint = fingerprintFor(
+      organizationId,
+      attempt.id,
+      `${data.source}:${data.kind}:${data.pseudonym ?? data.errorCode ?? 'health'}`,
+      dedupeWindow(observedAt, 5),
+    );
+    const limitations = data.source === 'bluetooth_le'
+      ? 'BLE advertisements do not identify a device type; addresses may rotate and many phones do not advertise.'
+      : data.source === 'wifi'
+        ? 'Wi-Fi scans observe access points, not nearby clients or every phone; a hotspot is not proof of a prohibited device.'
+        : 'Scanner health is technical telemetry and is not evidence of student conduct.';
+    const fields = {
+      examId: context.examId,
+      candidateId: candidate.id,
+      attemptId: attempt.id,
+      source: data.source,
+      kind: data.kind,
+      rssi: data.rssi,
+      pseudonym: data.pseudonym,
+      scannerStatus: data.scannerStatus,
+      errorCode: data.errorCode,
+      observedAt,
+      limitations,
+      expiresAt: new Date(observedAt.getTime() + 30 * 24 * 60 * 60_000),
+    };
+    const observationResult = await withAdvertisedNameCompatibility(includeAdvertisedName => {
+      const namedFields = includeAdvertisedName ? { ...fields, advertisedName: data.advertisedName } : fields;
+      return prisma.radioObservation.upsert({
+        where: { organizationId_fingerprint: { organizationId, fingerprint } },
+        update: namedFields,
+        create: { ...namedFields, organizationId, fingerprint },
+        select: radioObservationSelect(includeAdvertisedName),
+      });
+    });
+
+    let signalId: string | undefined;
+    let repeatedObservationCount = 0;
+    if ((data.kind === 'advertisement' || data.kind === 'access_point') && data.pseudonym) {
+      const windowStart = new Date(observedAt.getTime() - 5 * 60_000);
+      const recent = await prisma.radioObservation.findMany({
+        where: {
+          organizationId,
+          attemptId: attempt.id,
+          source: data.source,
+          kind: data.kind,
+          pseudonym: data.pseudonym,
+          observedAt: { gte: windowStart, lte: observedAt },
+          expiresAt: { gt: receivedAt },
+        },
+        orderBy: { observedAt: 'desc' },
+        take: 100,
+        select: { id: true },
+      });
+      repeatedObservationCount = recent.length;
+      if (recent.length >= 3) {
+        const dedupeKey = radioRepeatSignalDedupeKey(
+          organizationId,
+          attempt.id,
+          data.source,
+          data.kind,
+          data.pseudonym,
+          observedAt,
+        );
+        const rule = `repeated_${data.source}_pseudonym`;
+        const label = data.source === 'wifi'
+          ? 'Repeated access-point observation for one session pseudonym; this is not a client-device finding'
+          : 'Repeated BLE signal for one session pseudonym; device identity remains unknown';
+        const signal = await prisma.$transaction(async tx => {
+          const createdOrExisting = await tx.radioCandidateSignal.upsert({
+            where: { dedupeKey },
+            update: {},
+            create: {
+              organizationId,
+              examId: context.examId,
+              candidateId: candidate.id,
+              attemptId: attempt.id,
+              rule,
+              label,
+              dedupeKey,
+            },
+          });
+          await tx.radioSignalObservation.createMany({
+            data: recent.map(item => ({ signalId: createdOrExisting.id, observationId: item.id })),
+            skipDuplicates: true,
+          });
+          return createdOrExisting;
+        });
+        signalId = signal.id;
+      }
+    }
+
+    const observation = observationResult.result;
+    await audit(organizationId, companion.userId, 'radio.observation_recorded', 'RadioObservation', observation.id, {
+      source: data.source,
+      kind: data.kind,
+      signalId,
+    });
+    items.push({
+      observationId: observation.id,
+      candidateSignalId: signalId,
+      repeatedObservationCount,
+      advertisedNameStored: observationResult.advertisedNameAvailable && Boolean(data.advertisedName),
+      ...(data.advertisedName && !observationResult.advertisedNameAvailable
+        ? { warning: 'The current database schema does not yet store BLE advertised names. Apply the pending radio advertised-name migration to enable this field.' }
+        : {}),
+      disposition: data.kind === 'advertisement' || data.kind === 'access_point'
+        ? 'recorded_for_possible_review'
+        : 'technical_status_recorded',
+    });
+  }
+
+  return { status: 201 as const, body: { observations: items } };
+};
+
 app.post('/api/student/radio-observations', authenticateCompanion, radioObservationLimiter, async (req: AuthRequest, res, next) => { try {
   const data = radioObservationInput.parse(req.body);
-  const companion = (req as AuthRequest & { companion: CompanionClaims }).companion;
-  if (data.organizationId !== companion.organizationId || data.examId !== companion.examId || data.candidateId !== companion.candidateId || data.attemptId !== companion.attemptId) return res.status(403).json({ error: 'Observation context does not match this companion pairing.' });
-  const candidate = await prisma.candidate.findFirst({ where: { id: data.candidateId, organizationId: companion.organizationId, userId: companion.userId } });
-  const attempt = candidate && await prisma.examAttempt.findFirst({ where: { id: data.attemptId, organizationId: candidate.organizationId, candidateId: candidate.id, examId: data.examId, userId: companion.userId, status: 'in_progress', deadlineAt: { gt: new Date() } } });
-  if (!candidate || !attempt) return res.status(403).json({ error: 'An active authorized attempt is required' });
-  if (!attempt.monitoringConsentAt || attempt.monitoringConsentVersion !== 'examguard-monitoring-v2') return res.status(403).json({ error: 'Monitoring consent is not recorded for this attempt' });
-  const organizationId = candidate.organizationId;
-  const observedAt = new Date();
-  const fingerprint = fingerprintFor(organizationId, attempt.id, `${data.source}:${data.kind}:${data.pseudonym ?? data.errorCode ?? 'health'}`, dedupeWindow(observedAt, 30));
-  const limitations = data.source === 'bluetooth_le' ? 'BLE advertisements do not identify a device type; addresses may rotate and many phones do not advertise.' : data.source === 'wifi' ? 'Wi-Fi scans observe access points, not nearby clients or every phone; a hotspot is not proof of a prohibited device.' : 'Scanner health is technical telemetry and is not evidence of student conduct.';
-  const fields = { examId: data.examId, candidateId: candidate.id, attemptId: attempt.id, source: data.source, kind: data.kind, rssi: data.rssi, pseudonym: data.pseudonym, scannerStatus: data.scannerStatus, errorCode: data.errorCode, observedAt, limitations, expiresAt: new Date(observedAt.getTime() + 30 * 24 * 60 * 60_000) };
-  const observationResult = await withAdvertisedNameCompatibility(includeAdvertisedName => {
-    const namedFields = includeAdvertisedName ? { ...fields, advertisedName: data.advertisedName } : fields;
-    return prisma.radioObservation.upsert({
-      where: { organizationId_fingerprint: { organizationId, fingerprint } },
-      update: namedFields,
-      create: { ...namedFields, organizationId, fingerprint },
-      select: radioObservationSelect(includeAdvertisedName),
-    });
-  });
-  const observation = observationResult.result;
-  let signalId: string | undefined;
-  if (data.kind === 'advertisement' || data.kind === 'access_point') {
-    const windowStart = new Date(observedAt.getTime() - 5 * 60_000);
-    const recent = await prisma.radioObservation.findMany({ where: { organizationId, attemptId: attempt.id, source: data.source, kind: data.kind, observedAt: { gte: windowStart } }, orderBy: { observedAt: 'desc' }, take: 3, select: { id: true } });
-    if (recent.length >= 3) {
-      const rule = `repeated_${data.source}_observation`;
-      const existing = await prisma.radioCandidateSignal.findFirst({ where: { organizationId, attemptId: attempt.id, rule, status: 'pending_review' } });
-      const signal = existing ?? await prisma.radioCandidateSignal.create({ data: { organizationId, examId: data.examId, candidateId: candidate.id, attemptId: attempt.id, rule, label: 'Repeated nearby radio observation — device type unknown', observations: { create: recent.map(x => ({ observationId: x.id })) } } });
-      signalId = signal.id;
-    }
-  }
-  await audit(organizationId, companion.userId, 'radio.observation_recorded', 'RadioObservation', observation.id, { source: data.source, kind: data.kind, signalId });
-  res.status(201).json({ observationId: observation.id, candidateSignalId: signalId, advertisedNameStored: observationResult.advertisedNameAvailable && Boolean(data.advertisedName), ...(data.advertisedName && !observationResult.advertisedNameAvailable ? { warning: 'The current database schema does not yet store BLE advertised names. Apply the pending radio advertised-name migration to enable this field.' } : {}), disposition: data.kind === 'advertisement' || data.kind === 'access_point' ? 'recorded_for_possible_review' : 'technical_status_recorded' });
+  const { organizationId, examId, candidateId, attemptId, ...record } = data;
+  const result = await ingestRadioObservations(req, { organizationId, examId, candidateId, attemptId }, [record]);
+  if (result.status !== 201) return res.status(result.status).json(result.body);
+  return res.status(201).json(result.body.observations[0]);
+} catch (error) { next(error); } });
+app.post('/api/student/radio-observations/batch', authenticateCompanion, radioObservationLimiter, async (req: AuthRequest, res, next) => { try {
+  const data = radioObservationBatchInput.parse(req.body);
+  const { organizationId, examId, candidateId, attemptId, observations } = data;
+  const result = await ingestRadioObservations(req, { organizationId, examId, candidateId, attemptId }, observations);
+  return res.status(result.status).json(result.body);
 } catch (error) { next(error); } });
 app.get('/api/organizations/:organizationId/radio-observations', authenticate, authorize('institute_admin', 'teacher', 'proctor'), async (req: AuthRequest, res, next) => { try {
   const organizationId = req.auth!.organizationId!;
@@ -2736,7 +2875,34 @@ app.get('/api/organizations/:organizationId/evidence/:kind/:evidenceId/details',
     await audit(organizationId, req.auth!.userId, 'evidence.detail_viewed', 'RadioObservation', observation.id);
     const signalIds = observation.signals.map(link => link.signal.id);
     const reviewHistory = signalIds.length ? await prisma.auditLog.findMany({ where: { organizationId, targetType: 'RadioCandidateSignal', targetId: { in: signalIds } }, orderBy: { createdAt: 'desc' }, take: 50, select: { id: true, action: true, metadata: true, createdAt: true, actor: { select: { name: true } } } }) : [];
-    return res.json({ item: { id: observation.id, kind, type: `${observation.source}:${observation.kind}`, occurredAt: observation.observedAt, candidate: observation.candidate, exam: observation.exam, attempt: observation.attempt, details: { kind: observation.kind, rssi: observation.rssi, proximity: radioProximity(observation.source, observation.rssi), pseudonym: observation.pseudonym, advertisedName: observation.advertisedName ?? null, advertisedNameAvailable: observationResult.advertisedNameAvailable, scannerStatus: observation.scannerStatus, errorCode: observation.errorCode, limitations: observation.limitations }, signals: observation.signals.map(link => link.signal) }, reviewHistory });
+    const samePseudonymWhere = observation.pseudonym && (observation.source === 'bluetooth_le' || observation.source === 'wifi')
+      ? {
+          organizationId,
+          attemptId: observation.attemptId,
+          source: observation.source,
+          kind: observation.kind,
+          pseudonym: observation.pseudonym,
+          expiresAt: { gt: new Date() },
+        }
+      : null;
+    const historyResult = samePseudonymWhere
+      ? await withAdvertisedNameCompatibility(includeAdvertisedName =>
+          prisma.radioObservation.findMany({
+            where: samePseudonymWhere,
+            orderBy: { observedAt: 'desc' },
+            take: 100,
+            select: {
+              id: true,
+              observedAt: true,
+              rssi: true,
+              ...(includeAdvertisedName ? { advertisedName: true } : {}),
+            },
+          }))
+      : { result: [], advertisedNameAvailable: observationResult.advertisedNameAvailable };
+    const historyCount = samePseudonymWhere
+      ? await prisma.radioObservation.count({ where: samePseudonymWhere })
+      : 0;
+    return res.json({ item: { id: observation.id, kind, type: `${observation.source}:${observation.kind}`, occurredAt: observation.observedAt, candidate: observation.candidate, exam: observation.exam, attempt: observation.attempt, details: { kind: observation.kind, rssi: observation.rssi, proximity: radioProximity(observation.source, observation.rssi), pseudonym: observation.pseudonym, advertisedName: observation.advertisedName ?? null, advertisedNameAvailable: observationResult.advertisedNameAvailable, scannerStatus: observation.scannerStatus, errorCode: observation.errorCode, limitations: observation.limitations, repeatedObservationCount: historyCount, history: historyResult.result.map(item => ({ observedAt: item.observedAt, rssi: item.rssi, advertisedName: 'advertisedName' in item ? item.advertisedName ?? null : null, proximity: radioProximity(observation.source, item.rssi) })) }, signals: observation.signals.map(link => link.signal) }, reviewHistory });
   }
   const submission = await prisma.codeSubmission.findFirst({ where: { id: evidenceId, organizationId }, include: { candidate: { select: { id: true, name: true, email: true, organizationId: true } }, attempt: { select: { id: true, status: true, organizationId: true, examId: true, candidateId: true, exam: { select: { id: true, title: true, organizationId: true } } } }, codingQuestion: { select: { id: true, title: true } } } });
   if (!submission || !evidenceAttemptScopeMatches(submission.attempt, { organizationId: submission.organizationId, examId: submission.attempt.examId, candidateId: submission.candidateId }, organizationId) || submission.attempt.exam.organizationId !== organizationId || submission.candidate.organizationId !== organizationId) return res.status(404).json({ error: 'Evidence not found' });

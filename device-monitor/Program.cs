@@ -177,6 +177,12 @@ internal sealed class MonitorForm : Form
         AutoSize = true
     };
 
+    private readonly Label radioSyncStatus = new()
+    {
+        Text = "Backend sync: idle",
+        AutoSize = true
+    };
+
     private readonly ListBox activity = new()
     {
         Dock = DockStyle.Fill
@@ -201,7 +207,11 @@ internal sealed class MonitorForm : Form
         AutoSize = true
     };
 
-    private readonly BluetoothLEAdvertisementWatcher bluetooth = new();
+    private readonly BluetoothLEAdvertisementWatcher bluetooth = new()
+    {
+        ScanningMode = BluetoothLEScanningMode.Active,
+        AllowExtendedAdvertisements = true
+    };
     private readonly HttpClient http = new()
     {
         Timeout = TimeSpan.FromSeconds(10)
@@ -210,14 +220,17 @@ internal sealed class MonitorForm : Form
     private string sessionSalt =
         Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
 
-    private bool scanning;
-    private bool closing;
+    private volatile bool scanning;
+    private volatile bool closing;
     private bool wifiScanRunning;
+    private bool pairingInProgress;
     private bool bluetoothAvailable;
     private bool wifiAvailable;
     private bool paired;
     private DateTimeOffset? pairingExpiresAt;
     private readonly BridgeAuthorizationSessions bridgeAuthorizationSessions = new();
+    private readonly RadioObservationOutbox radioOutbox = new();
+    private readonly RadioObservationSampler radioSampler = new();
 
     private readonly TcpListener bridge = new(IPAddress.Loopback, 43117);
     private readonly NotifyIcon trayIcon;
@@ -226,6 +239,8 @@ internal sealed class MonitorForm : Form
     private bool bridgeStartAttempted;
     private System.Threading.Timer? heartbeatTimer;
     private System.Threading.Timer? wifiScanTimer;
+    private System.Threading.Timer? radioUploadTimer;
+    private long reportedDroppedObservationCount;
 
     public MonitorForm()
     {
@@ -299,6 +314,7 @@ internal sealed class MonitorForm : Form
         buttons.Controls.Add(stopButton);
         buttons.Controls.Add(bluetoothStatus);
         buttons.Controls.Add(wifiStatus);
+        buttons.Controls.Add(radioSyncStatus);
 
         var consentPanel = new Panel
         {
@@ -331,16 +347,11 @@ internal sealed class MonitorForm : Form
         stopButton.Click += async (_, _) =>
             await StopAsync();
 
-        bluetooth.Received += async (_, e) =>
-            await BluetoothReceived(e);
+        bluetooth.Received += (_, e) => BluetoothReceived(e);
 
         bluetooth.Stopped += (_, e) =>
         {
-            if (e.Error != BluetoothError.Success)
-            {
-                SetBluetoothStatus("Bluetooth: unavailable");
-                Add($"Bluetooth stopped with error: {e.Error}");
-            }
+            HandleBluetoothStopped(e.Error);
         };
 
         consent.CheckedChanged += (_, _) =>
@@ -361,6 +372,11 @@ internal sealed class MonitorForm : Form
             }
         };
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) HideToTray(); };
+        radioUploadTimer = new System.Threading.Timer(
+            async _ => await PumpRadioOutboxAsync(),
+            null,
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(1));
     }
 
     private void HideToTray()
@@ -387,6 +403,25 @@ internal sealed class MonitorForm : Form
     private async Task CloseFromTrayAsync()
     {
         if (scanning) await StopAsync();
+        for (var attempt = 0; attempt < 4 && radioOutbox.PendingCount > 0; attempt++)
+        {
+            await PumpRadioOutboxAsync();
+            if (radioOutbox.PendingCount > 0)
+                await Task.Delay(TimeSpan.FromSeconds(attempt + 1));
+        }
+        if (radioOutbox.PendingCount > 0)
+        {
+            var pending = radioOutbox.PendingCount;
+            var choice = MessageBox.Show(
+                this,
+                $"{pending} radio observations are still queued and cannot be saved after closing. Cancel to leave the Companion running and retry synchronization, or choose OK to close and discard them.",
+                "Radio observations are not synchronized",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning);
+            if (choice != DialogResult.OK)
+                return;
+            Add($"Closing with {pending} unsynchronized radio observations; they will be discarded.");
+        }
         closing = true;
         Close();
     }
@@ -451,22 +486,21 @@ internal sealed class MonitorForm : Form
         try
         {
             bluetooth.Start();
-            bluetoothAvailable = true;
+            bluetoothAvailable = bluetooth.Status == BluetoothLEAdvertisementWatcherStatus.Started;
+            if (!bluetoothAvailable)
+                throw new InvalidOperationException("The Bluetooth LE watcher did not enter the started state.");
 
             SetBluetoothStatus("Bluetooth: active");
             Add("Bluetooth LE watcher started.");
+            await Submit("bluetooth_le", "scanner_status", null, null, "active");
         }
         catch (Exception ex)
         {
-            SetBluetoothStatus("Bluetooth: unavailable");
+            var status = ex is UnauthorizedAccessException ? "permission_denied" : "unavailable";
+            SetBluetoothStatus(status == "permission_denied" ? "Bluetooth: permission required" : "Bluetooth: unavailable");
             Add($"Bluetooth could not start: {ex.HResult:X8}");
 
-            await Submit(
-                "scanner_health",
-                "scan_error",
-                null,
-                ex.HResult.ToString("X8"),
-                "error");
+            await Submit("bluetooth_le", "scanner_status", null, ex.HResult.ToString("X8"), status);
         }
 
         await ScanWifiAsync();
@@ -491,6 +525,13 @@ internal sealed class MonitorForm : Form
                 if (!scanning || closing)
                     return;
 
+                if (!bluetoothAvailable && !wifiAvailable)
+                {
+                    await Submit("scanner_health", "scan_unavailable", null, "no_active_scanner", "unavailable");
+                    await InvokeOnUiAsync(() => StopAsync(reportToServer: false));
+                    return;
+                }
+
                 if (!pairingExpiresAt.HasValue ||
                     pairingExpiresAt.Value <= DateTimeOffset.UtcNow.AddSeconds(30))
                 {
@@ -499,6 +540,10 @@ internal sealed class MonitorForm : Form
                     return;
                 }
 
+                if (bluetoothAvailable)
+                    await Submit("bluetooth_le", "scanner_status", null, null, "active");
+                if (wifiAvailable)
+                    await Submit("wifi", "scanner_status", null, null, "active");
                 await Submit("scanner_health", "heartbeat", null, null, "active");
             }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
             wifiScanTimer?.Dispose();
@@ -507,6 +552,7 @@ internal sealed class MonitorForm : Form
                 if (scanning && !closing)
                     await ScanWifiAsync();
             }, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+            radioUploadTimer?.Change(TimeSpan.Zero, TimeSpan.FromSeconds(1));
             return true;
         }
         return false;
@@ -526,6 +572,7 @@ internal sealed class MonitorForm : Form
             return false;
         }
         pairButton.Enabled = false;
+        pairingInProgress = true;
         try
         {
             using var request = new HttpRequestMessage(
@@ -553,9 +600,26 @@ internal sealed class MonitorForm : Form
                 Add("Pairing response has missing, invalid, or expired credentials/context.");
                 return false;
             }
+            var attemptChanged = !string.IsNullOrEmpty(attemptId.Text) &&
+                !string.Equals(attemptId.Text, payload.Context.AttemptId, StringComparison.Ordinal);
+            if (attemptChanged && radioOutbox.PendingCount > 0)
+            {
+                for (var flushAttempt = 0; flushAttempt < 4 && radioOutbox.PendingCount > 0; flushAttempt++)
+                {
+                    await PumpRadioOutboxAsync(allowDuringPairing: true);
+                    if (radioOutbox.PendingCount > 0)
+                        await Task.Delay(TimeSpan.FromSeconds(flushAttempt + 1));
+                }
+                if (radioOutbox.PendingCount > 0)
+                {
+                    if (scanning) await StopAsync(reportToServer: false);
+                    Add("Previous-attempt observations are still syncing. The new attempt was not paired; retry after synchronization.");
+                    return false;
+                }
+            }
             // A running scan belongs to exactly one attempt. Stop the previous
             // context before changing IDs or rotating its session pseudonym salt.
-            if (scanning && !string.Equals(attemptId.Text, payload.Context.AttemptId, StringComparison.Ordinal))
+            if (scanning && attemptChanged)
                 await StopAsync();
 
             organizationId.Text = payload.Context.OrganizationId;
@@ -581,6 +645,7 @@ internal sealed class MonitorForm : Form
         }
         finally
         {
+            pairingInProgress = false;
             pairButton.Enabled = true;
         }
     }
@@ -900,29 +965,36 @@ internal sealed class MonitorForm : Form
         return completion.Task;
     }
 
-    private async Task BluetoothReceived(
-        BluetoothLEAdvertisementReceivedEventArgs e)
+    private void BluetoothReceived(BluetoothLEAdvertisementReceivedEventArgs e)
     {
-        if (!scanning || !consent.Checked)
+        if (!scanning)
             return;
 
-        // The raw Bluetooth address is used only in memory to
-        // derive a session-scoped pseudonym. It is never uploaded.
-        var pseudonym = Pseudonym(e.BluetoothAddress.ToString("X"));
+        if (e.BluetoothAddress == 0)
+        {
+            Add("BLE advertisement omitted because Windows did not provide a usable pseudonym source.");
+            return;
+        }
+
+        var observedAt = DateTimeOffset.UtcNow;
+        var pseudonym = RadioPrivacy.Pseudonym(sessionSalt, e.BluetoothAddress.ToString("X"));
+        if (!radioSampler.ShouldAccept("bluetooth_le", pseudonym, observedAt))
+            return;
         var advertisedName = SanitizeAdvertisedName(e.Advertisement.LocalName);
 
         Add(
             $"BLE advertisement observed (RSSI {e.RawSignalStrengthInDBm} dBm). " +
             "Device identity and device type are unknown.");
 
-        await Submit(
+        _ = Submit(
             "bluetooth_le",
             "advertisement",
             e.RawSignalStrengthInDBm,
             null,
             "active",
             pseudonym,
-            advertisedName);
+            advertisedName,
+            observedAt);
     }
 
     private async Task ScanWifiAsync()
@@ -934,37 +1006,62 @@ internal sealed class MonitorForm : Form
 
         try
         {
-            // NativeWifi is a synchronous native helper. Run it away from the
-            // UI thread so permission prompts and driver delays stay visible.
+            // NativeWifi waits for Windows scan-complete notifications away from the UI thread.
             var results = await Task.Run(NativeWifi.Scan);
             if (!scanning || closing)
+            {
+                Add("Wi-Fi scan completed after monitoring stopped; its observations were discarded.");
                 return;
+            }
 
             foreach (var diagnostic in NativeWifi.DrainDiagnostics())
                 Add($"Wi-Fi diagnostic: {diagnostic}");
 
-            wifiAvailable = true;
-            SetWifiStatus(
-                $"Wi-Fi: scan completed ({results.Count} access points)");
-            if (results.Count == 0)
+            foreach (var failure in results.Failures)
+                Add($"Wi-Fi scan diagnostic: {failure.Category} ({failure.Code}).");
+
+            var scanStatus = NativeWifi.ClassifyStatus(results);
+            wifiAvailable = results.SuccessfulInterfaces > 0;
+            if (!wifiAvailable)
+            {
+                SetWifiStatus(scanStatus == "permission_denied"
+                    ? "Wi-Fi: permission required"
+                    : scanStatus == "unavailable" ? "Wi-Fi: unavailable" : "Wi-Fi: scanner error");
+                await Submit("wifi", "scanner_status", null, "wifi_scan_failed", scanStatus, observedAt: results.CompletedAt);
+                return;
+            }
+
+            SetWifiStatus(results.Failures.Count == 0
+                ? $"Wi-Fi: scan completed ({results.AccessPoints.Count} access points)"
+                : $"Wi-Fi: partial scan ({results.SuccessfulInterfaces}/{results.TotalInterfaces} interfaces)");
+            await Submit(
+                "wifi",
+                "scanner_status",
+                null,
+                results.Failures.Count == 0 ? null : $"partial_scan_failures:{results.Failures.Count}",
+                scanStatus,
+                observedAt: results.CompletedAt);
+            await Submit("wifi", "scan_complete", null, null, "active", observedAt: results.CompletedAt);
+            if (results.AccessPoints.Count == 0)
                 Add("No Wi-Fi access points were visible in this scan.");
 
-            foreach (var ap in results.Take(20))
+            foreach (var ap in results.AccessPoints)
             {
-                if (!scanning || !consent.Checked)
+                if (!scanning)
                     break;
 
                 Add(
                     $"Wi-Fi access point observed (RSSI {ap.Rssi} dBm). " +
-                    "This does not identify a nearby phone or client.");
+                    "This is an environmental access point, not a nearby client device.");
 
-                await Submit(
+                _ = Submit(
                     "wifi",
                     "access_point",
                     ap.Rssi,
                     null,
                     "active",
-                    Pseudonym(ap.Bssid));
+                    RadioPrivacy.Pseudonym(sessionSalt, ap.Bssid),
+                    observedAt: results.CompletedAt);
             }
         }
         catch (Exception ex)
@@ -973,15 +1070,16 @@ internal sealed class MonitorForm : Form
                 Add($"Wi-Fi diagnostic: {diagnostic}");
 
             wifiAvailable = false;
-            SetWifiStatus("Wi-Fi: unavailable");
-            Add($"Wi-Fi scan failed: {ex.Message}");
+            var status = ex is WlanApiException wlan ? wlan.Category
+                : ex is UnauthorizedAccessException ? "permission_denied"
+                : "error";
+            SetWifiStatus(status == "permission_denied"
+                ? "Wi-Fi: permission required"
+                : status == "unavailable" ? "Wi-Fi: unavailable" : "Wi-Fi: scanner error");
+            Add($"Wi-Fi scan failed: {ex.GetType().Name}");
 
-            await Submit(
-                "scanner_health",
-                "scan_error",
-                null,
-                "wifi_api_error",
-                "error");
+            await Submit("wifi", "scanner_status", null, ex is WlanApiException wlanApi ? wlanApi.ErrorCode : ex.HResult.ToString("X8"), status);
+            await Submit("scanner_health", "scan_error", null, "wifi_api_error", "error");
         }
         finally
         {
@@ -994,7 +1092,11 @@ internal sealed class MonitorForm : Form
         if (!scanning)
             return;
 
+        var bluetoothWasAvailable = bluetoothAvailable;
+        var wifiWasAvailable = wifiAvailable;
         scanning = false;
+        bluetoothAvailable = false;
+        wifiAvailable = false;
         heartbeatTimer?.Dispose();
         heartbeatTimer = null;
         wifiScanTimer?.Dispose();
@@ -1020,6 +1122,10 @@ internal sealed class MonitorForm : Form
 
         if (reportToServer)
         {
+            if (bluetoothWasAvailable)
+                await Submit("bluetooth_le", "scanner_status", null, null, "stopped");
+            if (wifiWasAvailable)
+                await Submit("wifi", "scanner_status", null, null, "stopped");
             await Submit(
                 "scanner_health",
                 "scan_stopped",
@@ -1038,12 +1144,24 @@ internal sealed class MonitorForm : Form
             Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
     }
 
-    private string Pseudonym(string value)
+    private void HandleBluetoothStopped(BluetoothError error)
     {
-        return Convert.ToHexString(
-            SHA256.HashData(
-                Encoding.UTF8.GetBytes(sessionSalt + value)))
-            .ToLowerInvariant();
+        if (!scanning)
+            return;
+
+        bluetoothAvailable = false;
+        var status = error == BluetoothError.Success
+            ? "stopped"
+            : error == BluetoothError.ConsentRequired
+                ? "permission_denied"
+                : error == BluetoothError.RadioNotAvailable
+                    ? "unavailable"
+                    : "error";
+        SetBluetoothStatus(status == "permission_denied"
+            ? "Bluetooth: permission required"
+            : status == "unavailable" ? "Bluetooth: unavailable" : status == "stopped" ? "Bluetooth: stopped" : "Bluetooth: scanner error");
+        Add($"Bluetooth watcher stopped: {error}.");
+        _ = Submit("bluetooth_le", "scanner_status", null, error.ToString(), status);
     }
 
     private static string? SanitizeAdvertisedName(string? value)
@@ -1066,97 +1184,164 @@ internal sealed class MonitorForm : Form
         return sanitized.Length == 0 ? null : sanitized;
     }
 
-    private async Task Submit(
+    private Task Submit(
         string source,
         string kind,
         int? rssi,
         string? errorCode,
         string status,
         string? pseudonym = null,
-        string? advertisedName = null)
+        string? advertisedName = null,
+        DateTimeOffset? observedAt = null)
     {
+        if (closing || IsDisposed)
+            return Task.CompletedTask;
+
+        if (InvokeRequired)
+            return InvokeOnUiAsync(() => QueueObservation(
+                source, kind, rssi, errorCode, status, pseudonym, advertisedName, observedAt));
+
+        return QueueObservation(source, kind, rssi, errorCode, status, pseudonym, advertisedName, observedAt);
+    }
+
+    private Task QueueObservation(
+        string source,
+        string kind,
+        int? rssi,
+        string? errorCode,
+        string status,
+        string? pseudonym,
+        string? advertisedName,
+        DateTimeOffset? observedAt)
+    {
+        if (rssi.HasValue && (rssi.Value < -127 || rssi.Value > 0))
+        {
+            Add($"Skipped invalid RSSI value: {rssi.Value}.");
+            return Task.CompletedTask;
+        }
+
+        if (!paired || string.IsNullOrWhiteSpace(pairingToken.Text))
+            return Task.CompletedTask;
+
+        var context = new RadioObservationContext(
+            organizationId.Text.Trim(),
+            examId.Text.Trim(),
+            candidateId.Text.Trim(),
+            attemptId.Text.Trim());
+        var payload = new RadioObservationPayload(
+            source,
+            kind,
+            rssi,
+            pseudonym,
+            advertisedName,
+            status,
+            errorCode,
+            observedAt ?? DateTimeOffset.UtcNow);
+        if (!radioOutbox.TryEnqueue(context, pairingToken.Text.Trim(), payload, DateTimeOffset.UtcNow))
+        {
+            SetRadioSyncStatus($"Backend sync: queue full ({radioOutbox.PendingCount} pending)");
+            return Task.CompletedTask;
+        }
+
+        SetRadioSyncStatus($"Backend sync: queued ({radioOutbox.PendingCount} pending)");
+        return Task.CompletedTask;
+    }
+
+    private async Task PumpRadioOutboxAsync(bool allowDuringPairing = false)
+    {
+        if (closing || IsDisposed)
+            return;
+
+        if (InvokeRequired)
+        {
+            try
+            {
+                await InvokeOnUiAsync(() => PumpRadioOutboxOnUiAsync(allowDuringPairing));
+            }
+            catch (ObjectDisposedException) when (closing || IsDisposed)
+            {
+            }
+            catch (InvalidOperationException) when (closing || IsDisposed)
+            {
+            }
+            return;
+        }
+
+        await PumpRadioOutboxOnUiAsync(allowDuringPairing);
+    }
+
+    private async Task PumpRadioOutboxOnUiAsync(bool allowDuringPairing)
+    {
+        if (closing || IsDisposed || pairingInProgress && !allowDuringPairing || radioOutbox.PendingCount == 0)
+            return;
+
         try
         {
-            if (rssi.HasValue && (rssi.Value < -127 || rssi.Value > 0))
+            var result = await radioOutbox.PumpAsync(async (batch, cancellationToken) =>
             {
-                Add($"Skipped invalid RSSI value: {rssi.Value}.");
-                rssi = null;
+                var contextMatches = string.Equals(batch.Context.OrganizationId, organizationId.Text.Trim(), StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(batch.Context.ExamId, examId.Text.Trim(), StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(batch.Context.CandidateId, candidateId.Text.Trim(), StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(batch.Context.AttemptId, attemptId.Text.Trim(), StringComparison.OrdinalIgnoreCase);
+                var token = contextMatches && paired && !string.IsNullOrWhiteSpace(pairingToken.Text)
+                    ? pairingToken.Text.Trim()
+                    : batch.PairingToken;
+                var requestBody = new
+                {
+                    batch.Context.OrganizationId,
+                    batch.Context.ExamId,
+                    batch.Context.CandidateId,
+                    batch.Context.AttemptId,
+                    observations = batch.Observations
+                };
+                using var request = new HttpRequestMessage(
+                    HttpMethod.Post,
+                    $"{apiUrl.Text.TrimEnd('/')}/api/student/radio-observations/batch")
+                {
+                    Content = JsonContent.Create(
+                        requestBody,
+                        options: new JsonSerializerOptions
+                        {
+                            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+                        })
+                };
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                return await http.SendAsync(request, cancellationToken);
+            }, DateTimeOffset.UtcNow, bridgeCancellation.Token);
+
+            if (result == OutboxPumpResult.Succeeded)
+            {
+                SetRadioSyncStatus($"Backend sync: synchronized ({radioOutbox.PendingCount} pending)");
             }
-
-            var payload = new
+            else if (result == OutboxPumpResult.Retrying || result == OutboxPumpResult.Deferred)
             {
-                organizationId = organizationId.Text.Trim(),
-                examId = examId.Text.Trim(),
-                candidateId = candidateId.Text.Trim(),
-                attemptId = attemptId.Text.Trim(),
-                source,
-                kind,
-                rssi,
-                pseudonym,
-                advertisedName,
-                scannerStatus = status,
-                errorCode
-            };
-
-            using var request = new HttpRequestMessage(
-                HttpMethod.Post,
-                $"{apiUrl.Text.TrimEnd('/')}/api/student/radio-observations")
+                SetRadioSyncStatus($"Backend sync: retry pending ({radioOutbox.PendingCount} queued)");
+            }
+            else if (result == OutboxPumpResult.Rejected)
             {
-                Content = JsonContent.Create(payload, options: new System.Text.Json.JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull })
-            };
-
-            request.Headers.Authorization =
-                new AuthenticationHeaderValue(
-                    "Bearer",
-                    pairingToken.Text.Trim());
-
-            using var response = await http.SendAsync(request);
-
-            var responseBody =
-                await response.Content.ReadAsStringAsync();
-
-            Add(
-                $"Upload: {(int)response.StatusCode} " +
-                $"{response.StatusCode}");
-
-            if (response.StatusCode == HttpStatusCode.Unauthorized ||
-                response.StatusCode == HttpStatusCode.Forbidden)
-            {
+                SetRadioSyncStatus("Backend sync: rejected; reconnect Companion");
+                Add("The backend rejected a radio batch; monitoring was stopped for safety.");
+                radioOutbox.DiscardQueued();
                 paired = false;
-                Add("Server rejected Companion credentials; stopping local monitoring.");
-                if (InvokeRequired)
-                    await InvokeOnUiAsync(() => StopAsync(reportToServer: false));
-                else
-                    await StopAsync(reportToServer: false);
+                pairingExpiresAt = null;
+                await InvokeOnUiAsync(() => StopAsync(reportToServer: false));
             }
-            else if (!response.IsSuccessStatusCode)
+
+            if (radioOutbox.DroppedCount > reportedDroppedObservationCount)
             {
-                // Avoid printing tokens or raw radio identifiers.
-                Add($"Server response: {Limit(responseBody, 500)}");
+                var dropped = radioOutbox.DroppedCount - reportedDroppedObservationCount;
+                reportedDroppedObservationCount = radioOutbox.DroppedCount;
+                Add($"Radio observations dropped from the bounded queue or expired: {dropped}.");
             }
         }
-        catch (TaskCanceledException)
+        catch (OperationCanceledException) when (bridgeCancellation.IsCancellationRequested)
         {
-            Add("Upload timed out. Check that the API is running.");
-        }
-        catch (HttpRequestException ex)
-        {
-            Add($"Network/API error: {ex.Message}");
         }
         catch (Exception ex)
         {
-            Add($"Upload error: {ex.GetType().Name}: {ex.Message}");
+            SetRadioSyncStatus("Backend sync: retry pending");
+            Add($"Radio batch upload failed: {ex.GetType().Name}.");
         }
-    }
-
-    private static string Limit(string value, int maxLength)
-    {
-        if (string.IsNullOrEmpty(value))
-            return "(empty response)";
-
-        return value.Length <= maxLength
-            ? value
-            : value[..maxLength] + "...";
     }
 
     private void SetBluetoothStatus(string value)
@@ -1181,6 +1366,17 @@ internal sealed class MonitorForm : Form
         wifiStatus.Text = value;
     }
 
+    private void SetRadioSyncStatus(string value)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(() => SetRadioSyncStatus(value));
+            return;
+        }
+
+        radioSyncStatus.Text = value;
+    }
+
     internal void Add(string message)
     {
         if (IsDisposed || Disposing)
@@ -1202,6 +1398,7 @@ internal sealed class MonitorForm : Form
         if (disposing)
         {
             heartbeatTimer?.Dispose();
+            radioUploadTimer?.Dispose();
             bridgeCancellation.Cancel();
             bridge.Stop();
             if (bluetooth.Status == BluetoothLEAdvertisementWatcherStatus.Started)

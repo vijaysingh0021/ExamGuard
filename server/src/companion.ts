@@ -1,7 +1,7 @@
 /**
  * Connection state for the Windows Companion, derived only from what it has already reported.
- * The Companion reports scanner health on events (start, stop, errors) and scan results, not on a fixed heartbeat,
- * so silence is described neutrally ("quiet"), never as a disconnection or as misconduct.
+ * A recent active heartbeat confirms the Companion is reporting, not that any radio device was detected.
+ * Silence is described neutrally ("quiet"), never as a disconnection or as misconduct.
  */
 export type CompanionConnection = 'not_connected' | 'connected' | 'quiet' | 'stopped_by_candidate' | 'scanner_problem';
 export const QUIET_AFTER_MS = 120_000;

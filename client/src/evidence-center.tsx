@@ -31,6 +31,35 @@ type EvidenceItem = {
   signals?: ReviewSignal[];
 };
 type EvidenceDetail = { item: EvidenceItem & { details?: Record<string, unknown> }; reviewHistory: Array<{ id: string; action: string; metadata: unknown; createdAt: string; actor?: { name: string } | null }> };
+type RadioAnalysis = {
+  scannerOperational: boolean;
+  companionHeartbeatAt: string | null;
+  scanners: Record<'bluetooth' | 'wifi', {
+    status: string;
+    statusAt: string | null;
+    lastSuccessfulScanAt: string | null;
+    lastReceivedObservationAt: string | null;
+    scanFailures: number;
+    permissionErrors: number;
+    unavailableReports: number;
+    lastErrorCode: string | null;
+    lastErrorAt: string | null;
+  }>;
+  backendSynchronization: { state: string; lastAcknowledgedAt: string | null; acceptedRecordCount: number };
+  radioObservationCount: number;
+  missingRssiCount: number;
+  pseudonyms: Array<{
+    source: string;
+    pseudonym: string | null;
+    repeatedObservationCount: number;
+    rssiReadingCount: number;
+    rssiRangeDb: number | null;
+    history: Array<{ observedAt: string; rssi: number | null; relativeSignal: { band: string; confidence: string }; advertisedName: string | null }>;
+  }>;
+  conclusion: string;
+  confidence: string;
+  limitations: string[];
+};
 
 const labelFor = (value: string) => value.replace(/_/g, ' ').replace(/:/g, ' · ');
 const eventLabel = (value: string) => ({
@@ -68,6 +97,25 @@ const dateParam = (value: string, end = false) => value ? new Date(`${value}T${e
 const evidenceLabel = (item: EvidenceItem) => item.kind === 'radio_observation'
   ? radioActivityLabel(item.source, item.type.split(':')[1] ?? String(item.details?.kind ?? ''))
   : eventLabel(item.type);
+const radioConclusionLabel = (value: string) => ({
+  scanner_operational_detection_not_confirmed: 'Scanner operational; detection not confirmed',
+  no_observations_received: 'No radio observations received',
+  ble_advertisement_received: 'BLE advertisement received; identity unverified',
+  environmental_access_point_observation_received: 'Environmental Wi-Fi access-point observation received',
+  radio_observations_received: 'BLE and Wi-Fi radio observations received; human review required',
+  device_observation_received: 'Radio observation received; human review required',
+  repeated_observations_same_session_pseudonym: 'Repeated observations of the same session pseudonym',
+  monitoring_interrupted: 'Monitoring interruption reported',
+}[value] ?? 'Insufficient evidence');
+const radioStatusLabel = (value: string) => ({
+  active: 'Operational (does not confirm detection)',
+  stopped: 'Stopped',
+  permission_denied: 'Permission denied',
+  unavailable: 'Unavailable',
+  error: 'Scanner error',
+  quiet: 'No recent scanner report',
+  unknown: 'No scanner status received',
+}[value] ?? 'Scanner status unavailable');
 
 export function EvidenceCenter({ session }: { session: ReviewerSession }) {
   const [params, setParams] = useSearchParams();
@@ -119,6 +167,13 @@ export function EvidenceCenter({ session }: { session: ReviewerSession }) {
       return { items: response.data, pagination: readPagination(response) };
     },
     placeholderData: previous => previous,
+  });
+  const radioAnalysis = useQuery({
+    queryKey: ['radio-analysis', session.organization.id, attemptId],
+    enabled: Boolean(attemptId),
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: false,
+    queryFn: () => api.get<RadioAnalysis>(`/api/organizations/${session.organization.id}/attempts/${attemptId}/radio-analysis`).then(response => response.data),
   });
   const detail = useQuery({
     queryKey: ['evidence-detail', session.organization.id, selected?.kind, selected?.id],
@@ -217,6 +272,9 @@ export function EvidenceCenter({ session }: { session: ReviewerSession }) {
   const incident = activeItem?.incidents?.[0];
   const signal = activeItem?.signals?.[0];
   const activeDetails = activeItem?.details ?? {};
+  const radioHistory = Array.isArray(activeDetails.history)
+    ? activeDetails.history as Array<Record<string, unknown>>
+    : [];
   const readabilityAssessment = activeDetails.readabilityAssessment && typeof activeDetails.readabilityAssessment === 'object'
     ? activeDetails.readabilityAssessment as Record<string, unknown>
     : null;
@@ -252,6 +310,53 @@ export function EvidenceCenter({ session }: { session: ReviewerSession }) {
       <div className="mt-3 flex flex-wrap items-center justify-between gap-2"><p className="text-xs text-stone-500">Search matches candidate name, email, examination title, and event type.</p><Button size="sm" variant="outline" onClick={() => setParams(new URLSearchParams())}><RefreshCw size={14}/> Clear filters</Button></div>
     </div>
 
+    {attemptId && <section className="rounded-2xl border border-stone-200 bg-white p-4 shadow-sm" aria-label="Radio monitoring analysis">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div><h3 className="font-semibold text-stone-900">Radio scanner diagnostics and evidence</h3><p className="mt-1 text-xs text-stone-500">Technical scanner state is separate from detections. No radio observation establishes ownership, distance, or misconduct.</p></div>
+        {radioAnalysis.data && <Badge variant="outline">Confidence: {labelFor(radioAnalysis.data.confidence)}</Badge>}
+      </div>
+      {radioAnalysis.isLoading && <p className="mt-3 text-sm text-stone-500" role="status">Loading attempt-scoped scanner diagnostics…</p>}
+      {radioAnalysis.isError && <Alert className="mt-3" variant="destructive"><div className="flex items-center justify-between gap-3"><span>Radio diagnostics could not be loaded for this attempt.</span><Button size="sm" variant="outline" onClick={() => void radioAnalysis.refetch()}>Retry</Button></div></Alert>}
+      {radioAnalysis.data && <div className="mt-4 space-y-4">
+        <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+          <b className="text-sm text-stone-900">Examiner summary: {radioConclusionLabel(radioAnalysis.data.conclusion)}</b>
+          <p className="mt-1 text-xs text-stone-600">This is an evidence summary only. Radio observations never trigger an automatic penalty.</p>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          {(['bluetooth', 'wifi'] as const).map(scanner => {
+            const diagnostic = radioAnalysis.data!.scanners[scanner];
+            return <div key={scanner} className="rounded-xl border border-stone-200 p-3">
+              <b className="text-sm text-stone-900">{scanner === 'bluetooth' ? 'Bluetooth LE' : 'Wi-Fi access-point scanner'}</b>
+              <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
+                <dt className="text-stone-500">Status</dt><dd className="text-stone-800">{radioStatusLabel(diagnostic.status)}</dd>
+                <dt className="text-stone-500">Last successful scan</dt><dd className="text-stone-800">{diagnostic.lastSuccessfulScanAt ? new Date(diagnostic.lastSuccessfulScanAt).toLocaleString() : scanner === 'bluetooth' ? 'Continuous watcher; no discrete scan timestamp' : 'None recorded'}</dd>
+                <dt className="text-stone-500">Last observation</dt><dd className="text-stone-800">{diagnostic.lastReceivedObservationAt ? new Date(diagnostic.lastReceivedObservationAt).toLocaleString() : 'No observation received'}</dd>
+                <dt className="text-stone-500">Scan failures</dt><dd className="text-stone-800">{diagnostic.scanFailures}</dd>
+                <dt className="text-stone-500">Permission errors</dt><dd className="text-stone-800">{diagnostic.permissionErrors}</dd>
+                <dt className="text-stone-500">Unavailable reports</dt><dd className="text-stone-800">{diagnostic.unavailableReports}</dd>
+              </dl>
+              {diagnostic.lastErrorCode && <p className="mt-2 text-xs text-amber-800">Latest technical error{diagnostic.lastErrorAt ? ` (${new Date(diagnostic.lastErrorAt).toLocaleString()})` : ''}: {diagnostic.lastErrorCode}</p>}
+            </div>;
+          })}
+        </div>
+        <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-stone-600">
+          <span>Backend sync: {radioAnalysis.data.backendSynchronization.state === 'backend_receipt_confirmed' ? 'backend receipt confirmed' : 'no backend receipt'}{radioAnalysis.data.backendSynchronization.lastAcknowledgedAt ? ` · last receipt ${new Date(radioAnalysis.data.backendSynchronization.lastAcknowledgedAt).toLocaleString()}` : ''}</span>
+          <span>Stored records analyzed: {radioAnalysis.data.backendSynchronization.acceptedRecordCount}</span>
+          <span>Radio observations: {radioAnalysis.data.radioObservationCount}</span>
+          <span>Missing RSSI: {radioAnalysis.data.missingRssiCount}</span>
+        </div>
+        {radioAnalysis.data.pseudonyms.length > 0 && <div>
+          <h4 className="text-sm font-semibold text-stone-900">Observation history by session pseudonym</h4>
+          <div className="mt-2 space-y-2">{radioAnalysis.data.pseudonyms.slice(0, 10).map(group => <details key={`${group.source}:${group.pseudonym}`} className="rounded-xl border border-stone-200 p-3">
+            <summary className="cursor-pointer text-sm text-stone-800">{group.source === 'wifi' ? 'Wi-Fi access point' : 'BLE advertisement'} · {group.repeatedObservationCount} observation{group.repeatedObservationCount === 1 ? '' : 's'} · session pseudonym {group.pseudonym}</summary>
+            <p className="mt-2 text-xs text-stone-500">RSSI consistency: {group.rssiRangeDb === null ? 'not enough measured readings to compare' : `${group.rssiRangeDb} dB range across ${group.rssiReadingCount} readings`}. Variation is not a distance estimate.</p>
+            <ol className="mt-2 space-y-1 text-xs text-stone-600">{group.history.slice(-20).reverse().map((entry, index) => <li key={`${entry.observedAt}-${index}`} className="flex flex-wrap justify-between gap-x-3"><span>{new Date(entry.observedAt).toLocaleString()} · RSSI {entry.rssi === null ? 'unavailable' : `${entry.rssi} dBm`} · {radioSignalStrengthLabel(entry.relativeSignal.band)}</span>{entry.advertisedName && <span>Broadcast name “{entry.advertisedName}” (unverified)</span>}</li>)}</ol>
+          </details>)}</div>
+        </div>}
+        <ul className="list-disc space-y-1 pl-5 text-xs text-stone-500">{radioAnalysis.data.limitations.map(limitation => <li key={limitation}>{limitation}</li>)}</ul>
+      </div>}
+    </section>}
+
     {inventory.isError && <Alert variant="destructive"><div className="flex items-center justify-between gap-3"><span>Evidence records could not be loaded. Check reviewer access and filter values.</span><Button size="sm" variant="outline" onClick={() => void inventory.refetch()}>Retry</Button></div></Alert>}
     {inventory.isLoading && <div className="rounded-xl border border-stone-200 bg-white p-8 text-center text-sm text-stone-500" role="status">Loading institution evidence…</div>}
     {!inventory.isLoading && !inventory.isError && <div className="overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-sm">
@@ -273,6 +378,7 @@ export function EvidenceCenter({ session }: { session: ReviewerSession }) {
             <div className="rounded-xl border border-stone-200 p-3"><span className="text-xs text-stone-500">How strong did the signal seem?</span><b className="mt-1 block text-sm">{radioSignalStrengthLabel((activeItem.details.proximity as Record<string, unknown> | undefined)?.band)}</b><span className="mt-1 block text-xs text-stone-500">This is a rough signal category, not a reliable distance measurement. Walls and device position affect it.</span></div>
             <details className="sm:col-span-2 rounded-xl border border-stone-200 p-3 text-xs text-stone-500"><summary className="cursor-pointer font-semibold">Technical details</summary><p className="mt-2">RSSI: {typeof activeItem.details.rssi === 'number' ? `${activeItem.details.rssi} dBm` : 'unavailable'} · session-only signal code: {typeof activeItem.details.pseudonym === 'string' ? activeItem.details.pseudonym : 'unavailable'} · confidence: {String((activeItem.details.proximity as Record<string, unknown> | undefined)?.confidence ?? 'unavailable')}</p></details>
             {typeof activeItem.details.limitations === 'string' && <p className="sm:col-span-2 text-xs leading-5 text-stone-500">{activeItem.details.limitations}</p>}
+            {typeof activeItem.details.repeatedObservationCount === 'number' && <div className="sm:col-span-2 rounded-xl border border-stone-200 p-3"><b className="text-sm text-stone-800">Same session pseudonym: {activeItem.details.repeatedObservationCount} stored observations</b>{radioHistory.length > 0 && <ol className="mt-2 space-y-1 text-xs text-stone-600">{radioHistory.map((entry, index) => <li key={`${String(entry.observedAt)}-${index}`}>{typeof entry.observedAt === 'string' ? new Date(entry.observedAt).toLocaleString() : 'Time unavailable'} · RSSI {typeof entry.rssi === 'number' ? `${entry.rssi} dBm` : 'unavailable'} · {radioSignalStrengthLabel((entry.proximity as Record<string, unknown> | undefined)?.band)}</li>)}</ol>}</div>}
           </div>}
           {activeItem.type === 'potential_visual_assistance' && <Alert variant="warning" className="mt-5">Potential Visual Assistance is an approximate, low-confidence review signal. The visible screen and BLE observation are only time-correlated; they are not identified as the same device, and this is not a finding of misconduct.</Alert>}
           {readabilityAssessment && <div className="mt-3 rounded-xl border border-stone-200 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><h3 className="font-semibold text-stone-900">Visible-screen review estimate</h3><Badge variant="outline">Confidence: {String(readabilityAssessment.confidence ?? 'unavailable')}</Badge></div><p className="mt-2 text-sm text-stone-600">{String(readabilityAssessment.limitations ?? readabilityAssessment.basis ?? 'Approximate camera-only assessment.')}</p>

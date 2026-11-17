@@ -8,6 +8,8 @@ import { providerFromEnv } from './assistant/provider.js';
 import { emailProviderFromEnv } from './email.js';
 import { evaluateQuota, parseQuotaBytes } from './quota.js';
 import { companionConnection } from './companion.js';
+import { analyzeRadioObservations } from './radio-analysis.js';
+import { radioObservationSelect, withAdvertisedNameCompatibility } from './radio-observation.js';
 import { isUuid } from './ids.js';
 import { parseRetentionDays, retentionCutoff } from './lifecycle.js';
 import { prisma } from './prisma.js';
@@ -102,12 +104,30 @@ export function registerOpsRoutes(app: Express) {
     const organizationId = req.auth!.organizationId!; const attemptId = String(req.params.attemptId);
     if (!isUuid(attemptId)) return res.status(400).json({ error: 'Invalid attempt id' });
     if (!(await prisma.examAttempt.findFirst({ where: { id: attemptId, organizationId }, select: { id: true } }))) return res.status(404).json({ error: 'Attempt not found' });
-    const [latest, byStatus] = await Promise.all([
+    const [latestHeartbeat, latestReport, byStatus] = await Promise.all([
+      prisma.radioObservation.findFirst({ where: { organizationId, attemptId, source: 'scanner_health', kind: 'heartbeat' }, orderBy: { observedAt: 'desc' }, select: { observedAt: true, scannerStatus: true } }),
       prisma.radioObservation.findFirst({ where: { organizationId, attemptId }, orderBy: { observedAt: 'desc' }, select: { observedAt: true, scannerStatus: true, errorCode: true } }),
       prisma.radioObservation.groupBy({ by: ['scannerStatus'], where: { organizationId, attemptId }, _count: { _all: true } }),
     ]);
     // Diagnostics only: no pseudonyms, fingerprints or signal data are returned.
-    res.json({ connection: companionConnection(latest && { observedAt: latest.observedAt, scannerStatus: latest.scannerStatus }, new Date()), lastObservationAt: latest?.observedAt ?? null, lastScannerStatus: latest?.scannerStatus ?? null, lastErrorCode: latest?.errorCode ?? null, scannerStatusCounts: Object.fromEntries(byStatus.map(r => [r.scannerStatus, r._count._all])), note: 'Companion observations are evidence for human review, not proof of misconduct.' });
+    res.json({ connection: companionConnection(latestHeartbeat, new Date()), lastObservationAt: latestReport?.observedAt ?? null, lastScannerStatus: latestReport?.scannerStatus ?? null, lastErrorCode: latestReport?.errorCode ?? null, scannerStatusCounts: Object.fromEntries(byStatus.map(r => [r.scannerStatus, r._count._all])), note: 'A recent heartbeat confirms reporting only; radio observations are not proof of misconduct.' });
+  } catch (error) { next(error); } });
+
+  app.get('/api/organizations/:organizationId/attempts/:attemptId/radio-analysis', authenticate, authorize(...reviewerRoles), async (req: AuthRequest, res, next) => { try {
+    const organizationId = req.auth!.organizationId!;
+    const attemptId = String(req.params.attemptId);
+    if (!isUuid(attemptId)) return res.status(400).json({ error: 'Invalid attempt id' });
+    const attempt = await prisma.examAttempt.findFirst({ where: { id: attemptId, organizationId }, select: { id: true } });
+    if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
+    const now = new Date();
+    const recordsResult = await withAdvertisedNameCompatibility(includeAdvertisedName =>
+      prisma.radioObservation.findMany({
+        where: { organizationId, attemptId, expiresAt: { gt: now } },
+        orderBy: { observedAt: 'desc' },
+        take: 1000,
+        select: radioObservationSelect(includeAdvertisedName),
+      }));
+    res.json(analyzeRadioObservations(recordsResult.result, now));
   } catch (error) { next(error); } });
 
   // Candidate-facing readiness: only the candidate who owns the attempt can see it, and only technical status is returned.
@@ -116,7 +136,7 @@ export function registerOpsRoutes(app: Express) {
     if (!isUuid(attemptId)) return res.status(400).json({ error: 'Invalid attempt id' });
     const attempt = await prisma.examAttempt.findFirst({ where: { id: attemptId, userId: req.auth!.userId }, select: { id: true, organizationId: true } });
     if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
-    const latest = await prisma.radioObservation.findFirst({ where: { organizationId: attempt.organizationId, attemptId: attempt.id }, orderBy: { observedAt: 'desc' }, select: { observedAt: true, scannerStatus: true } });
+    const latest = await prisma.radioObservation.findFirst({ where: { organizationId: attempt.organizationId, attemptId: attempt.id, source: 'scanner_health', kind: 'heartbeat' }, orderBy: { observedAt: 'desc' }, select: { observedAt: true, scannerStatus: true } });
     res.json(companionConnection(latest, new Date()));
   } catch (error) { next(error); } });
 }

@@ -171,6 +171,8 @@ enum RadioKind {
   advertisement
   access_point
   heartbeat
+  scanner_status
+  scan_complete
   scan_unavailable
   permission_denied
   scan_error
@@ -1076,6 +1078,7 @@ model RadioObservation {
   @@unique([organizationId, fingerprint])
   @@index([expiresAt])
   @@index([organizationId, attemptId, observedAt(sort: Desc)])
+  @@index([organizationId, attemptId, source, kind, pseudonym, observedAt(sort: Desc)])
   @@map("radio_observations")
 }
 
@@ -1088,6 +1091,7 @@ model RadioCandidateSignal {
   rule           String
   label          String
   status         RadioSignalStatus @default(pending_review)
+  dedupeKey      String?           @unique
   reviewerId     String?           @db.Uuid
   reviewerNotes  String?
   createdAt      DateTime          @default(now())
