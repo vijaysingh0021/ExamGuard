@@ -185,7 +185,10 @@ export async function checkCompanionBridge(
       cache: 'no-store',
       signal: AbortSignal.timeout(1500),
     });
-    if (response.status === 401) return unavailable('The local Companion bridge rejected its browser session. Retry after opening the Companion.');
+    if (response.status === 401) return {
+      ...unavailable("The local Companion rejected this browser session's authorization. Retry the check once from the trusted ExamGuard website."),
+      remediation: 'Confirm you are using the trusted ExamGuard website and that the Companion is open. If authorization is still rejected, restart the Companion and retry.',
+    };
     if (!response.ok) return unavailable('The local Companion health endpoint returned an error.');
     const health = await response.json() as { status?: unknown };
     if (health.status !== 'ready') return unavailable('The Companion is installed but its local bridge is not ready.');
@@ -204,12 +207,16 @@ export async function checkCompanionBridge(
 
 let memoryCompanionBridgeToken: string | null = null;
 const COMPANION_BRIDGE_TOKEN_KEY = 'examguard:companion-bridge-token';
+const COMPANION_BRIDGE_TOKEN_PATTERN = /^[0-9a-f]{64}$/i;
 
 export function getCompanionBridgeToken(): string {
-  if (memoryCompanionBridgeToken) return memoryCompanionBridgeToken;
+  if (memoryCompanionBridgeToken && COMPANION_BRIDGE_TOKEN_PATTERN.test(memoryCompanionBridgeToken)) {
+    return memoryCompanionBridgeToken;
+  }
+  memoryCompanionBridgeToken = null;
   try {
     const stored = window.sessionStorage.getItem(COMPANION_BRIDGE_TOKEN_KEY);
-    if (stored && stored.length >= 32) {
+    if (stored && COMPANION_BRIDGE_TOKEN_PATTERN.test(stored)) {
       memoryCompanionBridgeToken = stored;
       return stored;
     }

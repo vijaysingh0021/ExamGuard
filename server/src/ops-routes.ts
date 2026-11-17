@@ -14,7 +14,8 @@ import { prisma } from './prisma.js';
 
 const reviewerRoles = ['institute_admin', 'teacher', 'proctor'] as const;
 /** Membership role -> assistant role. Derived server-side from the verified membership, never from the request. */
-const assistantRoleFor = (role?: string) => ({ student: 'candidate', teacher: 'teacher', proctor: 'reviewer', institute_admin: 'admin' } as Record<string, string>)[role ?? ''];
+export const assistantAccessRoles = ['platform_admin', 'institute_admin', 'teacher', 'proctor', 'student'] as const;
+export const assistantRoleFor = (role?: string) => ({ platform_admin: 'admin', student: 'candidate', teacher: 'teacher', proctor: 'reviewer', institute_admin: 'admin' } as Record<string, string>)[role ?? ''];
 const chatBody = z.object({ message: z.string().min(1).max(2000), history: z.array(z.object({ role: z.enum(['user', 'assistant']), content: z.string().max(2000) })).max(12).optional() });
 const AUDITED_REFUSALS = new Set(['bypass', 'hidden_tests', 'exam_answer']);
 
@@ -35,11 +36,11 @@ export function registerOpsRoutes(app: Express) {
   const assistant = createAssistant({ provider });
   const chatLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false, keyGenerator: req => (req as AuthRequest).auth?.userId ?? 'anonymous' });
 
-  app.get('/api/organizations/:organizationId/assistant/status', authenticate, authorize('institute_admin', 'teacher', 'proctor', 'student'), (_req, res) => {
+  app.get('/api/organizations/:organizationId/assistant/status', authenticate, authorize(...assistantAccessRoles), (_req, res) => {
     res.json({ mode: provider ? 'ai_assisted' : 'help_center', providerConfigured: !!provider, conversationsStored: false });
   });
 
-  app.post('/api/organizations/:organizationId/assistant/chat', authenticate, authorize('institute_admin', 'teacher', 'proctor', 'student'), chatLimiter, async (req: AuthRequest, res, next) => { try {
+  app.post('/api/organizations/:organizationId/assistant/chat', authenticate, authorize(...assistantAccessRoles), chatLimiter, async (req: AuthRequest, res, next) => { try {
     const body = chatBody.parse(req.body);
     const role = assistantRoleFor(req.auth!.role);
     if (!role) return res.status(403).json({ error: 'Assistant is not available for this role' });
@@ -55,7 +56,7 @@ export function registerOpsRoutes(app: Express) {
 
   // Feedback records only the rating and the answer's category. The question and answer text are never stored.
   const feedbackBody = z.object({ helpful: z.boolean(), intent: z.string().max(40), mode: z.enum(['knowledge', 'model', 'refused', 'no_answer', 'rate_limited']) });
-  app.post('/api/organizations/:organizationId/assistant/feedback', authenticate, authorize('institute_admin', 'teacher', 'proctor', 'student'), chatLimiter, async (req: AuthRequest, res, next) => { try {
+  app.post('/api/organizations/:organizationId/assistant/feedback', authenticate, authorize(...assistantAccessRoles), chatLimiter, async (req: AuthRequest, res, next) => { try {
     const body = feedbackBody.parse(req.body);
     await prisma.auditLog.create({ data: { organizationId: req.auth!.organizationId!, actorId: req.auth!.userId, action: 'assistant.feedback', targetType: 'Assistant', targetId: req.auth!.userId, metadata: body } });
     res.status(204).end();

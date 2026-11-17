@@ -18,7 +18,7 @@ vi.mock('axios', () => ({
 }));
 
 import { LoginPage, ForgotPasswordPage, ResetPasswordPage } from '../auth-pages';
-import { CandidateDashboard, Exams } from '../main';
+import { CandidateDashboard, Exams, ReadinessChecks } from '../main';
 
 const session = { token: 'token', user: { name: 'Candidate', email: 'candidate@example.edu' }, organization: { id: 'org-1', name: 'Example Institute' }, role: 'candidate' };
 const response = <T,>(data: T, headers: Record<string, string> = {}) => Promise.resolve({ data, headers });
@@ -114,6 +114,27 @@ describe('authentication forms', () => {
 });
 
 describe('candidate and teacher workflows', () => {
+  it('clicking Check Companion invokes the authenticated local health check', async () => {
+    http.get.mockResolvedValue(response({ checks: [] }));
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ status: 'ready' }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      withQuery(<ReadinessChecks onStart={vi.fn()} error="" fullscreenRequired={false} organizationId="org-1" examId="exam-1" />);
+      await userEvent.click(screen.getByRole('button', { name: 'Connect / check Companion' }));
+
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        'http://127.0.0.1:43117/health',
+        expect.objectContaining({ cache: 'no-store', headers: expect.any(Object) }),
+      ));
+      const request = fetchMock.mock.calls[0];
+      const authorization = new Headers(request[1]?.headers).get('Authorization');
+      expect(authorization).toMatch(/^Bearer [a-f0-9]{64}$/);
+      expect(await screen.findByText('The registered Windows Companion bridge is reachable on this device.')).toBeInTheDocument();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('shows assigned exam dates in the student calendar', async () => {
     const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);

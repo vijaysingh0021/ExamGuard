@@ -101,12 +101,13 @@ import { AnswerSync, pendingStore, type SyncSnapshot } from "./lib/answer-sync";
 import { createSubmitter } from "./lib/submit-flow";
 import { clockOffsetMs, isAnswered, loadMarks, progress as examProgress, remainingMs, saveMarks, serverAlignedNow } from "./lib/exam-state";
 import { PendingWrites } from "./lib/pending-writes";
+import { pairCompanionAttempt } from "./lib/companion-pairing";
 import {
   browserCompatibility,
   cameraStreamHasLiveTrack,
   cameraStreamIsActive,
-  companionBridgeAuthorization,
   checkCompanionBridge,
+  companionBridgeAuthorization,
   createReadinessCheck,
   fullDisplayStreamIsActive,
   microphoneStreamIsActive,
@@ -674,7 +675,7 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
     </div>
   );
 }
-function ReadinessChecks({ onStart, error, fullscreenRequired, organizationId, examId }: { onStart: () => void; error: string; fullscreenRequired: boolean; organizationId: string; examId: string }) {
+export function ReadinessChecks({ onStart, error, fullscreenRequired, organizationId, examId }: { onStart: () => void; error: string; fullscreenRequired: boolean; organizationId: string; examId: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const cameraStream = useRef<MediaStream | null>(null);
   const microphoneStream = useRef<MediaStream | null>(null);
@@ -1646,15 +1647,11 @@ function StudentExam({ session }: { session: Session }) {
     setPairingError("");
     setPairingLoading(true);
     try {
-      const { data } = await api.post(`/api/student/attempts/${attemptId}/companion-pairing`);
-      const bridgeResponse = await fetch("http://127.0.0.1:43117/pair", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...companionBridgeAuthorization() },
-        cache: "no-store",
-        body: JSON.stringify({ apiUrl: resolveCompanionApiOrigin(), pairingToken: data.pairingToken, consentGranted: true }),
-      });
-      const bridgeResult = await bridgeResponse.json().catch(() => ({}));
-      if (!bridgeResponse.ok || bridgeResult.status !== "connected") throw new Error(bridgeResult.error ?? "The Windows Companion did not confirm the connection.");
+      await pairCompanionAttempt(
+        attemptId,
+        resolveCompanionApiOrigin(),
+        async activeAttemptId => (await api.post(`/api/student/attempts/${activeAttemptId}/companion-pairing`)).data,
+      );
       setPairingError("");
       return true;
     } catch (requestError) {

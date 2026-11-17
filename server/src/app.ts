@@ -25,7 +25,7 @@ import { securityHeaders } from './security-headers.js';
 import { automaticallyGrade, gradeStatusAfterAuto, manualMarksWithinBounds, totalMarks } from './grading.js';
 import { createOtp, createResetToken, hashResetToken, otpConfig, passwordPolicy } from './password-reset.js';
 import { sendPasswordChangeConfirmationEmail, sendPasswordOtpEmail, sendSignupOtpEmail } from './mailer.js';
-import { loadConfig } from './config.js';
+import { isClientOriginAllowed, loadConfig } from './config.js';
 import { regionsForCountry, searchDirectory } from './institutions.js';
 import { beginAuthorization, configuredProviders, finishAuthorization, type OAuthProvider } from './oauth.js';
 import { prisma } from './prisma.js';
@@ -252,27 +252,29 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
   const codeRunner = judge0AdapterFromEnv();
   const judge0LanguageIds = judge0LanguageIdsFromEnv();
   const storage = storageImpl ?? realStorage;
-  const clientOrigin = new URL(process.env.CLIENT_URL?.trim() || 'http://localhost:5173').origin;
-
   app.disable('x-powered-by');
   app.use(securityHeaders);
   app.use(cors({
-  origin: clientOrigin,
-  credentials: true,
-  exposedHeaders: [
-    'X-Page',
-    'X-Page-Size',
-    'X-Total-Count',
-    'X-Total-Pages',
-    'Date'
-  ]
-}));
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (isClientOriginAllowed(origin, process.env.CLIENT_URL)) return callback(null, origin);
+      return callback(null, false);
+    },
+    credentials: true,
+    exposedHeaders: [
+      'X-Page',
+      'X-Page-Size',
+      'X-Total-Count',
+      'X-Total-Pages',
+      'Date'
+    ]
+  }));
   app.set('storage', storage);
-  app.use((_req, res, next) => {
+  app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=(), payment=(), usb=()');
-    res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
+    if (!req.path.startsWith('/api/private-evidence/')) res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
     if (process.env.NODE_ENV === 'production') res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     next();
   });
@@ -291,6 +293,10 @@ export function createApp(storageImpl?: StorageInterface): express.Express {
   }
   app.get('/health', (_req, res) => res.json({ status: 'ok' }));
   app.get(['/api/local-evidence/:token', '/api/private-evidence/:token'], async (req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && !isClientOriginAllowed(origin, process.env.CLIENT_URL)) {
+      return res.status(403).json({ error: 'Origin is not allowed by the ExamGuard CORS policy.' });
+    }
     let key: string;
     try {
       key = verifyPrivateEvidenceToken(String(req.params.token));

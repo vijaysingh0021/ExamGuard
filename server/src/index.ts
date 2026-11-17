@@ -3,7 +3,7 @@ import { Server } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { createApp } from './app.js';
 import { connectDatabase } from './db.js';
-import { configurationErrorMessage, loadConfig, type Config } from './config.js';
+import { configurationErrorMessage, isClientOriginAllowed, loadConfig, type Config } from './config.js';
 import { prisma } from './prisma.js';
 import { isUuid } from './ids.js';
 import { bearerToken, jwtSubject } from './auth.js';
@@ -19,7 +19,15 @@ try { config = loadConfig(); } catch (error) {
 const app = createApp();
 console.info('email.provider.initialized', emailProviderStatus());
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: config.CLIENT_URL } });
+const io = new Server(server, {
+  cors: {
+    origin: (origin, callback) => {
+      if (!origin || isClientOriginAllowed(origin, config.CLIENT_URL)) return callback(null, origin ?? true);
+      return callback(null, false);
+    },
+    credentials: true,
+  },
+});
 
 io.use((socket, next) => {
   try {

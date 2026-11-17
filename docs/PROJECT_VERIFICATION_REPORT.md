@@ -1,13 +1,48 @@
 # ExamGuard Project Verification Report
 
 **Checked:** 2026-11-17
-**Scope:** Local source, automated tests, builds, and static checks. No production or hosted staging service was accessed.
+**Scope:** Local source, automated tests, builds, local browser state, and read-only public health checks. No production records were changed.
+
+## Final follow-up verification (2026-11-17)
+
+This dated follow-up supersedes earlier test counts and adds the production-origin Companion check performed after the report above was written.
+
+| Area | Evidence | Result |
+|---|---|---|
+| Backend | `npm run test -w server` against loopback `examguard_test` | **234 passed, 0 failed, 0 skipped** |
+| Frontend | `npm run test -w client` | **166 passed, 0 failed, 0 skipped** |
+| AI service | `python -m unittest discover -v` | **57 passed, 0 failed, 6 skipped** (63 total; six authorized image fixtures absent) |
+| Windows Companion auth helper | `dotnet run --project device-monitor.tests\ExamGuard.DeviceMonitor.SessionTests.csproj` | **Passed**: valid, missing, malformed, distinct-session, mismatched-session, and idle-expiry cases |
+| Builds | Server and client build scripts; `dotnet build device-monitor\ExamGuard.DeviceMonitor.csproj --no-restore` | **Passed**; Companion build had 0 warnings and 0 errors |
+| Assistant routes | Isolated-database HTTP integration test for teacher, proctor, institute admin, wrong-organization access, grounded/refused responses, analytics facts, and invalid input | **Passed** |
+| Render health | Read-only `GET https://exam-guardd.onrender.com/health` | **HTTP 200**, `{"status":"ok"}` |
+| Stable Vercel site | Opened `https://examguard-sooty.vercel.app/` in browser | **Loaded** |
+
+### Companion production-origin 401: confirmed cause and fix status
+
+- A browser request from the exact stable Vercel origin to `http://127.0.0.1:43117/health` included a fresh, correctly formatted 64-hex Bearer token. It returned **401** with the Companion's generic “Local browser session is not authorized” response. This confirms the request passed CORS/preflight and reached the local Companion; the failure was authorization, not a missing header or CORS rejection. The token was generated and used in-browser and was not recorded or displayed.
+- The running Companion executable predates the current source. Its previous authorization logic retained a single browser token for the whole Companion process. The local Edge session had already registered its token, so a separate production-origin browser session was rejected.
+- Current source replaces that single-token state with a bounded set of independent browser sessions, constant-time token comparison, idle expiry, and health-only re-registration. `/pair` and `/stop` still require an already registered browser session; exam pairing continues to use the server-issued, short-lived, attempt-scoped JWT.
+- The current source passes the Companion authorization tests and builds successfully, but the updated executable was **not installed or launched**. The user was unavailable to approve replacing the running desktop program. Consequently, the stable-site 401 is not yet resolved on this machine and must not be reported as fixed in production. A signed/current Companion package and an approved local restart are still required for physical re-verification.
+
+### Local application and exam lifecycle evidence
+
+- The existing local browser was already open at `http://localhost:5173/app/take/...`. Its live page showed an active attempt with a running timer, “All changes saved,” active camera, current AI frame analysis, and Companion-connected status. The Companion window showed its local bridge ready.
+- This was an already-active attempt with unknown ownership/backend configuration. It was not altered, submitted, or used to create additional records. This observation does not establish a complete teacher-to-results lifecycle. Fresh exam creation, student readiness, start, save/reload, submission, grading, and teacher review were not executed as one verified browser flow.
+- The local readiness page had shown AI and private-evidence readiness, but this is not evidence of an actual Supabase evidence upload/download or of a full Cloud Run deployment health check.
+
+### External and high-impact verification limits
+
+- Supabase upload/retrieval was not attempted because no explicitly isolated test-storage project/bucket was provided. The smoke script writes an object; running it against unknown configuration could write to production storage, which was intentionally avoided.
+- No authenticated production workflow was exercised. The production site opened unauthenticated; no production account credentials or permission to create/alter production exam records were supplied.
+- Cloud Run was not independently queried because the service URL was not provided and reading `.env` was prohibited. The current local readiness UI did show authenticated AI-service readiness.
+- The Companion executable was not replaced or relaunched after the required approval request could not be answered. No package signing certificate or release workflow was available in the repository.
 
 ## Executive summary
 
-The local backend, frontend, AI service, and TypeScript/build checks were verified in this environment using an isolated loopback PostgreSQL `examguard_test` database on `127.0.0.1:55432`. The temporary cluster was created only for validation, used explicitly with `TEST_DATABASE_URL`, and then stopped and removed after verification.
+The local backend, frontend, AI service, and build checks were verified using an isolated loopback PostgreSQL `examguard_test` database. The test process received an explicit `TEST_DATABASE_URL`; tests left no application records, and the temporary test cluster was stopped and removed after validation.
 
-The backend suite passed in that isolated local test database: 230 passed, 0 failed, 0 skipped. The frontend suite passed: 156 passed. The AI service suite passed: 57 passed, 0 failed, 6 skipped (fixture-based tests intentionally skipped because the labeled fixtures are absent). The backend lint, build, import, API-contract, and migration checks also passed.
+The latest backend suite passed in that isolated local test database: 234 passed, 0 failed, 0 skipped. The frontend suite passed: 166 passed, 0 failed, 0 skipped. The AI service suite passed: 57 passed, 0 failed, 6 skipped (fixture-based tests intentionally skipped because the labeled fixtures are absent). Backend and frontend builds passed; the Windows Companion source also built and its authorization tests passed.
 
 A focused inspection of the AI inference code confirmed there is no active `_FACE_RESULT_CACHE`, `_reuse_last_face_result`, or equivalent stale per-frame face-result reuse in the live pipeline. The live code reprocesses each frame independently; the negative assertion is retained in the regression tests to prevent that stale behavior from returning.
 
@@ -28,9 +63,9 @@ Verified validation sequence used in this environment:
 
 | Area | Command/check | Result |
 |---|---|---|
-| Backend tests | `cd D:\ExamGuard-local-integration; $env:TEST_DATABASE_URL='postgresql://postgres@127.0.0.1:55432/examguard_test'; npm test -w server` | **Passed**: **230 passed, 0 failed, 0 skipped** |
-| Frontend tests | `cd D:\ExamGuard-local-integration; npm test -w client -- --run` | **Passed**: **156 passed** |
-| AI service | `cd D:\ExamGuard-local-integration\ai-service; python -m unittest discover -p "test_*.py"` | **Passed**: **57 passed, 0 failed, 6 skipped** |
+| Backend tests | `cd D:\ExamGuard-local-integration; $env:TEST_DATABASE_URL='<loopback examguard_test URL>'; npm run test -w server` | **Passed**: **234 passed, 0 failed, 0 skipped** |
+| Frontend tests | `cd D:\ExamGuard-local-integration; npm run test -w client` | **Passed**: **166 passed, 0 failed, 0 skipped** |
+| AI service | `cd D:\ExamGuard-local-integration\ai-service; python -m unittest discover -v` | **Passed**: **57 passed, 0 failed, 6 skipped** |
 | Server lint | `cd D:\ExamGuard-local-integration; npm run lint -w server` | **Passed** |
 | Server build | `cd D:\ExamGuard-local-integration; npm run build -w server` | **Passed** |
 | Import check | `cd D:\ExamGuard-local-integration; node server/scripts/check-imports.mjs` | **Passed** |
@@ -77,7 +112,7 @@ After the backend tests completed, the temporary `examguard_test` database was q
 
 The temporary test cluster was then stopped and removed to leave the environment clean.
 
-## Local workflow smoke tests (browser-verified)
+## Historical local workflow smoke tests (browser-verified; see dated follow-up above)
 
 The app was started locally with the documented config and a working local PostgreSQL database. The following browser-verified workflows were exercised in this environment:
 

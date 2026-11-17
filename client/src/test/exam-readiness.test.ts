@@ -119,6 +119,30 @@ describe("examination media readiness", () => {
     expect(missing.remediation).toMatch(/install and register/i);
   });
 
+  it("replaces a saved bridge token that does not match the Companion's required format", async () => {
+    const key = "examguard:companion-bridge-token";
+    try {
+      for (const malformed of ["a".repeat(32), "g".repeat(64)]) {
+        window.sessionStorage.setItem(key, malformed);
+        vi.resetModules();
+        const { getCompanionBridgeToken, companionBridgeAuthorization } = await import("../lib/exam-readiness");
+        const token = getCompanionBridgeToken();
+
+        expect(token).toMatch(/^[0-9a-f]{64}$/i);
+        expect(token).not.toBe(malformed);
+        expect(window.sessionStorage.getItem(key)).toBe(token);
+        expect(companionBridgeAuthorization().Authorization).toBe(`Bearer ${token}`);
+      }
+      const valid = "ab".repeat(32);
+      window.sessionStorage.setItem(key, valid);
+      vi.resetModules();
+      const { getCompanionBridgeToken: getValidToken } = await import("../lib/exam-readiness");
+      expect(getValidToken()).toBe(valid);
+    } finally {
+      window.sessionStorage.removeItem(key);
+    }
+  });
+
   it("does not claim the Companion is ready unless its local bridge reports ready", async () => {
     const response = await checkCompanionBridge(async () => Response.json({ status: "ready" }));
     expect(response.status).toBe("ready");
@@ -142,9 +166,12 @@ describe("examination media readiness", () => {
   });
 
   it("reports rejected local bridge authorization and permission failures for user recovery", async () => {
-    const unauthorized = await checkCompanionBridge(async () => new Response(null, { status: 401 }));
+    const fetchUnauthorized = vi.fn(async () => new Response(null, { status: 401 }));
+    const unauthorized = await checkCompanionBridge(fetchUnauthorized);
     expect(unauthorized.status).toBe("unavailable");
-    expect(unauthorized.explanation).toMatch(/rejected its browser session/i);
+    expect(unauthorized.explanation).toMatch(/rejected this browser session's authorization/i);
+    expect(unauthorized.remediation).toMatch(/restart the Companion/i);
+    expect(fetchUnauthorized).toHaveBeenCalledTimes(1);
     const denied = await checkCompanionBridge(async () => { throw new TypeError("Failed to fetch"); });
     expect(denied.status).toBe("unavailable");
     expect(denied.explanation).toMatch(/Local network access permission/i);

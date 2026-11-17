@@ -1,4 +1,4 @@
-import test from 'node:test'; import assert from 'node:assert/strict'; import { roleCanAccess, signToken, tenantFilter, jwtSubject, signCompanionToken, authenticate } from '../src/auth.js';
+import test from 'node:test'; import assert from 'node:assert/strict'; import { roleCanAccess, signToken, tenantFilter, jwtSubject, signCompanionToken, authenticate, authenticateCompanion } from '../src/auth.js';
 import jwt from 'jsonwebtoken';
 
 test('authentication signs a JWT with configured environment', () => { const previous = { ...process.env }; Object.assign(process.env, { DATABASE_URL: 'postgresql://user:pass@localhost:5432/test', JWT_SECRET: 'x'.repeat(32) }); assert.match(signToken('user-id'), /\./); process.env = previous; });
@@ -40,6 +40,40 @@ test('companion pairing tokens are short-lived and scoped to the device-monitor 
   const now = Math.floor(Date.now() / 1000);
   assert.ok(decoded.exp > now);
   assert.ok(decoded.exp <= now + 600); // 10 minutes
+  process.env = previous;
+});
+
+test('Companion authentication accepts valid tokens and rejects missing, invalid, and expired tokens', async () => {
+  const previous = { ...process.env };
+  const secret = 'x'.repeat(32);
+  Object.assign(process.env, { DATABASE_URL: 'postgresql://user:pass@localhost:5432/test', JWT_SECRET: secret });
+  const id = '550e8400-e29b-41d4-a716-446655440000';
+  const claims = { sub: id, organizationId: id, examId: id, candidateId: id, attemptId: id };
+  const validToken = signCompanionToken({ userId: id, organizationId: id, examId: id, candidateId: id, attemptId: id });
+  const invalidToken = jwt.sign(claims, 'y'.repeat(32), {
+    audience: 'examguard-device-monitor',
+    expiresIn: '10m',
+  });
+  const expiredToken = jwt.sign(claims, secret, {
+    audience: 'examguard-device-monitor',
+    expiresIn: -1,
+  });
+  const run = async (authorization?: string) => {
+    let status = 0;
+    let nextCalled = false;
+    const res = { status(code: number) { status = code; return this; }, json() { return this; } };
+    await authenticateCompanion(
+      { headers: authorization ? { authorization } : {} } as never,
+      res as never,
+      () => { nextCalled = true; },
+    );
+    return { status, nextCalled };
+  };
+
+  assert.deepEqual(await run(`Bearer ${validToken}`), { status: 0, nextCalled: true });
+  assert.deepEqual(await run(), { status: 401, nextCalled: false });
+  assert.deepEqual(await run(`Bearer ${invalidToken}`), { status: 401, nextCalled: false });
+  assert.deepEqual(await run(`Bearer ${expiredToken}`), { status: 401, nextCalled: false });
   process.env = previous;
 });
 

@@ -82,10 +82,9 @@ test('private evidence permits trusted cross-origin image retrieval and rejects 
     const untrustedOrigin = await fetch(`${baseUrl}/api/private-evidence/${makeToken(objectKey)}`, {
       headers: { Origin: 'https://untrusted.example' },
     });
-    assert.equal(untrustedOrigin.status, 200);
-    assert.equal(untrustedOrigin.headers.get('access-control-allow-origin'), trustedOrigin);
-    assert.notEqual(untrustedOrigin.headers.get('access-control-allow-origin'), 'https://untrusted.example');
-    assert.equal(untrustedOrigin.headers.get('cross-origin-resource-policy'), 'cross-origin');
+    assert.equal(untrustedOrigin.status, 403);
+    assert.equal(untrustedOrigin.headers.get('access-control-allow-origin'), null);
+    assert.equal(untrustedOrigin.headers.get('cross-origin-resource-policy'), null);
 
     const noOrigin = await fetch(`${baseUrl}/api/private-evidence/${makeToken(objectKey)}`);
     assert.equal(noOrigin.status, 200);
@@ -108,7 +107,7 @@ test('private evidence permits trusted cross-origin image retrieval and rejects 
       headers: { Origin: trustedOrigin },
     });
     assert.equal(unassociated.status, 404);
-    assert.deepEqual(storageReads, [objectKey, objectKey, objectKey]);
+    assert.deepEqual(storageReads, [objectKey, objectKey]);
 
     const localEvidence = await fetch(`${baseUrl}/api/local-evidence/${makeToken(objectKey)}`, {
       headers: { Origin: trustedOrigin },
@@ -128,7 +127,7 @@ test('private evidence permits trusted cross-origin image retrieval and rejects 
     assert.equal(fallback.status, 200);
     assert.equal(fallback.headers.get('access-control-allow-origin'), 'http://localhost:5173');
     assert.equal(fallback.headers.get('cross-origin-resource-policy'), 'cross-origin');
-    assert.deepEqual(storageReads, [objectKey, objectKey, objectKey, objectKey, objectKey]);
+    assert.deepEqual(storageReads, [objectKey, objectKey, objectKey, objectKey]);
   } finally {
     try {
       if (server?.listening) await stopServer(server);

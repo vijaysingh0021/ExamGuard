@@ -1,9 +1,20 @@
-import test from 'node:test'; import assert from 'node:assert/strict'; import { loadConfig } from '../src/config.js';
+import test from 'node:test'; import assert from 'node:assert/strict'; import { isClientOriginAllowed, loadConfig, parseClientOrigins } from '../src/config.js';
 import { isSupportedImage, isSupportedIdentityDocument } from '../src/upload-validation.js';
 
 test('requires PostgreSQL configuration', () => assert.throws(() => loadConfig({ DATABASE_URL: '', JWT_SECRET: '' })));
 test('accepts PostgreSQL configuration', () => assert.equal(loadConfig({ DATABASE_URL: 'postgresql://user:pass@localhost:5432/test', JWT_SECRET: 'a'.repeat(32) }).DATABASE_URL, 'postgresql://user:pass@localhost:5432/test'));
 test('rejects a non-PostgreSQL database URL', () => assert.throws(() => loadConfig({ DATABASE_URL: 'mysql://localhost/test', JWT_SECRET: 'a'.repeat(32) })));
+test('supports a comma-separated allowlist for the stable production and preview Vercel origins', () => {
+  const origins = parseClientOrigins('https://examguard-sooty.vercel.app, https://examguard-ulwa-mxdb9npr4-vijay452s-projects.vercel.app');
+  assert.deepEqual(origins, [
+    'https://examguard-sooty.vercel.app',
+    'https://examguard-ulwa-mxdb9npr4-vijay452s-projects.vercel.app',
+  ]);
+  assert.equal(isClientOriginAllowed('https://examguard-sooty.vercel.app', 'https://examguard-sooty.vercel.app, https://examguard-ulwa-mxdb9npr4-vijay452s-projects.vercel.app'), true);
+  assert.equal(isClientOriginAllowed('https://examguard-sooty.vercel.app/', 'https://examguard-sooty.vercel.app, https://examguard-ulwa-mxdb9npr4-vijay452s-projects.vercel.app'), true);
+  assert.equal(isClientOriginAllowed('https://examguard-ulwa-mxdb9npr4-vijay452s-projects.vercel.app', 'https://examguard-sooty.vercel.app, https://examguard-ulwa-mxdb9npr4-vijay452s-projects.vercel.app'), true);
+  assert.equal(isClientOriginAllowed('https://evil.example.com', 'https://examguard-sooty.vercel.app, https://examguard-ulwa-mxdb9npr4-vijay452s-projects.vercel.app'), false);
+});
 
 // File upload validation tests
 test('JPEG magic bytes validation', () => {
