@@ -23,11 +23,29 @@ Assert(restartedSessions.Authorize(tokenA, allowRegistration: false, now: now.Ad
 
 Console.WriteLine("PASS: missing, malformed, valid, independent browser sessions, mismatched-session, idle-expiry, and Companion-restart registration.");
 
+TestBluetoothLifecycle();
 TestPseudonymsAndSampling();
 TestWifiSelection();
 TestWlanCompletion();
 TestWifiStatus();
+await TestRadioBatchSerialization();
 await TestObservationOutbox();
+
+static void TestBluetoothLifecycle()
+{
+    Assert(BluetoothWatcherLifecycle.PlanStart(BluetoothWatcherState.Created) == BluetoothWatcherStartAction.Start, "A new BLE watcher must start from Created.");
+    Assert(BluetoothWatcherLifecycle.PlanStart(BluetoothWatcherState.Stopped) == BluetoothWatcherStartAction.Start, "A stopped BLE watcher may start again.");
+    Assert(BluetoothWatcherLifecycle.PlanStart(BluetoothWatcherState.Started) == BluetoothWatcherStartAction.StopAndWait, "An already-started watcher must stop and settle before a new session starts.");
+    Assert(BluetoothWatcherLifecycle.PlanStart(BluetoothWatcherState.Stopping) == BluetoothWatcherStartAction.WaitForStop, "A stopping watcher must finish its asynchronous transition before restart.");
+    Assert(BluetoothWatcherLifecycle.PlanStart(BluetoothWatcherState.Aborted) == BluetoothWatcherStartAction.Recreate, "An aborted watcher must be replaced rather than started again.");
+    Assert(BluetoothWatcherLifecycle.PlanStart(BluetoothWatcherState.Unknown) == BluetoothWatcherStartAction.Fail, "Unknown watcher states must fail closed.");
+    Assert(BluetoothWatcherLifecycle.ClassifyStartFailure(new InvalidOperationException(), true, true, true, "On") == "error", "An invalid watcher lifecycle state must not be mislabeled as missing hardware.");
+    Assert(BluetoothWatcherLifecycle.ClassifyStartFailure(new UnauthorizedAccessException(), true, true, true, "On") == "permission_denied", "Access failures must remain permission errors.");
+    Assert(BluetoothWatcherLifecycle.ClassifyStartFailure(new InvalidOperationException(), false, false, false, null) == "unavailable", "A missing radio must be reported as unavailable.");
+    Assert(BluetoothWatcherLifecycle.ClassifyStartFailure(new InvalidOperationException(), true, false, true, "On") == "unavailable", "An adapter without LE availability must be reported as unavailable.");
+    Assert(BluetoothWatcherLifecycle.ClassifyStartFailure(new InvalidOperationException(), true, true, true, "Off") == "unavailable", "A powered-off radio must be reported as unavailable.");
+    Console.WriteLine("PASS: BLE Created/Started/Stopping/Stopped/Aborted lifecycle plans and failure classification.");
+}
 
 static void TestPseudonymsAndSampling()
 {
@@ -158,6 +176,48 @@ static async Task TestObservationOutbox()
     outbox.DiscardQueued();
     Assert(outbox.PendingCount == 0 && outbox.DroppedCount == 2, "Discarding a rejected attempt must clear and count all queued observations.");
     Console.WriteLine("PASS: bounded batching, HTTP 429 Retry-After, and successful batch acknowledgment.");
+}
+
+static async Task TestRadioBatchSerialization()
+{
+    var batch = new RadioObservationBatch(
+        new RadioObservationContext(
+            "a9c1d9e8-66c1-4f4a-81a2-12cfa785a301",
+            "76dc2647-9c2c-4bd0-9a9e-cc1e498601dd",
+            "f19aa211-1cbc-4c42-981f-57dd5d2f3e99",
+            "321bead6-eaed-424b-813f-6a9c2eb97ea3"),
+        "pairing-token-must-not-be-in-body",
+        new[]
+        {
+            new RadioObservationPayload(
+                "bluetooth_le",
+                "advertisement",
+                -61,
+                "session-pseudonym-123456",
+                null,
+                "active",
+                null,
+                DateTimeOffset.Parse("2025-01-02T03:04:05.0000000+00:00")),
+        });
+    using var content = RadioObservationBatchContent.Create(batch);
+    var json = await content.ReadAsStringAsync();
+    using var document = System.Text.Json.JsonDocument.Parse(json);
+    var root = document.RootElement;
+    Assert(root.GetProperty("organizationId").GetString() == "a9c1d9e8-66c1-4f4a-81a2-12cfa785a301", "Batch context must use backend-compatible camelCase names and UUID values.");
+    Assert(root.GetProperty("attemptId").GetString() == "321bead6-eaed-424b-813f-6a9c2eb97ea3", "Attempt context must be serialized.");
+    var observation = root.GetProperty("observations")[0];
+    Assert(observation.GetProperty("source").GetString() == "bluetooth_le", "Observation source must be serialized in the backend schema.");
+    Assert(observation.GetProperty("kind").GetString() == "advertisement", "Observation kind must be serialized in the backend schema.");
+    Assert(observation.GetProperty("rssi").GetInt32() == -61, "Actual RSSI must be serialized as an integer.");
+    Assert(observation.GetProperty("pseudonym").GetString() == "session-pseudonym-123456", "The session pseudonym must be serialized.");
+    Assert(observation.GetProperty("scannerStatus").GetString() == "active", "Scanner status must use the backend-compatible field name.");
+    Assert(observation.GetProperty("observedAt").GetString() == "2025-01-02T03:04:05+00:00", "Observation timestamps must serialize as ISO timestamps.");
+    Assert(!observation.TryGetProperty("advertisedName", out _), "Missing optional advertised names must be omitted rather than represented as null.");
+    Assert(!json.Contains("pairing-token-must-not-be-in-body", StringComparison.Ordinal), "Pairing credentials must stay in the authorization header, not the batch body.");
+    Assert(CompanionApiErrorSummary.FromBody("{\"error\":\"Attempt is no longer active\"}", "application/json") == "Attempt is no longer active", "JSON API rejection details must be retained for local diagnostics.");
+    Assert(CompanionApiErrorSummary.FromBody("{\"error\":\"Rejected pairing-token-secret\"}", "application/json", "pairing-token-secret") == "Rejected [redacted]", "API diagnostics must redact any echoed credential.");
+    Assert(CompanionApiErrorSummary.FromBody("<html>private upstream detail</html>", "text/html") == "non-JSON error response (text/html)", "Non-JSON upstream bodies must not be copied into Companion logs.");
+    Console.WriteLine("PASS: batch payload serialization matches backend field names and excludes credentials.");
 }
 
 static void Assert(bool condition, string message)

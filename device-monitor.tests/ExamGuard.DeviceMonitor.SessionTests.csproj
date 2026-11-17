@@ -7,6 +7,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\device-monitor\BridgeAuthorizationSessions.cs" Link="BridgeAuthorizationSessions.cs" />
+    <Compile Include="..\device-monitor\BluetoothWatcherLifecycle.cs" Link="BluetoothWatcherLifecycle.cs" />
     <Compile Include="..\device-monitor\NativeWifi.cs" Link="NativeWifi.cs" />
     <Compile Include="..\device-monitor\RadioObservationPipeline.cs" Link="RadioObservationPipeline.cs" />
   </ItemGroup>

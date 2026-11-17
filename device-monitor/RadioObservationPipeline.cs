@@ -1,7 +1,10 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace ExamGuard.DeviceMonitor;
 
@@ -25,6 +28,63 @@ internal sealed record RadioObservationBatch(
     RadioObservationContext Context,
     string PairingToken,
     IReadOnlyList<RadioObservationPayload> Observations);
+
+internal static class RadioObservationBatchContent
+{
+    public static HttpContent Create(RadioObservationBatch batch)
+    {
+        var context = batch.Context;
+        var body = new
+        {
+            context.OrganizationId,
+            context.ExamId,
+            context.CandidateId,
+            context.AttemptId,
+            observations = batch.Observations
+        };
+        return JsonContent.Create(
+            body,
+            options: new JsonSerializerOptions(JsonSerializerDefaults.Web)
+            {
+                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+            });
+    }
+}
+
+internal static class CompanionApiErrorSummary
+{
+    public static string FromBody(string? body, string? mediaType, params string?[] sensitiveValues)
+    {
+        if (string.IsNullOrWhiteSpace(body))
+            return "empty error response";
+
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            if (document.RootElement.ValueKind == JsonValueKind.Object &&
+                document.RootElement.TryGetProperty("error", out var error) &&
+                error.ValueKind == JsonValueKind.String)
+            {
+                var message = new string((error.GetString() ?? string.Empty)
+                    .Where(character => !char.IsControl(character))
+                    .Take(240)
+                    .ToArray())
+                    .Trim();
+                foreach (var sensitiveValue in sensitiveValues)
+                {
+                    if (!string.IsNullOrEmpty(sensitiveValue))
+                        message = message.Replace(sensitiveValue, "[redacted]", StringComparison.Ordinal);
+                }
+                return message.Length == 0 ? "empty API error message" : message;
+            }
+            return "JSON error response without a message";
+        }
+        catch (JsonException)
+        {
+            return $"non-JSON error response ({mediaType ?? "unknown content type"})";
+        }
+    }
+}
 
 internal enum OutboxPumpResult
 {
@@ -105,7 +165,8 @@ internal sealed class RadioObservationOutbox
     public async Task<OutboxPumpResult> PumpAsync(
         Func<RadioObservationBatch, CancellationToken, Task<HttpResponseMessage>> sendBatch,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Func<RadioObservationBatch, HttpResponseMessage, CancellationToken, Task>? inspectResponse = null)
     {
         if (Interlocked.CompareExchange(ref pumping, 1, 0) != 0)
             return OutboxPumpResult.Deferred;
@@ -122,6 +183,8 @@ internal sealed class RadioObservationOutbox
             try
             {
                 using var response = await sendBatch(batch, cancellationToken);
+                if (inspectResponse is not null)
+                    await inspectResponse(batch, response, cancellationToken);
                 var status = (int)response.StatusCode;
                 if (response.IsSuccessStatusCode)
                 {

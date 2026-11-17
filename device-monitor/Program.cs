@@ -207,11 +207,13 @@ internal sealed class MonitorForm : Form
         AutoSize = true
     };
 
-    private readonly BluetoothLEAdvertisementWatcher bluetooth = new()
-    {
-        ScanningMode = BluetoothLEScanningMode.Active,
-        AllowExtendedAdvertisements = true
-    };
+    private BluetoothLEAdvertisementWatcher bluetooth = null!;
+    private Windows.Foundation.TypedEventHandler<BluetoothLEAdvertisementWatcher, BluetoothLEAdvertisementReceivedEventArgs>? bluetoothReceivedHandler;
+    private Windows.Foundation.TypedEventHandler<BluetoothLEAdvertisementWatcher, BluetoothLEAdvertisementWatcherStoppedEventArgs>? bluetoothStoppedHandler;
+    private readonly object bluetoothStopSync = new();
+    private readonly SemaphoreSlim bluetoothLifecycleGate = new(1, 1);
+    private TaskCompletionSource<bool>? bluetoothStoppedCompletion;
+    private volatile bool bluetoothStopExpected;
     private readonly HttpClient http = new()
     {
         Timeout = TimeSpan.FromSeconds(10)
@@ -244,6 +246,7 @@ internal sealed class MonitorForm : Form
 
     public MonitorForm()
     {
+        bluetooth = CreateBluetoothWatcher();
         Text = "ExamGuard Device Monitor";
         Width = 800;
         Height = 620;
@@ -347,13 +350,6 @@ internal sealed class MonitorForm : Form
         stopButton.Click += async (_, _) =>
             await StopAsync();
 
-        bluetooth.Received += (_, e) => BluetoothReceived(e);
-
-        bluetooth.Stopped += (_, e) =>
-        {
-            HandleBluetoothStopped(e.Error);
-        };
-
         consent.CheckedChanged += (_, _) =>
         {
             if (!consent.Checked && scanning)
@@ -377,6 +373,193 @@ internal sealed class MonitorForm : Form
             null,
             TimeSpan.FromSeconds(1),
             TimeSpan.FromSeconds(1));
+    }
+
+    private BluetoothLEAdvertisementWatcher CreateBluetoothWatcher()
+    {
+        var watcher = new BluetoothLEAdvertisementWatcher
+        {
+            ScanningMode = BluetoothLEScanningMode.Active,
+            AllowExtendedAdvertisements = true
+        };
+        bluetoothReceivedHandler = (_, e) =>
+        {
+            if (ReferenceEquals(watcher, bluetooth))
+                BluetoothReceived(e);
+        };
+        bluetoothStoppedHandler = (_, e) =>
+        {
+            if (ReferenceEquals(watcher, bluetooth))
+                HandleBluetoothStopped(e.Error);
+        };
+        watcher.Received += bluetoothReceivedHandler;
+        watcher.Stopped += bluetoothStoppedHandler;
+        return watcher;
+    }
+
+    private void ReplaceBluetoothWatcher()
+    {
+        if (bluetoothReceivedHandler is not null)
+            bluetooth.Received -= bluetoothReceivedHandler;
+        if (bluetoothStoppedHandler is not null)
+            bluetooth.Stopped -= bluetoothStoppedHandler;
+        bluetooth = CreateBluetoothWatcher();
+    }
+
+    private static async Task<BluetoothRadioDiagnostic> ReadBluetoothRadioDiagnosticAsync()
+    {
+        try
+        {
+            var adapter = await BluetoothAdapter.GetDefaultAsync();
+            if (adapter is null)
+                return new BluetoothRadioDiagnostic(false, false, false, null, null);
+
+            var radio = await adapter.GetRadioAsync();
+            return new BluetoothRadioDiagnostic(
+                true,
+                adapter.IsLowEnergySupported,
+                adapter.IsCentralRoleSupported,
+                radio?.State.ToString(),
+                radio is null ? "Bluetooth radio state is unavailable." : null);
+        }
+        catch (Exception ex)
+        {
+            return new BluetoothRadioDiagnostic(
+                null,
+                null,
+                null,
+                null,
+                $"{ex.GetType().Name}; HRESULT=0x{ex.HResult:X8}");
+        }
+    }
+
+    private async Task<bool> StartBluetoothWatcherAsync()
+    {
+        await bluetoothLifecycleGate.WaitAsync();
+        try
+        {
+            for (var attempt = 0; attempt < 4; attempt++)
+            {
+                if (!scanning || !consent.Checked || !paired ||
+                    !pairingExpiresAt.HasValue ||
+                    pairingExpiresAt.Value <= DateTimeOffset.UtcNow.AddSeconds(30))
+                    return false;
+
+                switch (BluetoothWatcherLifecycle.PlanStart(MapBluetoothWatcherState(bluetooth.Status)))
+                {
+                    case BluetoothWatcherStartAction.Start:
+                        bluetooth.Start();
+                        if (bluetooth.Status != BluetoothLEAdvertisementWatcherStatus.Started)
+                            throw new InvalidOperationException($"Bluetooth watcher did not start; state={bluetooth.Status}.");
+                        return true;
+                    case BluetoothWatcherStartAction.StopAndWait:
+                    case BluetoothWatcherStartAction.WaitForStop:
+                        await StopBluetoothWatcherAndWaitAsync();
+                        break;
+                    case BluetoothWatcherStartAction.Recreate:
+                        ReplaceBluetoothWatcher();
+                        break;
+                    default:
+                        throw new InvalidOperationException($"Bluetooth watcher cannot start from state {bluetooth.Status}.");
+                }
+            }
+
+            throw new TimeoutException($"Bluetooth watcher did not reach a startable state; state={bluetooth.Status}.");
+        }
+        finally
+        {
+            bluetoothLifecycleGate.Release();
+        }
+    }
+
+    private async Task StopBluetoothWatcherSerializedAsync()
+    {
+        await bluetoothLifecycleGate.WaitAsync();
+        try
+        {
+            await StopBluetoothWatcherAndWaitAsync();
+        }
+        finally
+        {
+            bluetoothLifecycleGate.Release();
+        }
+    }
+
+    private async Task StopBluetoothWatcherAndWaitAsync()
+    {
+        var watcher = bluetooth;
+        bluetoothStopExpected = true;
+        TaskCompletionSource<bool>? completion = null;
+        try
+        {
+            var state = watcher.Status;
+            if (state is BluetoothLEAdvertisementWatcherStatus.Created
+                or BluetoothLEAdvertisementWatcherStatus.Stopped
+                or BluetoothLEAdvertisementWatcherStatus.Aborted)
+                return;
+
+            completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (bluetoothStopSync)
+                bluetoothStoppedCompletion = completion;
+
+            state = watcher.Status;
+            if (state == BluetoothLEAdvertisementWatcherStatus.Started)
+                watcher.Stop();
+            else if (state != BluetoothLEAdvertisementWatcherStatus.Stopping &&
+                     state != BluetoothLEAdvertisementWatcherStatus.Stopped &&
+                     state != BluetoothLEAdvertisementWatcherStatus.Aborted)
+                throw new InvalidOperationException($"Bluetooth watcher entered unexpected state {state} while stopping.");
+
+            if (watcher.Status is BluetoothLEAdvertisementWatcherStatus.Stopped
+                or BluetoothLEAdvertisementWatcherStatus.Aborted)
+                return;
+
+            var completed = await Task.WhenAny(completion.Task, Task.Delay(TimeSpan.FromSeconds(5)));
+            if (completed != completion.Task)
+                throw new TimeoutException($"Bluetooth watcher stop timed out; state={watcher.Status}.");
+
+            if (watcher.Status is not (BluetoothLEAdvertisementWatcherStatus.Stopped
+                or BluetoothLEAdvertisementWatcherStatus.Aborted))
+                throw new InvalidOperationException($"Bluetooth watcher stop completed in state {watcher.Status}.");
+        }
+        finally
+        {
+            lock (bluetoothStopSync)
+            {
+                if (completion is not null && ReferenceEquals(bluetoothStoppedCompletion, completion))
+                    bluetoothStoppedCompletion = null;
+            }
+            bluetoothStopExpected = false;
+        }
+    }
+
+    private static BluetoothWatcherState MapBluetoothWatcherState(
+        BluetoothLEAdvertisementWatcherStatus status) => status switch
+    {
+        BluetoothLEAdvertisementWatcherStatus.Created => BluetoothWatcherState.Created,
+        BluetoothLEAdvertisementWatcherStatus.Started => BluetoothWatcherState.Started,
+        BluetoothLEAdvertisementWatcherStatus.Stopping => BluetoothWatcherState.Stopping,
+        BluetoothLEAdvertisementWatcherStatus.Stopped => BluetoothWatcherState.Stopped,
+        BluetoothLEAdvertisementWatcherStatus.Aborted => BluetoothWatcherState.Aborted,
+        _ => BluetoothWatcherState.Unknown
+    };
+
+    private static string DescribeException(Exception exception) =>
+        $"{exception.GetType().FullName}: {exception.Message}; HRESULT=0x{exception.HResult:X8}; stack={exception.StackTrace ?? "(unavailable)"}";
+
+    private sealed record BluetoothRadioDiagnostic(
+        bool? AdapterFound,
+        bool? LowEnergyAvailable,
+        bool? SupportsLeCentral,
+        string? State,
+        string? Error)
+    {
+        public string Summary =>
+            $"adapterFound={AdapterFound?.ToString() ?? "unknown"}; " +
+            $"lowEnergy={LowEnergyAvailable?.ToString() ?? "unknown"}; " +
+            $"leCentral={SupportsLeCentral?.ToString() ?? "unknown"}; " +
+            $"state={State ?? "unknown"}" +
+            (Error is null ? string.Empty : $"; diagnosticError={Error}");
     }
 
     private void HideToTray()
@@ -483,23 +666,35 @@ internal sealed class MonitorForm : Form
 
         bluetoothAvailable = false;
         wifiAvailable = false;
+        var bluetoothRadio = await ReadBluetoothRadioDiagnosticAsync();
+        Add($"Bluetooth radio diagnostic: {bluetoothRadio.Summary}");
         try
         {
-            bluetooth.Start();
-            bluetoothAvailable = bluetooth.Status == BluetoothLEAdvertisementWatcherStatus.Started;
-            if (!bluetoothAvailable)
-                throw new InvalidOperationException("The Bluetooth LE watcher did not enter the started state.");
+            if (!await StartBluetoothWatcherAsync())
+            {
+                if (scanning)
+                    await StopAsync(reportToServer: false);
+                return false;
+            }
 
+            bluetoothAvailable = true;
             SetBluetoothStatus("Bluetooth: active");
-            Add("Bluetooth LE watcher started.");
+            Add($"Bluetooth LE watcher started; state={bluetooth.Status}.");
             await Submit("bluetooth_le", "scanner_status", null, null, "active");
         }
         catch (Exception ex)
         {
-            var status = ex is UnauthorizedAccessException ? "permission_denied" : "unavailable";
-            SetBluetoothStatus(status == "permission_denied" ? "Bluetooth: permission required" : "Bluetooth: unavailable");
-            Add($"Bluetooth could not start: {ex.HResult:X8}");
-
+            bluetoothAvailable = false;
+            var status = BluetoothWatcherLifecycle.ClassifyStartFailure(
+                ex,
+                bluetoothRadio.AdapterFound,
+                bluetoothRadio.LowEnergyAvailable,
+                bluetoothRadio.SupportsLeCentral,
+                bluetoothRadio.State);
+            SetBluetoothStatus(status == "permission_denied"
+                ? "Bluetooth: permission required"
+                : status == "unavailable" ? "Bluetooth: unavailable" : "Bluetooth: scanner error");
+            Add($"Bluetooth watcher start failed: {DescribeException(ex)}; watcherState={bluetooth.Status}; radio={bluetoothRadio.Summary}");
             await Submit("bluetooth_le", "scanner_status", null, ex.HResult.ToString("X8"), status);
         }
 
@@ -583,7 +778,12 @@ internal sealed class MonitorForm : Form
             if (!response.IsSuccessStatusCode)
             {
                 paired = false;
-                Add($"Automatic pairing was not accepted ({(int)response.StatusCode}). Return to the active exam and retry.");
+                var body = await response.Content.ReadAsStringAsync();
+                var summary = CompanionApiErrorSummary.FromBody(
+                    body,
+                    response.Content.Headers.ContentType?.MediaType,
+                    pairingToken.Text.Trim());
+                Add($"Automatic pairing was not accepted ({(int)response.StatusCode}): {summary}. Return to the active exam and retry.");
                 return false;
             }
             var payload = await response.Content.ReadFromJsonAsync<PairingResponse>();
@@ -640,7 +840,10 @@ internal sealed class MonitorForm : Form
         catch (HttpRequestException ex)
         {
             paired = false;
-            Add($"Automatic pairing network/API error: {ex.Message}");
+            var statusCode = ex.StatusCode.HasValue ? ((int)ex.StatusCode.Value).ToString() : "none";
+            var detail = ex.Message.Replace(pairingToken.Text.Trim(), "[redacted]", StringComparison.Ordinal);
+            var innerType = ex.InnerException?.GetType().Name ?? "none";
+            Add($"Automatic pairing network/API error: status={statusCode}; {ex.GetType().Name}; inner={innerType}; detail={detail}.");
             return false;
         }
         finally
@@ -1022,6 +1225,7 @@ internal sealed class MonitorForm : Form
 
             var scanStatus = NativeWifi.ClassifyStatus(results);
             wifiAvailable = results.SuccessfulInterfaces > 0;
+            Add($"Wi-Fi scan finished: status={scanStatus}; interfaces={results.SuccessfulInterfaces}/{results.TotalInterfaces}; distinctAccessPoints={results.AccessPoints.Count}.");
             if (!wifiAvailable)
             {
                 SetWifiStatus(scanStatus == "permission_denied"
@@ -1106,15 +1310,11 @@ internal sealed class MonitorForm : Form
 
         try
         {
-            if (bluetooth.Status ==
-                BluetoothLEAdvertisementWatcherStatus.Started)
-            {
-                bluetooth.Stop();
-            }
+            await StopBluetoothWatcherSerializedAsync();
         }
         catch (Exception ex)
         {
-            Add($"Error stopping Bluetooth watcher: {ex.Message}");
+            Add($"Error stopping Bluetooth watcher: {DescribeException(ex)}; watcherState={bluetooth.Status}.");
         }
 
         SetBluetoothStatus("Bluetooth: stopped");
@@ -1146,7 +1346,10 @@ internal sealed class MonitorForm : Form
 
     private void HandleBluetoothStopped(BluetoothError error)
     {
-        if (!scanning)
+        lock (bluetoothStopSync)
+            bluetoothStoppedCompletion?.TrySetResult(true);
+
+        if (bluetoothStopExpected || !scanning)
             return;
 
         bluetoothAvailable = false;
@@ -1286,28 +1489,26 @@ internal sealed class MonitorForm : Form
                 var token = contextMatches && paired && !string.IsNullOrWhiteSpace(pairingToken.Text)
                     ? pairingToken.Text.Trim()
                     : batch.PairingToken;
-                var requestBody = new
-                {
-                    batch.Context.OrganizationId,
-                    batch.Context.ExamId,
-                    batch.Context.CandidateId,
-                    batch.Context.AttemptId,
-                    observations = batch.Observations
-                };
                 using var request = new HttpRequestMessage(
                     HttpMethod.Post,
                     $"{apiUrl.Text.TrimEnd('/')}/api/student/radio-observations/batch")
                 {
-                    Content = JsonContent.Create(
-                        requestBody,
-                        options: new JsonSerializerOptions
-                        {
-                            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
-                        })
+                    Content = RadioObservationBatchContent.Create(batch)
                 };
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
                 return await http.SendAsync(request, cancellationToken);
-            }, DateTimeOffset.UtcNow, bridgeCancellation.Token);
+            }, DateTimeOffset.UtcNow, bridgeCancellation.Token, async (batch, response, cancellationToken) =>
+            {
+                if (response.IsSuccessStatusCode)
+                    return;
+
+                var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                var summary = CompanionApiErrorSummary.FromBody(
+                    body,
+                    response.Content.Headers.ContentType?.MediaType,
+                    batch.PairingToken);
+                Add($"Radio batch API rejected with HTTP {(int)response.StatusCode}: {summary}.");
+            });
 
             if (result == OutboxPumpResult.Succeeded)
             {
